@@ -1,0 +1,27 @@
+services:
+  # Default: PostgreSQL 16
+  postgres:
+    build:
+      context: .
+      args:
+        PG_VERSION: ${PG_VERSION:-16}
+    image: pg-flight-recorder-test:${PG_VERSION:-16}
+    container_name: pg-flight-recorder-test
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./install.sql:/install.sql:ro
+      - ./tests:/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

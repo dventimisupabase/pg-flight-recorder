@@ -569,15 +569,26 @@ SELECT * FROM flight_recorder.compare('...', '...');
 
 ## Testing
 
-```bash
-# Local development
-supabase start
-supabase db reset
-supabase test db  # 131 tests
+Run tests locally with Docker (supports PostgreSQL 15, 16, 17, 18):
 
-# Deploy
-supabase link --project-ref <ref>
-supabase db push
+```bash
+# Test on PostgreSQL 16 (default)
+./test.sh
+
+# Test on specific version
+./test.sh 15   # PostgreSQL 15
+./test.sh 17   # PostgreSQL 17
+
+# Test on all versions
+./test.sh all  # Tests 118 pgTAP tests on PG 15, 16, 17, 18
+```
+
+Or against your own PostgreSQL 15+ instance:
+
+```bash
+psql -f install.sql
+psql -c "CREATE EXTENSION pgtap;"
+pg_prove -U postgres -d postgres tests/flight_recorder_test.sql
 ```
 
 **Note:** VACUUM warnings during tests are expected (tests run in transactions).
@@ -598,15 +609,12 @@ psql -f uninstall.sql
 
 ```
 pg-flight-recorder/
-├── install.sql                  # Standalone install
-├── uninstall.sql                # Standalone uninstall
+├── install.sql                  # Installation script
+├── uninstall.sql                # Uninstall script
+├── docker-compose.yml           # PostgreSQL + pg_cron for testing
+├── test.sh                      # Test runner script
+├── tests/
+│   └── flight_recorder_test.sql # pgTAP tests (118 tests)
 ├── README.md                    # Quick start
-├── REFERENCE.md                 # This file
-└── supabase/
-    ├── config.toml
-    ├── migrations/
-    │   ├── 20260105000000_enable_pg_cron.sql
-    │   └── 20260106000000_pg_flight_recorder.sql
-    └── tests/
-        └── 00001_flight_recorder_test.sql
+└── REFERENCE.md                 # This file (full documentation)
 ```

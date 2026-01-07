@@ -6,12 +6,6 @@ Server-side flight recorder for PostgreSQL. Runs automatically via pg_cron. Zero
 
 ## Install
 
-**Supabase:**
-```bash
-supabase link --project-ref <your-ref>
-supabase db push
-```
-
 **PostgreSQL 15+** (requires pg_cron):
 ```bash
 psql -f install.sql
@@ -47,7 +41,7 @@ SELECT flight_recorder.enable();               -- Resume
 
 **Default overhead: ~0.5% CPU** (3-minute sampling)
 
-Built for production with automatic safety controls (circuit breaker, adaptive mode, DDL detection, timeouts). See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
+Built for production with automatic safety controls (circuit breaker, adaptive mode, timeouts). See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
 
 ## Set and Forget
 
@@ -71,6 +65,31 @@ These affordances make safety validation a no-brainer.
 
 ```bash
 psql -f uninstall.sql
+```
+
+## Testing
+
+Run tests locally with Docker:
+
+```bash
+# Test on PostgreSQL 16 (default)
+./test.sh
+
+# Test on specific version
+./test.sh 15   # PostgreSQL 15
+./test.sh 17   # PostgreSQL 17
+./test.sh 18   # PostgreSQL 18
+
+# Test on all versions (15, 16, 17, 18)
+./test.sh all
+```
+
+Or test against your own PostgreSQL 15+ instance with pg_cron and pgTAP installed:
+
+```bash
+psql -f install.sql
+psql -c "CREATE EXTENSION pgtap;"
+pg_prove -U postgres -d postgres tests/flight_recorder_test.sql
 ```
 
 ## Documentation
