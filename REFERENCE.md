@@ -108,9 +108,51 @@ SELECT flight_recorder.enable();  -- Reschedule with new interval
 
 ## Safety Features
 
+### Observer Effect
+
+Flight recorder has measurable overhead. Exact cost depends on configuration:
+
+| Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
+|--------|-----------------|-----------------|----------------|-------|
+| **Default** | 120s | 250ms | 0.8% | 4 sections: wait, activity, progress, locks |
+| **High Resolution** | 60s | 250ms | 1.7% | Set sample_interval_seconds=60 for higher temporal resolution |
+| **Light Mode** | 120s | 250ms | 0.6% | 3 sections: wait, activity, locks (progress disabled) |
+| **Emergency Mode** | 120s | 250ms | 0.4% | 2 sections: wait, activity (locks and progress disabled) |
+
+**Additional Resource Costs:**
+
+- **Catalog locks**: 1 AccessShareLock per sample (default snapshot-based collection)
+- **Lock timeout**: 100ms - fails fast if catalogs are locked by DDL operations
+- **Memory**: 2MB work_mem per collection (configurable)
+- **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
+- **pg_stat_statements**: 20 queries × 96 snapshots/day = 1,920 rows/day
+
+**Target Environments:**
+
+- ✓ Production troubleshooting (enable during incidents)
+- ✓ Staging/dev (always-on monitoring)
+- ⚠ High-DDL workloads (frequent CREATE/DROP/ALTER may cause catalog lock contention)
+- ✗ Resource-constrained databases (< 2 CPU cores, < 4GB RAM)
+
+**Reducing Overhead:**
+
+```sql
+-- Switch to light mode (disables progress tracking)
+SELECT flight_recorder.set_mode('light');
+
+-- Switch to emergency mode (disables locks and progress)
+SELECT flight_recorder.set_mode('emergency');
+
+-- Stop completely
+SELECT flight_recorder.disable();
+
+-- Validate your configuration
+SELECT * FROM flight_recorder.validate_config();
+```
+
 ### Observer Effect Prevention
 
-Flight recorder is designed to have minimal impact on the database it monitors:
+Flight recorder is designed to minimize impact on the database it monitors:
 
 **UNLOGGED Tables**
 - 9 telemetry tables use UNLOGGED to eliminate WAL overhead
@@ -118,7 +160,7 @@ Flight recorder is designed to have minimal impact on the database it monitors:
 - Data lost on crash is acceptable for telemetry
 
 **Per-Section Timeouts**
-- Each collection section has independent 1-second timeout
+- Each collection section has independent 250ms timeout (configurable)
 - Prevents any single query from monopolizing resources
 - Timeout resets between sections and at function end
 
@@ -129,7 +171,7 @@ Flight recorder is designed to have minimal impact on the database it monitors:
 **Result Limits**
 - Lock samples: 100 max
 - Active sessions: 25 max
-- Statement snapshots: 50 max (configurable)
+- Statement snapshots: 20 max (configurable)
 
 ### Circuit Breaker
 

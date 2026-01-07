@@ -43,79 +43,22 @@ SELECT flight_recorder.disable();              -- Stop completely
 SELECT flight_recorder.enable();               -- Resume
 ```
 
-## Safety
+## Performance Impact
 
-Built for production with minimal observer effect:
+**Default overhead: ~0.8% CPU**
 
-- **UNLOGGED tables** - No WAL overhead for telemetry data
-- **Per-section timeouts** - Each query section limited to 250ms
-- **O(n) algorithms** - Lock detection uses `pg_blocking_pids()`, not O(n^2) joins
-- **Circuit breaker** - Auto-skips collection when system is stressed
-- **Adaptive mode** - Automatically reduces overhead under load
-- **Size limits** - Auto-disables if schema exceeds 10GB
-- **Result limits** - Caps on rows collected (50 locks, 25 sessions, 50 statements)
+Built for production with automatic safety controls (circuit breaker, adaptive mode, timeouts). See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
 
-## Observer Effect
+## Uninstall
 
-pg-flight-recorder has measurable overhead. Exact cost depends on configuration:
-
-| Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
-|--------|-----------------|-----------------|----------------|-------|
-| **Default** | 120s | 250ms | 0.8% | 4 sections: wait, activity, progress, locks |
-| **High Resolution** | 60s | 250ms | 1.7% | Set sample_interval_seconds=60 for higher temporal resolution |
-| **Light Mode** | 120s | 250ms | 0.6% | 3 sections: wait, activity, locks (progress disabled) |
-| **Emergency Mode** | 120s | 250ms | 0.4% | 2 sections: wait, activity (locks and progress disabled) |
-
-Additional considerations:
-
-- **Catalog locks**: 1 AccessShareLock per sample (default snapshot-based collection)
-- **Lock timeout**: 100ms - fails fast if catalogs are locked by DDL operations
-- **Memory**: 2MB work_mem per collection (configurable)
-- **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
-- **pg_stat_statements**: 20 queries × 96 snapshots/day = 1,920 rows/day (87% reduction from older versions)
-
-### Reducing Overhead
-
-```sql
--- Switch to light mode (disables progress tracking)
-SELECT flight_recorder.set_mode('light');
-
--- Switch to emergency mode (disables locks and progress)
-SELECT flight_recorder.set_mode('emergency');
-
--- Stop completely
-SELECT flight_recorder.disable();
-
--- Validate your configuration
-SELECT * FROM flight_recorder.validate_config();
+```bash
+psql -f uninstall.sql
 ```
 
-### Advanced Optimizations (Opt-In)
+## Documentation
 
-Additional features available via configuration:
-
-```sql
--- Skip collection when system idle (adaptive sampling)
-UPDATE flight_recorder.config SET value = 'true' WHERE key = 'adaptive_sampling';
-
--- Adjust sample interval (60s = higher resolution, 180s = lower overhead)
-UPDATE flight_recorder.config SET value = '60' WHERE key = 'sample_interval_seconds';
-```
-
-See [REFERENCE.md](REFERENCE.md) for detailed configuration options.
-
-### Target Environments
-
-- ✓ Production troubleshooting (enable during incidents)
-- ✓ Staging/dev (always-on monitoring)
-- ⚠ High-DDL workloads (frequent CREATE/DROP/ALTER may cause catalog lock contention)
-- ✗ Resource-constrained databases (< 2 CPU cores, < 4GB RAM)
-
-## More
-
-See [REFERENCE.md](REFERENCE.md) for:
-- All functions and views
-- Configuration options
-- Anomaly detection details
-- Diagnostic patterns
-- Testing instructions
+See [REFERENCE.md](REFERENCE.md) for complete documentation including:
+- All analysis functions and views
+- Performance tuning and configuration
+- Safety mechanisms and troubleshooting
+- Advanced features
