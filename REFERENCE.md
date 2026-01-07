@@ -54,13 +54,20 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ### Health & Monitoring
 
-| Function                       | Purpose                           |
-|--------------------------------|-----------------------------------|
-| `health_check()`               | Component status overview         |
-| `performance_report(interval)` | Flight recorder's own performance |
-| `check_alerts(interval)`       | Active alerts (if enabled)        |
-| `config_recommendations()`     | Optimization suggestions          |
-| `export_json(start, end)`      | AI-friendly data export           |
+| Function                       | Purpose                                       |
+|--------------------------------|-----------------------------------------------|
+| `preflight_check()`            | **Pre-installation validation (run first)**   |
+| `quarterly_review()`           | **90-day health check (run every 3 months)**  |
+| `health_check()`               | Component status overview                     |
+| `performance_report(interval)` | Flight recorder's own performance             |
+| `check_alerts(interval)`       | Active alerts (if enabled)                    |
+| `config_recommendations()`     | Optimization suggestions                      |
+| `export_json(start, end)`      | AI-friendly data export                       |
+
+**"Set and Forget" Workflow:**
+1. Before installation: `SELECT * FROM flight_recorder.preflight_check();`
+2. Every 3 months: `SELECT * FROM flight_recorder.quarterly_review();`
+3. Both functions provide clear GO/NO-GO status with actionable recommendations.
 
 ## Views
 
@@ -76,13 +83,13 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ## Collection Modes
 
-Modes control **what** is collected, not **how often**. Sample interval is configured separately via `sample_interval_seconds` (default: 120s).
+Modes control **what** is collected, not **how often**. Sample interval is configured separately via `sample_interval_seconds` (default: 180s).
 
 | Mode        | Locks | Progress | Interval Behavior | Use Case        |
 |-------------|-------|----------|-------------------|-----------------|
 | `normal`    | Yes   | Yes      | Uses configured interval | Default (4 sections) |
 | `light`     | Yes   | No       | Uses configured interval | Moderate load (3 sections) |
-| `emergency` | No    | No       | Forces min 120s | System stressed (2 sections) |
+| `emergency` | No    | No       | Forces min 180s | System stressed (2 sections) |
 
 ```sql
 SELECT flight_recorder.set_mode('light');
@@ -114,10 +121,10 @@ Flight recorder has measurable overhead. Exact cost depends on configuration:
 
 | Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
 |--------|-----------------|-----------------|----------------|-------|
-| **Default** | 120s | 250ms | 0.8% | 4 sections: wait, activity, progress, locks |
+| **Default** | 180s | 250ms | 0.5% | 4 sections: wait, activity, progress, locks |
 | **High Resolution** | 60s | 250ms | 1.7% | Set sample_interval_seconds=60 for higher temporal resolution |
-| **Light Mode** | 120s | 250ms | 0.6% | 3 sections: wait, activity, locks (progress disabled) |
-| **Emergency Mode** | 120s | 250ms | 0.4% | 2 sections: wait, activity (locks and progress disabled) |
+| **Light Mode** | 180s | 250ms | 0.4% | 3 sections: wait, activity, locks (progress disabled) |
+| **Emergency Mode** | 180s | 250ms | 0.3% | 2 sections: wait, activity (locks and progress disabled) |
 
 **Additional Resource Costs:**
 

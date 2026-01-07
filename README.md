@@ -45,9 +45,27 @@ SELECT flight_recorder.enable();               -- Resume
 
 ## Performance Impact
 
-**Default overhead: ~0.8% CPU**
+**Default overhead: ~0.5% CPU** (3-minute sampling)
 
-Built for production with automatic safety controls (circuit breaker, adaptive mode, timeouts). See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
+Built for production with automatic safety controls (circuit breaker, adaptive mode, DDL detection, timeouts). See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
+
+## Set and Forget
+
+Safe for always-on monitoring. Before enabling:
+
+```sql
+-- Run preflight check (one-time setup validation)
+SELECT * FROM flight_recorder.preflight_check();
+```
+
+After installation, run quarterly health checks:
+
+```sql
+-- Run every 3 months (takes ~1 second)
+SELECT * FROM flight_recorder.quarterly_review();
+```
+
+These affordances make safety validation a no-brainer.
 
 ## Uninstall
 

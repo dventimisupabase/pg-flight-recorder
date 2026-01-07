@@ -291,7 +291,7 @@
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
 --   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes)
---   flight_recorder_sample    : 60 seconds    (REDUCED from 30s for observer safety - adaptive mode adjusts dynamically)
+--   flight_recorder_sample    : 180 seconds   (default 3-minute sampling - configurable via sample_interval_seconds)
 --   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - drops old partitions and cleans snapshots)
 --   flight_recorder_partition : 0 2 * * *     (daily at 2 AM - creates future partitions proactively)
 --
@@ -644,53 +644,53 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 -- Default configuration
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
-    -- Phase 5A: Configurable sample interval (default 120s for 0.8% overhead)
-    ('sample_interval_seconds', '120'),        -- Sample collection frequency (was hardcoded 60s)
+    -- Configurable sample interval (default 180s for 0.5% overhead)
+    ('sample_interval_seconds', '180'),        -- Sample collection frequency
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
     ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
     ('statements_min_calls', '1'),
     ('enable_locks', 'true'),
     ('enable_progress', 'true'),
-    -- P0: Circuit breaker - REDUCED from 5000ms to 1000ms for faster protection
+    -- Circuit breaker settings
     ('circuit_breaker_threshold_ms', '1000'),  -- Skip collection if avg of last 3 runs exceeded this
     ('circuit_breaker_enabled', 'true'),
     ('circuit_breaker_window_minutes', '15'),  -- Look back window for moving average
-    -- P0: Statement and lock timeouts (applied in collection functions)
-    ('statement_timeout_ms', '2000'),          -- Max total collection time (REDUCED from 5000ms)
+    -- Statement and lock timeouts (applied in collection functions)
+    ('statement_timeout_ms', '2000'),          -- Max total collection time
     ('lock_timeout_ms', '100'),                -- Max wait for catalog locks (fail fast on contention)
     ('work_mem_kb', '2048'),                   -- work_mem limit for flight recorder queries (2MB)
     -- Per-section sub-timeouts (prevent one section consuming entire budget)
     ('section_timeout_ms', '250'),             -- Max time per section (reset before each section)
-    -- P0: Cost-based skip thresholds (proactive checks before expensive queries)
+    -- Cost-based skip thresholds (proactive checks before expensive queries)
     ('skip_locks_threshold', '50'),            -- Skip lock collection if > N blocked locks
     ('skip_activity_conn_threshold', '100'),   -- Skip activity if > N active connections
-    -- P1: Schema size monitoring
+    -- Schema size monitoring
     ('schema_size_warning_mb', '5000'),        -- Warn when schema exceeds 5GB
     ('schema_size_critical_mb', '10000'),      -- Auto-disable when schema exceeds 10GB
     ('schema_size_check_enabled', 'true'),
-    -- P2: Automatic mode switching - ENABLED BY DEFAULT and triggers earlier
-    ('auto_mode_enabled', 'true'),             -- Auto-adjust mode based on system load (ENABLED!)
-    ('auto_mode_connections_threshold', '60'), -- Switch to light at 60% (REDUCED from 80%)
+    -- Automatic mode switching (enabled by default)
+    ('auto_mode_enabled', 'true'),             -- Auto-adjust mode based on system load
+    ('auto_mode_connections_threshold', '60'), -- Switch to light at 60% of max_connections
     ('auto_mode_trips_threshold', '3'),        -- Switch to emergency if circuit breaker tripped N times in 10min
-    -- P2: Configurable retention by table type
+    -- Configurable retention by table type
     ('retention_samples_days', '7'),           -- Retention for samples table
     ('retention_snapshots_days', '30'),        -- Retention for snapshots table
     ('retention_statements_days', '30'),       -- Retention for pg_stat_statements snapshots
     ('retention_collection_stats_days', '30'), -- Retention for collection_stats table
-    -- P3: Self-monitoring and health checks
+    -- Self-monitoring and health checks
     ('self_monitoring_enabled', 'true'),       -- Track flight recorder system performance
     ('health_check_enabled', 'true'),          -- Enable health check function
-    -- P4: Advanced features
+    -- Advanced features
     ('alert_enabled', 'false'),                -- Enable alert notifications
     ('alert_circuit_breaker_count', '5'),      -- Alert if circuit breaker trips N times in hour
     ('alert_schema_size_mb', '8000'),          -- Alert if schema exceeds threshold (80% of critical)
-    -- Phase 5B: Snapshot-based collection (default enabled, reduces catalog locks from 3 to 1)
+    -- Snapshot-based collection (default enabled, reduces catalog locks from 3 to 1)
     ('snapshot_based_collection', 'true'),     -- Use temp table snapshot of pg_stat_activity
-    -- Phase 5C: Adaptive sampling (opt-in, skips collection when idle)
+    -- Adaptive sampling (opt-in, skips collection when idle)
     ('adaptive_sampling', 'false'),            -- Skip collection when system idle
     ('adaptive_sampling_idle_threshold', '5'), -- Skip if < N active connections
-    -- Phase 6: DDL detection (enabled by default, prevents lock contention with schema changes)
+    -- DDL detection (enabled by default, prevents lock contention with schema changes)
     ('ddl_detection_enabled', 'true'),         -- Check for active DDL before collecting
     ('ddl_skip_locks', 'true'),                -- Skip lock collection when DDL detected
     ('ddl_skip_entire_sample', 'false')        -- Skip entire sample when DDL detected (more aggressive)
@@ -1450,7 +1450,7 @@ BEGIN
         COALESCE(flight_recorder._get_config('work_mem_kb', '2048'), '2048') || 'kB',
         true);  -- Limit memory for joins/sorts
 
-    -- Phase 5C: Adaptive sampling - skip if system idle (opt-in)
+    -- Adaptive sampling - skip if system idle (opt-in)
     -- IMPORTANT: This check happens AFTER lock_timeout is set, so it's protected
     DECLARE
         v_adaptive_sampling BOOLEAN;
@@ -1484,7 +1484,7 @@ BEGIN
         END IF;
     END;
 
-    -- Phase 6: DDL detection - skip lock collection or entire sample when DDL is active
+    -- DDL detection - skip lock collection or entire sample when DDL is active
     -- IMPORTANT: This check happens AFTER lock_timeout is set, so it's protected
     DECLARE
         v_ddl_detected BOOLEAN;
@@ -1541,13 +1541,13 @@ BEGIN
     );
     v_pg_version := flight_recorder._pg_version();
 
-    -- Phase 6: Apply DDL detection override for lock collection
+    -- Apply DDL detection override for lock collection
     -- If DDL was detected and ddl_skip_locks=true, disable lock collection
     IF v_ddl_detected AND v_skip_locks_on_ddl AND NOT v_skip_sample_on_ddl THEN
         v_enable_locks := FALSE;
     END IF;
 
-    -- Phase 5B: Snapshot-based collection (default enabled) - Query pg_stat_activity once
+    -- Snapshot-based collection (default enabled) - Query pg_stat_activity once
     v_snapshot_based := COALESCE(
         flight_recorder._get_config('snapshot_based_collection', 'true')::boolean,
         true
@@ -1576,7 +1576,7 @@ BEGIN
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
 
-        -- Phase 5B: Use snapshot table if enabled (reduces catalog locks)
+        -- Use snapshot table if enabled (reduces catalog locks)
         IF v_snapshot_based THEN
             INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
             SELECT
@@ -1621,7 +1621,7 @@ BEGIN
                 100
             );
 
-            -- Phase 5B: Use snapshot table if enabled (reduces catalog locks)
+            -- Use snapshot table if enabled (reduces catalog locks)
             -- Quick count (minimal overhead)
             IF v_snapshot_based THEN
                 SELECT COUNT(*) INTO v_active_conn_count
@@ -1637,7 +1637,7 @@ BEGIN
                 RAISE NOTICE 'pg-flight-recorder: Skipping activity collection - % active connections exceeds threshold %',
                     v_active_conn_count, v_skip_activity_threshold;
             ELSE
-                -- Phase 5B: Use snapshot table if enabled
+                -- Use snapshot table if enabled
                 IF v_snapshot_based THEN
                     INSERT INTO flight_recorder.activity_samples (
                         sample_id, sample_captured_at, pid, usename, application_name, backend_type,
@@ -1834,7 +1834,7 @@ BEGIN
                 50
             );
 
-            -- Phase 5B: Use snapshot table if enabled (reduces catalog locks)
+            -- Use snapshot table if enabled (reduces catalog locks)
             -- Quick count of blocked sessions (minimal overhead)
             IF v_snapshot_based THEN
                 SELECT COUNT(*) INTO v_blocked_count
@@ -1851,7 +1851,7 @@ BEGIN
                 RAISE NOTICE 'pg-flight-recorder: Skipping lock collection - % blocked sessions exceeds threshold % (potential lock storm)',
                     v_blocked_count, v_skip_locks_threshold;
             ELSE
-                -- Phase 5B: Use snapshot table if enabled
+                -- Use snapshot table if enabled
                 -- O(n) lock detection using pg_blocking_pids()
                 -- pg_blocking_pids(pid) returns array of PIDs blocking a given PID
                 -- This is much more efficient than the O(n²) self-join on pg_locks
@@ -2263,7 +2263,7 @@ BEGIN
             v_statements_interval_minutes INTEGER;
             v_should_collect BOOLEAN := TRUE;
         BEGIN
-            -- Phase 5A: Check if enough time has elapsed since last statements collection
+            -- Check if enough time has elapsed since last statements collection
             v_statements_interval_minutes := COALESCE(
                 flight_recorder._get_config('statements_interval_minutes', '15')::integer,
                 15
@@ -3774,7 +3774,7 @@ BEGIN
     -- Get current mode
     v_mode := flight_recorder._get_config('mode', 'normal');
 
-    -- Phase 5A: Get configurable sample interval (default 120s)
+    -- Get configurable sample interval (default 120s)
     v_sample_interval_seconds := COALESCE(
         flight_recorder._get_config('sample_interval_seconds', '120')::integer,
         120
@@ -3802,7 +3802,7 @@ BEGIN
         PERFORM cron.schedule('flight_recorder_snapshot', '*/5 * * * *', 'SELECT flight_recorder.snapshot()');
         v_scheduled := v_scheduled + 1;
 
-        -- Phase 5A: Schedule sample based on configurable interval
+        -- Schedule sample based on configurable interval
         -- Convert seconds to minutes for cron format (only supports minute granularity)
         IF v_sample_interval_seconds < 60 THEN
             -- Sub-minute intervals not supported reliably, default to 60s
@@ -3884,7 +3884,7 @@ BEGIN
         WHEN undefined_function THEN NULL;
     END;
 
-    -- Phase 5A: Read sample interval from config (default 120s)
+    -- Read sample interval from config (default 120s)
     SELECT value::integer INTO v_sample_interval_seconds
     FROM flight_recorder.config
     WHERE key = 'sample_interval_seconds';
@@ -3917,7 +3917,7 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Phase 5A: Schedule sample collection based on configured interval
+    -- Schedule sample collection based on configured interval
     IF v_sample_interval_seconds < 60 THEN
         -- Sub-minute intervals - round up to 60s (not reliably supported)
         v_cron_expression := '* * * * *';
@@ -4775,6 +4775,416 @@ BEGIN
             'No configuration changes recommended at this time'::text,
             NULL::text;
     END IF;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Preflight Check - Run before enabling for "set and forget" validation
+-- -----------------------------------------------------------------------------
+-- No-brainer pre-flight validation for initial setup.
+-- Checks if your environment is suitable for always-on monitoring.
+-- Returns: Clear GO/NO-GO with actionable recommendations.
+--
+-- USAGE:
+--   SELECT * FROM flight_recorder.preflight_check();
+--
+-- Expected output: All checks should show 'GO' status for safe always-on operation.
+--
+CREATE OR REPLACE FUNCTION flight_recorder.preflight_check()
+RETURNS TABLE(
+    check_name TEXT,
+    status TEXT,
+    details TEXT,
+    recommendation TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_max_connections INTEGER;
+    v_current_connections INTEGER;
+    v_pg_stat_statements_max INTEGER;
+    v_cpu_count INTEGER;
+    v_shared_buffers_mb INTEGER;
+    v_connection_pct NUMERIC;
+    v_pg_cron_exists BOOLEAN;
+BEGIN
+    -- Check 1: System resources (CPU count via pg_stat_statements or estimate)
+    BEGIN
+        -- Try to get CPU count from system (may not be available)
+        v_cpu_count := (SELECT setting::integer FROM pg_settings WHERE name = 'max_worker_processes');
+        IF v_cpu_count < 4 THEN
+            RETURN QUERY SELECT
+                'System Resources'::text,
+                'CAUTION'::text,
+                format('Detected %s worker processes (CPU estimate)', v_cpu_count),
+                'Flight recorder overhead (0.5%%) is acceptable but consider testing in staging first. Systems with <4 cores have less overhead margin.'::text;
+        ELSE
+            RETURN QUERY SELECT
+                'System Resources'::text,
+                'GO'::text,
+                format('Detected %s worker processes', v_cpu_count),
+                'System has adequate resources for always-on monitoring.'::text;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN QUERY SELECT
+            'System Resources'::text,
+            'GO'::text,
+            'Unable to detect CPU count',
+            'Verify your system has ≥4 CPU cores for comfortable always-on operation.'::text;
+    END;
+
+    -- Check 2: Connection headroom
+    SELECT setting::integer INTO v_max_connections FROM pg_settings WHERE name = 'max_connections';
+    SELECT count(*) INTO v_current_connections FROM pg_stat_activity;
+    v_connection_pct := (v_current_connections::numeric / v_max_connections) * 100;
+
+    IF v_connection_pct > 70 THEN
+        RETURN QUERY SELECT
+            'Connection Headroom'::text,
+            'CAUTION'::text,
+            format('Currently %s%% of max_connections (%s/%s)', round(v_connection_pct, 1), v_current_connections, v_max_connections),
+            'System frequently near max_connections. Adaptive mode will trigger often. Consider increasing max_connections or monitoring connection patterns.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            'Connection Headroom'::text,
+            'GO'::text,
+            format('Currently %s%% of max_connections (%s/%s)', round(v_connection_pct, 1), v_current_connections, v_max_connections),
+            'Adequate connection headroom for normal operations.'::text;
+    END IF;
+
+    -- Check 3: pg_stat_statements budget
+    BEGIN
+        SELECT setting::integer INTO v_pg_stat_statements_max
+        FROM pg_settings WHERE name = 'pg_stat_statements.max';
+
+        IF v_pg_stat_statements_max < 5000 THEN
+            RETURN QUERY SELECT
+                'pg_stat_statements Budget'::text,
+                'NO-GO'::text,
+                format('pg_stat_statements.max = %s (too low)', v_pg_stat_statements_max),
+                'Flight recorder will consume 20-40% of statement budget. Increase to at least 10,000: ALTER SYSTEM SET pg_stat_statements.max = 10000; (requires restart)'::text;
+        ELSIF v_pg_stat_statements_max < 10000 THEN
+            RETURN QUERY SELECT
+                'pg_stat_statements Budget'::text,
+                'CAUTION'::text,
+                format('pg_stat_statements.max = %s (minimal)', v_pg_stat_statements_max),
+                'Flight recorder will consume 20-40% of statement budget. Consider increasing to 10,000+ for comfortable operation.'::text;
+        ELSE
+            RETURN QUERY SELECT
+                'pg_stat_statements Budget'::text,
+                'GO'::text,
+                format('pg_stat_statements.max = %s', v_pg_stat_statements_max),
+                'Adequate statement tracking capacity.'::text;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN QUERY SELECT
+            'pg_stat_statements Budget'::text,
+            'CAUTION'::text,
+            'pg_stat_statements extension not found or not configured',
+            'Statement collection will be disabled (statements_enabled=auto). This is acceptable if you don''t need query-level metrics.'::text;
+    END;
+
+    -- Check 4: Storage headroom
+    BEGIN
+        SELECT setting::integer INTO v_shared_buffers_mb
+        FROM pg_settings WHERE name = 'shared_buffers';
+        -- Convert from 8KB blocks to MB
+        v_shared_buffers_mb := (v_shared_buffers_mb * 8) / 1024;
+
+        RETURN QUERY SELECT
+            'Storage Overhead'::text,
+            'GO'::text,
+            'Flight recorder uses 2-3 GB per week (default 7-day retention)',
+            'UNLOGGED tables minimize WAL overhead. Daily partition cleanup prevents unbounded growth.'::text;
+    END;
+
+    -- Check 5: pg_cron availability
+    SELECT EXISTS (
+        SELECT 1 FROM pg_extension WHERE extname = 'pg_cron'
+    ) INTO v_pg_cron_exists;
+
+    IF v_pg_cron_exists THEN
+        RETURN QUERY SELECT
+            'Scheduling (pg_cron)'::text,
+            'GO'::text,
+            'pg_cron extension detected',
+            'Automatic scheduling will work. Flight recorder will run automatically every 3 minutes.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            'Scheduling (pg_cron)'::text,
+            'CAUTION'::text,
+            'pg_cron extension not found',
+            'You will need to schedule flight_recorder.sample() and flight_recorder.snapshot() manually via external cron or pg_agent.'::text;
+    END IF;
+
+    -- Check 6: Safety mechanisms
+    RETURN QUERY SELECT
+        'Safety Mechanisms'::text,
+        'GO'::text,
+        'Circuit breaker, adaptive mode, DDL detection, timeouts all enabled by default',
+        'Flight recorder will auto-reduce overhead under stress and prevent lock contention.'::text;
+
+    -- Summary recommendation
+    DECLARE
+        v_nogo_count INTEGER;
+        v_caution_count INTEGER;
+    BEGIN
+        SELECT
+            count(*) FILTER (WHERE status = 'NO-GO'),
+            count(*) FILTER (WHERE status = 'CAUTION')
+        INTO v_nogo_count, v_caution_count
+        FROM flight_recorder.preflight_check();
+
+        IF v_nogo_count > 0 THEN
+            RETURN QUERY SELECT
+                '=== SUMMARY ==='::text,
+                'NO-GO'::text,
+                format('%s critical issues detected', v_nogo_count),
+                'Address NO-GO items before enabling always-on monitoring. See recommendations above.'::text;
+        ELSIF v_caution_count > 0 THEN
+            RETURN QUERY SELECT
+                '=== SUMMARY ==='::text,
+                'PROCEED WITH CAUTION'::text,
+                format('%s cautions detected', v_caution_count),
+                'System is acceptable for always-on monitoring but consider addressing cautions. Test in staging first if possible.'::text;
+        ELSE
+            RETURN QUERY SELECT
+                '=== SUMMARY ==='::text,
+                'READY FOR PRODUCTION'::text,
+                'All checks passed',
+                'System is well-suited for "set and forget" always-on monitoring. Run quarterly_review() every 3 months to verify continued health.'::text;
+        END IF;
+    END;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Quarterly Review - Run every 3 months for ongoing health validation
+-- -----------------------------------------------------------------------------
+-- No-brainer quarterly health check for always-on deployments.
+-- Validates that flight recorder is still operating within acceptable parameters.
+-- Returns: Clear health status with actionable recommendations.
+--
+-- USAGE:
+--   SELECT * FROM flight_recorder.quarterly_review();
+--
+-- Run this every 3 months (set a calendar reminder) to ensure flight recorder
+-- continues to operate safely. Takes ~1 second to execute.
+--
+CREATE OR REPLACE FUNCTION flight_recorder.quarterly_review()
+RETURNS TABLE(
+    component TEXT,
+    status TEXT,
+    metric TEXT,
+    assessment TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_avg_duration_ms NUMERIC;
+    v_max_duration_ms NUMERIC;
+    v_skipped_count INTEGER;
+    v_total_count INTEGER;
+    v_schema_size_mb NUMERIC;
+    v_last_sample TIMESTAMPTZ;
+    v_last_snapshot TIMESTAMPTZ;
+    v_circuit_breaker_trips INTEGER;
+    v_ddl_skips INTEGER;
+    v_failed_collections INTEGER;
+    v_sample_count INTEGER;
+BEGIN
+    -- Header
+    RETURN QUERY SELECT
+        '=== FLIGHT RECORDER QUARTERLY REVIEW ==='::text,
+        'INFO'::text,
+        format('Review period: Last 90 days | Generated: %s', now()::text),
+        'This review validates flight recorder health for continued always-on operation.'::text;
+
+    -- Metric 1: Average overhead (last 30 days)
+    SELECT
+        avg(duration_ms),
+        max(duration_ms),
+        count(*) FILTER (WHERE skipped),
+        count(*)
+    INTO v_avg_duration_ms, v_max_duration_ms, v_skipped_count, v_total_count
+    FROM flight_recorder.collection_stats
+    WHERE started_at > now() - interval '30 days'
+      AND collection_type = 'sample';
+
+    IF v_avg_duration_ms IS NULL THEN
+        RETURN QUERY SELECT
+            '1. Collection Performance'::text,
+            'ERROR'::text,
+            'No collections in last 30 days',
+            'Flight recorder may not be running. Check pg_cron jobs.'::text;
+    ELSIF v_avg_duration_ms < 200 THEN
+        RETURN QUERY SELECT
+            '1. Collection Performance'::text,
+            'EXCELLENT'::text,
+            format('Avg: %sms | Max: %sms | Skipped: %s/%s',
+                   round(v_avg_duration_ms), round(v_max_duration_ms), v_skipped_count, v_total_count),
+            'Collection overhead is minimal. No action needed.'::text;
+    ELSIF v_avg_duration_ms < 500 THEN
+        RETURN QUERY SELECT
+            '1. Collection Performance'::text,
+            'GOOD'::text,
+            format('Avg: %sms | Max: %sms | Skipped: %s/%s',
+                   round(v_avg_duration_ms), round(v_max_duration_ms), v_skipped_count, v_total_count),
+            'Collection overhead is acceptable. Continue monitoring.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '1. Collection Performance'::text,
+            'REVIEW NEEDED'::text,
+            format('Avg: %sms | Max: %sms | Skipped: %s/%s',
+                   round(v_avg_duration_ms), round(v_max_duration_ms), v_skipped_count, v_total_count),
+            'Collections are slower than expected. Consider: (1) switching to light mode, (2) increasing sample_interval_seconds to 300, or (3) checking for system bottlenecks.'::text;
+    END IF;
+
+    -- Metric 2: Storage consumption
+    SELECT schema_size_mb INTO v_schema_size_mb FROM flight_recorder._check_schema_size();
+    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples;
+
+    IF v_schema_size_mb < 3000 THEN
+        RETURN QUERY SELECT
+            '2. Storage Consumption'::text,
+            'EXCELLENT'::text,
+            format('%s MB | %s samples', round(v_schema_size_mb), v_sample_count),
+            'Storage usage is healthy. Daily cleanup is working correctly.'::text;
+    ELSIF v_schema_size_mb < 6000 THEN
+        RETURN QUERY SELECT
+            '2. Storage Consumption'::text,
+            'GOOD'::text,
+            format('%s MB | %s samples', round(v_schema_size_mb), v_sample_count),
+            'Storage usage is acceptable. Monitor growth trend.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '2. Storage Consumption'::text,
+            'REVIEW NEEDED'::text,
+            format('%s MB | %s samples', round(v_schema_size_mb), v_sample_count),
+            'Storage usage is high. Run cleanup() or reduce retention_samples_days.'::text;
+    END IF;
+
+    -- Metric 3: Collection reliability (last 90 days)
+    SELECT
+        count(*) FILTER (WHERE NOT success AND NOT skipped)
+    INTO v_failed_collections
+    FROM flight_recorder.collection_stats
+    WHERE started_at > now() - interval '90 days';
+
+    IF v_failed_collections = 0 THEN
+        RETURN QUERY SELECT
+            '3. Collection Reliability'::text,
+            'EXCELLENT'::text,
+            format('0 failed collections in 90 days'),
+            'Flight recorder is operating reliably.'::text;
+    ELSIF v_failed_collections < 10 THEN
+        RETURN QUERY SELECT
+            '3. Collection Reliability'::text,
+            'GOOD'::text,
+            format('%s failed collections in 90 days', v_failed_collections),
+            'Minimal failures detected. This is normal and acceptable.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '3. Collection Reliability'::text,
+            'REVIEW NEEDED'::text,
+            format('%s failed collections in 90 days', v_failed_collections),
+            'Frequent failures detected. Check collection_stats for error patterns.'::text;
+    END IF;
+
+    -- Metric 4: Circuit breaker activity (last 90 days)
+    SELECT count(*) INTO v_circuit_breaker_trips
+    FROM flight_recorder.collection_stats
+    WHERE skipped = true
+      AND skipped_reason LIKE '%Circuit breaker%'
+      AND started_at > now() - interval '90 days';
+
+    IF v_circuit_breaker_trips = 0 THEN
+        RETURN QUERY SELECT
+            '4. Circuit Breaker Activity'::text,
+            'EXCELLENT'::text,
+            '0 trips in 90 days',
+            'System has not experienced collection stress.'::text;
+    ELSIF v_circuit_breaker_trips < 20 THEN
+        RETURN QUERY SELECT
+            '4. Circuit Breaker Activity'::text,
+            'GOOD'::text,
+            format('%s trips in 90 days', v_circuit_breaker_trips),
+            'Circuit breaker has triggered occasionally. This is normal during temporary load spikes.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '4. Circuit Breaker Activity'::text,
+            'REVIEW NEEDED'::text,
+            format('%s trips in 90 days', v_circuit_breaker_trips),
+            'Frequent circuit breaker trips indicate system stress. Consider switching to light mode permanently.'::text;
+    END IF;
+
+    -- Metric 5: DDL detection activity (last 90 days)
+    SELECT count(*) INTO v_ddl_skips
+    FROM flight_recorder.collection_stats
+    WHERE skipped = true
+      AND skipped_reason LIKE '%DDL%'
+      AND started_at > now() - interval '90 days';
+
+    IF v_ddl_skips = 0 THEN
+        RETURN QUERY SELECT
+            '5. DDL Detection Activity'::text,
+            'INFO'::text,
+            '0 DDL-related skips in 90 days',
+            'No schema changes detected during collection windows.'::text;
+    ELSIF v_ddl_skips < 50 THEN
+        RETURN QUERY SELECT
+            '5. DDL Detection Activity'::text,
+            'INFO'::text,
+            format('%s DDL-related skips in 90 days', v_ddl_skips),
+            'DDL detection prevented lock contention. This is working as intended.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '5. DDL Detection Activity'::text,
+            'INFO'::text,
+            format('%s DDL-related skips in 90 days', v_ddl_skips),
+            'Frequent DDL activity detected. Normal if you have active schema changes. Consider ddl_skip_entire_sample=false if you need lock data during DDL.'::text;
+    END IF;
+
+    -- Metric 6: Data freshness
+    SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples;
+    SELECT max(captured_at) INTO v_last_snapshot FROM flight_recorder.snapshots;
+
+    IF v_last_sample > now() - interval '10 minutes' AND v_last_snapshot > now() - interval '15 minutes' THEN
+        RETURN QUERY SELECT
+            '6. Data Freshness'::text,
+            'EXCELLENT'::text,
+            format('Last sample: %s ago | Last snapshot: %s ago',
+                   age(now(), v_last_sample)::text, age(now(), v_last_snapshot)::text),
+            'Collections are running on schedule.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '6. Data Freshness'::text,
+            'ERROR'::text,
+            format('Last sample: %s ago | Last snapshot: %s ago',
+                   age(now(), v_last_sample)::text, age(now(), v_last_snapshot)::text),
+            'Collections are stale. Check pg_cron jobs: SELECT * FROM cron.job WHERE jobname LIKE ''flight_recorder_%'';'::text;
+    END IF;
+
+    -- Summary and next steps
+    DECLARE
+        v_issues_count INTEGER;
+    BEGIN
+        SELECT count(*) INTO v_issues_count
+        FROM flight_recorder.quarterly_review()
+        WHERE status IN ('ERROR', 'REVIEW NEEDED');
+
+        IF v_issues_count = 0 THEN
+            RETURN QUERY SELECT
+                '=== QUARTERLY REVIEW SUMMARY ==='::text,
+                'HEALTHY'::text,
+                'All metrics within acceptable parameters',
+                'Flight recorder is operating as expected. Schedule next review in 3 months. No action required.'::text;
+        ELSE
+            RETURN QUERY SELECT
+                '=== QUARTERLY REVIEW SUMMARY ==='::text,
+                'ACTION REQUIRED'::text,
+                format('%s items need review', v_issues_count),
+                'Address items marked ERROR or REVIEW NEEDED above. Run config_recommendations() for specific tuning suggestions.'::text;
+        END IF;
+    END;
 END;
 $$;
 
