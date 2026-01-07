@@ -657,7 +657,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('statement_timeout_ms', '2000'),          -- Max total collection time (REDUCED from 5000ms)
     ('lock_timeout_ms', '500'),                -- Max wait for catalog locks (REDUCED from 1000ms)
     ('work_mem_kb', '2048'),                   -- work_mem limit for flight recorder queries (2MB)
-    -- A+: Per-section sub-timeouts (prevent one section consuming entire budget)
+    -- Per-section sub-timeouts (prevent one section consuming entire budget)
     ('section_timeout_ms', '1000'),            -- Max time per section (reset before each section)
     -- P0: Cost-based skip thresholds (NEW - proactive checks before expensive queries)
     ('skip_locks_threshold', '200'),           -- Skip lock collection if > N blocked locks
@@ -839,7 +839,7 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- -----------------------------------------------------------------------------
--- A+: Helper: Set per-section timeout
+-- Helper: Set per-section timeout
 -- Resets statement_timeout before each section to prevent one section consuming entire budget
 -- -----------------------------------------------------------------------------
 
@@ -1186,7 +1186,7 @@ $$;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.sample() - High-frequency sampling (wait events, activity, progress, locks)
--- A+ Safety: Per-section timeouts, O(n) lock detection using pg_blocking_pids()
+-- Per-section timeouts, O(n) lock detection using pg_blocking_pids()
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION flight_recorder.sample()
@@ -1234,13 +1234,13 @@ BEGIN
     );
     v_pg_version := flight_recorder._pg_version();
 
-    -- Create sample record (A+: Set section timeout before each section)
+    -- Create sample record (set section timeout before each section)
     PERFORM flight_recorder._set_section_timeout();
     INSERT INTO flight_recorder.samples (captured_at)
     VALUES (v_captured_at)
     RETURNING id INTO v_sample_id;
 
-    -- Section 1: Wait events (A+: Per-section timeout)
+    -- Section 1: Wait events
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
@@ -1261,7 +1261,7 @@ BEGIN
         RAISE WARNING 'pg-flight-recorder: Wait events collection failed: %', SQLERRM;
     END;
 
-    -- Section 2: Active sessions (A+: Per-section timeout + cost-based skip)
+    -- Section 2: Active sessions (cost-based skip)
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         DECLARE
@@ -1311,7 +1311,7 @@ BEGIN
         RAISE WARNING 'pg-flight-recorder: Activity samples collection failed: %', SQLERRM;
     END;
 
-    -- Section 3: Progress tracking (A+: Per-section timeout)
+    -- Section 3: Progress tracking
     IF v_enable_progress THEN
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
@@ -1440,8 +1440,8 @@ BEGIN
     END;
     END IF;  -- v_enable_progress
 
-    -- Section 4: Lock sampling (A+: Per-section timeout + O(n) algorithm using pg_blocking_pids())
-    -- REWRITTEN: Uses pg_blocking_pids() which is O(n) instead of O(n²) join on pg_locks
+    -- Section 4: Lock sampling (O(n) algorithm using pg_blocking_pids())
+    -- Uses pg_blocking_pids() which is O(n) instead of O(n²) join on pg_locks
     IF v_enable_locks THEN
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
@@ -1464,7 +1464,7 @@ BEGIN
                 RAISE NOTICE 'pg-flight-recorder: Skipping lock collection - % blocked sessions exceeds threshold % (potential lock storm)',
                     v_blocked_count, v_skip_locks_threshold;
             ELSE
-                -- A+ REWRITE: O(n) lock detection using pg_blocking_pids()
+                -- O(n) lock detection using pg_blocking_pids()
                 -- pg_blocking_pids(pid) returns array of PIDs blocking a given PID
                 -- This is much more efficient than the O(n²) self-join on pg_locks
                 INSERT INTO flight_recorder.lock_samples (
@@ -1515,7 +1515,7 @@ BEGIN
     -- P0 Safety: Record successful completion
     PERFORM flight_recorder._record_collection_end(v_stat_id, true, NULL);
 
-    -- A+ Safety: Reset statement_timeout to avoid affecting subsequent queries
+    -- Reset statement_timeout to avoid affecting subsequent queries
     PERFORM set_config('statement_timeout', '0', true);
 
     RETURN v_captured_at;
@@ -1523,7 +1523,7 @@ EXCEPTION
     WHEN OTHERS THEN
         -- P0 Safety: Record failure if entire function fails
         PERFORM flight_recorder._record_collection_end(v_stat_id, false, SQLERRM);
-        -- A+ Safety: Reset statement_timeout even on failure
+        -- Reset statement_timeout even on failure
         PERFORM set_config('statement_timeout', '0', true);
         RAISE;
 END;
@@ -1531,7 +1531,7 @@ $$;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.snapshot() - Capture current state
--- A+ Safety: Per-section timeouts
+-- Per-section timeouts
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION flight_recorder.snapshot()
@@ -1585,7 +1585,7 @@ BEGIN
 
     v_pg_version := flight_recorder._pg_version();
 
-    -- Section 1: Collect system stats (A+: Per-section timeout)
+    -- Section 1: Collect system stats
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         -- Count active autovacuum workers
@@ -1617,7 +1617,7 @@ BEGIN
         v_temp_bytes := 0;
     END;
 
-    -- Section 2: pg_stat_io collection (A+: Per-section timeout, PG16+)
+    -- Section 2: pg_stat_io collection (PG16+)
     IF v_pg_version >= 16 THEN
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
@@ -1757,7 +1757,7 @@ BEGIN
     -- Main snapshot INSERT completed successfully
     PERFORM flight_recorder._record_section_success(v_stat_id);
 
-    -- Section 3: Capture stats for tracked tables (A+: Per-section timeout)
+    -- Section 3: Capture stats for tracked tables
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         INSERT INTO flight_recorder.table_snapshots (
@@ -1798,7 +1798,7 @@ BEGIN
         RAISE WARNING 'pg-flight-recorder: Tracked tables collection failed: %', SQLERRM;
     END;
 
-    -- Section 4: Capture replication stats (A+: Per-section timeout)
+    -- Section 4: Capture replication stats
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         INSERT INTO flight_recorder.replication_snapshots (
@@ -1827,7 +1827,7 @@ BEGIN
         RAISE WARNING 'pg-flight-recorder: Replication stats collection failed: %', SQLERRM;
     END;
 
-    -- Section 5: Capture pg_stat_statements (A+: Per-section timeout, if available and enabled)
+    -- Section 5: Capture pg_stat_statements (if available and enabled)
     IF flight_recorder._has_pg_stat_statements()
        AND flight_recorder._get_config('statements_enabled', 'auto') != 'false'
     THEN
@@ -1893,7 +1893,7 @@ BEGIN
     -- P0 Safety: Record successful completion
     PERFORM flight_recorder._record_collection_end(v_stat_id, true, NULL);
 
-    -- A+ Safety: Reset statement_timeout to avoid affecting subsequent queries
+    -- Reset statement_timeout to avoid affecting subsequent queries
     PERFORM set_config('statement_timeout', '0', true);
 
     RETURN v_captured_at;
@@ -1901,7 +1901,7 @@ EXCEPTION
     WHEN OTHERS THEN
         -- P0 Safety: Record failure if entire function fails
         PERFORM flight_recorder._record_collection_end(v_stat_id, false, SQLERRM);
-        -- A+ Safety: Reset statement_timeout even on failure
+        -- Reset statement_timeout even on failure
         PERFORM set_config('statement_timeout', '0', true);
         RAISE;
 END;
