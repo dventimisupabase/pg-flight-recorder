@@ -61,10 +61,10 @@ pg-flight-recorder has measurable overhead. Exact cost depends on configuration:
 
 | Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
 |--------|-----------------|-----------------|----------------|-------|
-| **Default** | 120s | 250ms | 0.8% | Recommended for production |
-| **High Resolution** | 60s | 250ms | 1.7% | Configurable - higher temporal resolution |
-| **Light Mode** | 120s | 250ms | 0.7% | Disables progress tracking |
-| **Emergency Mode** | 120s | 250ms | 0.5% | Disables locks and progress tracking |
+| **Default** | 120s | 250ms | 0.8% | 4 sections: wait, activity, progress, locks |
+| **High Resolution** | 60s | 250ms | 1.7% | Set sample_interval_seconds=60 for higher temporal resolution |
+| **Light Mode** | 120s | 250ms | 0.6% | 3 sections: wait, activity, locks (progress disabled) |
+| **Emergency Mode** | 120s | 250ms | 0.4% | 2 sections: wait, activity (locks and progress disabled) |
 
 Additional considerations:
 

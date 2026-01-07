@@ -1870,10 +1870,10 @@ BEGIN
     -- P0 Safety: Record collection start for circuit breaker (5 sections: system stats, snapshot INSERT, tracked tables, replication, statements)
     v_stat_id := flight_recorder._record_collection_start('snapshot', 5);
 
-    -- P0 Safety: Set lock timeout and work_mem (A-GRADE: REDUCED THRESHOLDS)
+    -- P0 Safety: Set lock timeout and work_mem
     PERFORM set_config('lock_timeout',
-        COALESCE(flight_recorder._get_config('lock_timeout_ms', '500'), '500'),
-        true);  -- REDUCED from 1000ms to 500ms
+        COALESCE(flight_recorder._get_config('lock_timeout_ms', '100'), '100'),
+        true);
     PERFORM set_config('work_mem',
         COALESCE(flight_recorder._get_config('work_mem_kb', '2048'), '2048') || 'kB',
         true);  -- Limit memory for joins/sorts
@@ -3239,35 +3239,44 @@ CREATE OR REPLACE FUNCTION flight_recorder.set_mode(p_mode TEXT)
 RETURNS TEXT
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_interval TEXT;
     v_enable_locks BOOLEAN;
     v_enable_progress BOOLEAN;
     v_description TEXT;
-    v_pgcron_version TEXT;
-    v_supports_subsecond BOOLEAN := FALSE;
+    v_sample_interval_seconds INTEGER;
+    v_sample_interval_minutes INTEGER;
+    v_cron_expression TEXT;
+    v_current_interval INTEGER;
 BEGIN
     -- Validate mode
     IF p_mode NOT IN ('normal', 'light', 'emergency') THEN
         RAISE EXCEPTION 'Invalid mode: %. Must be normal, light, or emergency.', p_mode;
     END IF;
 
-    -- Set mode-specific configuration (A-GRADE: Normal mode now 60s instead of 30s)
+    -- Get current sample interval from config
+    v_current_interval := COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '120')::integer,
+        120
+    );
+
+    -- Set mode-specific configuration
+    -- Modes control WHAT is collected (locks, progress), not HOW OFTEN (interval)
     CASE p_mode
         WHEN 'normal' THEN
-            v_interval := '* * * * *';  -- Every minute (cron format for 60s) - A-GRADE: INCREASED from 30s
             v_enable_locks := TRUE;
             v_enable_progress := TRUE;
-            v_description := 'Normal mode: 60s sampling (A-GRADE safety), all collectors enabled';
+            v_sample_interval_seconds := v_current_interval;  -- Respect current config
+            v_description := format('Normal mode: %ss sampling, all collectors enabled', v_sample_interval_seconds);
         WHEN 'light' THEN
-            v_interval := '* * * * *';  -- Every minute (cron format for 60s)
             v_enable_locks := TRUE;
             v_enable_progress := FALSE;
-            v_description := 'Light mode: 60s sampling, progress tracking disabled';
+            v_sample_interval_seconds := v_current_interval;  -- Respect current config
+            v_description := format('Light mode: %ss sampling, progress tracking disabled', v_sample_interval_seconds);
         WHEN 'emergency' THEN
-            v_interval := '*/2 * * * *';  -- Every 2 minutes (cron format for 120s)
             v_enable_locks := FALSE;
             v_enable_progress := FALSE;
-            v_description := 'Emergency mode: 120s sampling, locks and progress disabled';
+            -- Emergency mode forces minimum 120s interval
+            v_sample_interval_seconds := GREATEST(v_current_interval, 120);
+            v_description := format('Emergency mode: %ss sampling, locks and progress disabled', v_sample_interval_seconds);
     END CASE;
 
     -- Update configuration
@@ -3283,35 +3292,30 @@ BEGIN
     VALUES ('enable_progress', v_enable_progress::text, now())
     ON CONFLICT (key) DO UPDATE SET value = v_enable_progress::text, updated_at = now();
 
+    -- If emergency mode and interval < 120s, update interval
+    IF p_mode = 'emergency' AND v_sample_interval_seconds > v_current_interval THEN
+        INSERT INTO flight_recorder.config (key, value, updated_at)
+        VALUES ('sample_interval_seconds', v_sample_interval_seconds::text, now())
+        ON CONFLICT (key) DO UPDATE SET value = v_sample_interval_seconds::text, updated_at = now();
+    END IF;
+
     -- Reschedule pg_cron job (if pg_cron available)
     BEGIN
-        SELECT extversion INTO v_pgcron_version FROM pg_extension WHERE extname = 'pg_cron';
-
-        IF v_pgcron_version IS NOT NULL THEN
-            v_pgcron_version := split_part(v_pgcron_version, '-', 1);
-            v_supports_subsecond := (
-                split_part(v_pgcron_version, '.', 1)::int > 1 OR
-                (split_part(v_pgcron_version, '.', 1)::int = 1 AND
-                 split_part(v_pgcron_version, '.', 2)::int > 4) OR
-                (split_part(v_pgcron_version, '.', 1)::int = 1 AND
-                 split_part(v_pgcron_version, '.', 2)::int = 4 AND
-                 COALESCE(NULLIF(split_part(v_pgcron_version, '.', 3), '')::int, 0) >= 1)
-            );
-
-            -- Unschedule existing
-            PERFORM cron.unschedule('flight_recorder_sample');
-
-            IF v_supports_subsecond THEN
-                PERFORM cron.schedule('flight_recorder_sample', v_interval, 'SELECT flight_recorder.sample()');
-            ELSE
-                -- Fallback: minute-level schedules
-                IF p_mode = 'emergency' THEN
-                    PERFORM cron.schedule('flight_recorder_sample', '*/2 * * * *', 'SELECT flight_recorder.sample()');
-                ELSE
-                    PERFORM cron.schedule('flight_recorder_sample', '* * * * *', 'SELECT flight_recorder.sample()');
-                END IF;
-            END IF;
+        -- Convert interval to cron expression
+        IF v_sample_interval_seconds < 60 THEN
+            v_cron_expression := '* * * * *';
+        ELSIF v_sample_interval_seconds = 60 THEN
+            v_cron_expression := '* * * * *';
+        ELSE
+            v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
+            v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
         END IF;
+
+        -- Unschedule existing
+        PERFORM cron.unschedule('flight_recorder_sample');
+
+        -- Schedule with new expression
+        PERFORM cron.schedule('flight_recorder_sample', v_cron_expression, 'SELECT flight_recorder.sample()');
     EXCEPTION
         WHEN undefined_table THEN NULL;
         WHEN undefined_function THEN NULL;
@@ -3465,7 +3469,7 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
--- A-GRADE: Partition Management Functions
+-- Partition Management Functions
 -- -----------------------------------------------------------------------------
 
 -- Create future partitions for samples table (daily partitions)
@@ -3599,7 +3603,7 @@ BEGIN
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_cleanup');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
 
-        -- A-GRADE: Unschedule partition creation
+        -- Unschedule partition creation
         PERFORM cron.unschedule('flight_recorder_partition')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_partition');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
@@ -3697,7 +3701,7 @@ BEGIN
             'SELECT flight_recorder.drop_old_partitions(); SELECT * FROM flight_recorder.cleanup(''7 days''::interval);');
         v_scheduled := v_scheduled + 1;
 
-        -- A-GRADE: Schedule partition creation (daily at 2 AM) - create future partitions proactively
+        -- Schedule partition creation (daily at 2 AM) - create future partitions proactively
         PERFORM cron.schedule('flight_recorder_partition', '0 2 * * *', 'SELECT flight_recorder.create_partitions(3)');
         v_scheduled := v_scheduled + 1;
 
