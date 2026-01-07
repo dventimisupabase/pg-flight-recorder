@@ -492,8 +492,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.progress_samples (
     sample_captured_at  TIMESTAMPTZ,
     progress_type       TEXT NOT NULL,      -- 'vacuum', 'copy', 'analyze', 'create_index'
     pid                 INTEGER NOT NULL,
-    relid               OID,
-    relname             TEXT,
+    relid               OID,                -- Relation OID (convert to name at query time with ::regclass)
     phase               TEXT,
     blocks_total        BIGINT,
     blocks_done         BIGINT,
@@ -523,7 +522,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples (
     blocking_app            TEXT,
     blocking_query_preview  TEXT,
     lock_type               TEXT,
-    locked_relation         TEXT,
+    locked_relation_oid     OID,                -- Relation OID (convert to name at query time with ::regclass)
     PRIMARY KEY (sample_id, blocked_pid, blocking_pid),
     FOREIGN KEY (sample_id, sample_captured_at) REFERENCES flight_recorder.samples(id, captured_at) ON DELETE CASCADE
 );
@@ -612,12 +611,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('snapshot_based_collection', 'true'),     -- Use temp table snapshot of pg_stat_activity
     -- Adaptive sampling (opt-in, skips collection when idle)
     ('adaptive_sampling', 'false'),            -- Skip collection when system idle
-    ('adaptive_sampling_idle_threshold', '5'), -- Skip if < N active connections
-    -- DDL detection (enabled by default, prevents lock contention with schema changes)
-    ('ddl_detection_enabled', 'true'),         -- Check for active DDL before collecting
-    ('ddl_detection_use_locks', 'true'),       -- Use catalog locks for 100% accurate DDL detection (vs 95% regex)
-    ('ddl_skip_locks', 'true'),                -- Skip lock collection when DDL detected
-    ('ddl_skip_entire_sample', 'false')        -- Skip entire sample when DDL detected (more aggressive)
+    ('adaptive_sampling_idle_threshold', '5')  -- Skip if < N active connections
 ON CONFLICT (key) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
@@ -640,128 +634,6 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
 
 CREATE INDEX IF NOT EXISTS collection_stats_type_started_idx
     ON flight_recorder.collection_stats(collection_type, started_at DESC);
-
--- -----------------------------------------------------------------------------
--- Helper: Detect active DDL operations
--- -----------------------------------------------------------------------------
--- Checks for active DDL operations (CREATE, ALTER, DROP, TRUNCATE, REINDEX)
--- to prevent lock contention between flight recorder and schema changes.
---
--- Returns: Record with (ddl_detected BOOLEAN, ddl_count INTEGER, ddl_types TEXT[])
---
--- RATIONALE:
---   DDL operations acquire AccessExclusiveLock on system catalogs, which conflicts
---   with flight recorder's AccessShareLock on pg_stat_activity, pg_locks, etc.
---   This can cause:
---   1. Flight recorder lock timeouts (fails to collect)
---   2. DDL operations delayed by flight recorder's catalog locks
---
--- USAGE:
---   Called by sample() function before catalog queries to decide whether to:
---   - Skip lock collection (ddl_skip_locks = true)
---   - Skip entire sample (ddl_skip_entire_sample = true)
---
--- PERFORMANCE:
---   - Protected by lock_timeout=100ms (set before calling)
---   - Query limited to active backend_type='client backend' only
---   - Regex match on query text (fast, no joins)
---
-CREATE OR REPLACE FUNCTION flight_recorder._detect_active_ddl()
-RETURNS TABLE (
-    ddl_detected BOOLEAN,
-    ddl_count INTEGER,
-    ddl_types TEXT[]
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_use_locks BOOLEAN;
-BEGIN
-    -- Check if DDL detection is enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('ddl_detection_enabled', 'true')::boolean,
-        true
-    );
-
-    IF NOT v_enabled THEN
-        RETURN QUERY SELECT false, 0, ARRAY[]::TEXT[];
-        RETURN;
-    END IF;
-
-    -- Check for lock-based detection (100% accurate, default enabled)
-    v_use_locks := COALESCE(
-        flight_recorder._get_config('ddl_detection_use_locks', 'true')::boolean,
-        true
-    );
-
-    IF v_use_locks THEN
-        -- Method 1: Catalog-based (100% accurate) - A+ UPGRADE
-        -- DDL operations hold AccessExclusiveLock on system catalogs
-        -- This catches ALL DDL including dynamic SQL, stored procedures, multi-statement blocks
-        RETURN QUERY
-        WITH catalog_locks AS (
-            SELECT DISTINCT
-                l.pid,
-                -- Infer DDL type from locked relation
-                CASE
-                    WHEN c.relname IN ('pg_class', 'pg_attribute', 'pg_constraint', 'pg_index')
-                        THEN 'TABLE_DDL'
-                    WHEN c.relname IN ('pg_proc', 'pg_language')
-                        THEN 'FUNCTION_DDL'
-                    WHEN c.relname IN ('pg_type', 'pg_enum')
-                        THEN 'TYPE_DDL'
-                    WHEN c.relname IN ('pg_namespace')
-                        THEN 'SCHEMA_DDL'
-                    WHEN c.relname IN ('pg_extension')
-                        THEN 'EXTENSION_DDL'
-                    ELSE 'DDL'
-                END AS ddl_type
-            FROM pg_locks l
-            JOIN pg_class c ON l.relation = c.oid
-            WHERE l.locktype = 'relation'
-              AND l.mode = 'AccessExclusiveLock'
-              AND c.relnamespace = 'pg_catalog'::regnamespace  -- System catalog
-              AND l.granted = true  -- Lock acquired (not waiting)
-              AND l.pid != pg_backend_pid()  -- Exclude ourselves
-        )
-        SELECT
-            (COUNT(*) > 0)::BOOLEAN AS ddl_detected,
-            COUNT(*)::INTEGER AS ddl_count,
-            array_agg(DISTINCT ddl_type) AS ddl_types
-        FROM catalog_locks;
-    ELSE
-        -- Method 2: Query pattern fallback (95% accurate, for compatibility)
-        -- Enhanced regex to catch more edge cases than original
-        RETURN QUERY
-        WITH ddl_queries AS (
-            SELECT
-                CASE
-                    -- Enhanced regex to catch more edge cases
-                    WHEN query ~* '(^|;)\s*CREATE' THEN 'CREATE'
-                    WHEN query ~* '(^|;)\s*ALTER' THEN 'ALTER'
-                    WHEN query ~* '(^|;)\s*DROP' THEN 'DROP'
-                    WHEN query ~* '(^|;)\s*TRUNCATE' THEN 'TRUNCATE'
-                    WHEN query ~* '(^|;)\s*REINDEX' THEN 'REINDEX'
-                    WHEN query ~* '(^|;)\s*VACUUM\s+FULL' THEN 'VACUUM FULL'
-                    WHEN query ~* 'EXECUTE.*\$\$.*CREATE' THEN 'CREATE (dynamic)'
-                    WHEN query ~* 'EXECUTE.*\$\$.*ALTER' THEN 'ALTER (dynamic)'
-                    ELSE 'OTHER'
-                END AS ddl_type
-            FROM pg_stat_activity
-            WHERE state = 'active'
-              AND backend_type = 'client backend'
-              AND pid != pg_backend_pid()
-              AND (query ~* '(^|;)\s*(CREATE|ALTER|DROP|TRUNCATE|REINDEX|VACUUM\s+FULL)'
-                   OR query ~* 'EXECUTE.*\$\$.*\s*(CREATE|ALTER)')
-        )
-        SELECT
-            (COUNT(*) > 0)::BOOLEAN AS ddl_detected,
-            COUNT(*)::INTEGER AS ddl_count,
-            array_agg(DISTINCT ddl_type) AS ddl_types
-        FROM ddl_queries;
-    END IF;
-END;
-$$;
 
 -- -----------------------------------------------------------------------------
 -- Helper: Check circuit breaker - should we skip collection?
@@ -1142,7 +1014,7 @@ BEGIN
                 WHEN v_lock_timeouts > 2 THEN 'WARNING'
                 ELSE 'OK'
             END::text,
-            format('%s lock timeout errors in last hour. Consider increasing lock_timeout_ms if DDL is frequent',
+            format('%s lock timeout errors in last hour. Consider increasing lock_timeout_ms or using emergency mode during high-load periods',
                    v_lock_timeouts);
     END;
 END;
@@ -1500,52 +1372,6 @@ BEGIN
         END IF;
     END;
 
-    -- DDL detection - skip lock collection or entire sample when DDL is active
-    -- IMPORTANT: This check happens AFTER lock_timeout is set, so it's protected
-    DECLARE
-        v_ddl_detected BOOLEAN;
-        v_ddl_count INTEGER;
-        v_ddl_types TEXT[];
-        v_skip_locks_on_ddl BOOLEAN;
-        v_skip_sample_on_ddl BOOLEAN;
-    BEGIN
-        -- Call DDL detection (protected by lock_timeout=100ms)
-        SELECT ddl_detected, ddl_count, ddl_types
-        INTO v_ddl_detected, v_ddl_count, v_ddl_types
-        FROM flight_recorder._detect_active_ddl();
-
-        IF v_ddl_detected THEN
-            -- Get DDL skip configuration
-            v_skip_sample_on_ddl := COALESCE(
-                flight_recorder._get_config('ddl_skip_entire_sample', 'false')::boolean,
-                false
-            );
-            v_skip_locks_on_ddl := COALESCE(
-                flight_recorder._get_config('ddl_skip_locks', 'true')::boolean,
-                true
-            );
-
-            -- Option 1: Skip entire sample (most aggressive)
-            IF v_skip_sample_on_ddl THEN
-                PERFORM flight_recorder._record_collection_skip('sample',
-                    format('DDL detected: %s active DDL operation(s) [%s] - skipping entire sample to prevent lock contention',
-                           v_ddl_count, array_to_string(v_ddl_types, ', ')));
-                RAISE NOTICE 'pg-flight-recorder: Skipping sample collection - DDL active: % operations [%]',
-                    v_ddl_count, array_to_string(v_ddl_types, ', ');
-                RETURN v_captured_at;
-            -- Option 2: Skip only lock collection (default)
-            ELSIF v_skip_locks_on_ddl THEN
-                RAISE NOTICE 'pg-flight-recorder: DDL detected (% operations: [%]) - skipping lock collection to prevent lock contention',
-                    v_ddl_count, array_to_string(v_ddl_types, ', ');
-                -- Will override enable_locks below
-            END IF;
-        END IF;
-    EXCEPTION WHEN OTHERS THEN
-        -- If DDL detection fails (e.g., lock timeout), log but continue
-        -- This ensures DDL detection doesn't break collection
-        RAISE WARNING 'pg-flight-recorder: DDL detection failed: % - continuing with collection', SQLERRM;
-    END;
-
     -- Get configuration
     v_enable_locks := COALESCE(
         flight_recorder._get_config('enable_locks', 'true')::boolean,
@@ -1556,12 +1382,6 @@ BEGIN
         TRUE
     );
     v_pg_version := flight_recorder._pg_version();
-
-    -- Apply DDL detection override for lock collection
-    -- If DDL was detected and ddl_skip_locks=true, disable lock collection
-    IF v_ddl_detected AND v_skip_locks_on_ddl AND NOT v_skip_sample_on_ddl THEN
-        v_enable_locks := FALSE;
-    END IF;
 
     -- Snapshot-based collection (default enabled) - Query pg_stat_activity once
     v_snapshot_based := COALESCE(
@@ -1714,7 +1534,7 @@ BEGIN
         -- Vacuum progress (handle PG17 column changes)
         IF v_pg_version >= 17 THEN
             INSERT INTO flight_recorder.progress_samples (
-                sample_id, sample_captured_at, progress_type, pid, relid, relname, phase,
+                sample_id, sample_captured_at, progress_type, pid, relid, phase,
                 blocks_total, blocks_done, tuples_total, tuples_done, details
             )
             SELECT
@@ -1723,7 +1543,6 @@ BEGIN
                 'vacuum',
                 p.pid,
                 p.relid,
-                p.relid::regclass::text,
                 p.phase,
                 p.heap_blks_total,
                 p.heap_blks_vacuumed,
@@ -1737,7 +1556,7 @@ BEGIN
             FROM pg_stat_progress_vacuum p;
         ELSE
             INSERT INTO flight_recorder.progress_samples (
-                sample_id, sample_captured_at, progress_type, pid, relid, relname, phase,
+                sample_id, sample_captured_at, progress_type, pid, relid, phase,
                 blocks_total, blocks_done, tuples_total, tuples_done, details
             )
             SELECT
@@ -1746,7 +1565,6 @@ BEGIN
                 'vacuum',
                 p.pid,
                 p.relid,
-                p.relid::regclass::text,
                 p.phase,
                 p.heap_blks_total,
                 p.heap_blks_vacuumed,
@@ -1761,7 +1579,7 @@ BEGIN
 
         -- COPY progress
         INSERT INTO flight_recorder.progress_samples (
-            sample_id, sample_captured_at, progress_type, pid, relid, relname, phase,
+            sample_id, sample_captured_at, progress_type, pid, relid, phase,
             tuples_done, bytes_total, bytes_done, details
         )
         SELECT
@@ -1770,7 +1588,6 @@ BEGIN
             'copy',
             p.pid,
             p.relid,
-            p.relid::regclass::text,
             p.command || '/' || p.type,
             p.tuples_processed,
             p.bytes_total,
@@ -1782,7 +1599,7 @@ BEGIN
 
         -- Analyze progress
         INSERT INTO flight_recorder.progress_samples (
-            sample_id, sample_captured_at, progress_type, pid, relid, relname, phase,
+            sample_id, sample_captured_at, progress_type, pid, relid, phase,
             blocks_total, blocks_done, details
         )
         SELECT
@@ -1791,7 +1608,6 @@ BEGIN
             'analyze',
             p.pid,
             p.relid,
-            p.relid::regclass::text,
             p.phase,
             p.sample_blks_total,
             p.sample_blks_scanned,
@@ -1805,7 +1621,7 @@ BEGIN
 
         -- Create index progress
         INSERT INTO flight_recorder.progress_samples (
-            sample_id, sample_captured_at, progress_type, pid, relid, relname, phase,
+            sample_id, sample_captured_at, progress_type, pid, relid, phase,
             blocks_total, blocks_done, tuples_total, tuples_done, details
         )
         SELECT
@@ -1814,7 +1630,6 @@ BEGIN
             'create_index',
             p.pid,
             p.relid,
-            p.relid::regclass::text,
             p.phase,
             p.blocks_total,
             p.blocks_done,
@@ -1874,7 +1689,7 @@ BEGIN
                 IF v_snapshot_based THEN
                     INSERT INTO flight_recorder.lock_samples (
                         sample_id, sample_captured_at, blocked_pid, blocked_user, blocked_app, blocked_query_preview, blocked_duration,
-                        blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation
+                        blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation_oid
                     )
                     SELECT DISTINCT ON (blocked.pid, blocking_pid)
                         v_sample_id,
@@ -1896,7 +1711,7 @@ BEGIN
                         -- Get relation if waiting on a relation lock
                         CASE
                             WHEN blocked.wait_event IN ('relation', 'extend', 'page', 'tuple') THEN
-                                (SELECT l.relation::regclass::text
+                                (SELECT l.relation
                                  FROM pg_locks l
                                  WHERE l.pid = blocked.pid AND NOT l.granted
                                  LIMIT 1)
@@ -1910,7 +1725,7 @@ BEGIN
                 ELSE
                     INSERT INTO flight_recorder.lock_samples (
                         sample_id, sample_captured_at, blocked_pid, blocked_user, blocked_app, blocked_query_preview, blocked_duration,
-                        blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation
+                        blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation_oid
                     )
                     SELECT DISTINCT ON (blocked.pid, blocking_pid)
                         v_sample_id,
@@ -1932,7 +1747,7 @@ BEGIN
                         -- Get relation if waiting on a relation lock
                         CASE
                             WHEN blocked.wait_event IN ('relation', 'extend', 'page', 'tuple') THEN
-                                (SELECT l.relation::regclass::text
+                                (SELECT l.relation
                                  FROM pg_locks l
                                  WHERE l.pid = blocked.pid AND NOT l.granted
                                  LIMIT 1)
@@ -2581,7 +2396,7 @@ SELECT
     l.blocking_user,
     l.blocking_app,
     l.lock_type,
-    l.locked_relation,
+    COALESCE(l.locked_relation_oid::regclass::text, 'OID:' || l.locked_relation_oid::text) AS locked_relation,
     l.blocked_query_preview,
     l.blocking_query_preview
 FROM flight_recorder.samples sm
@@ -2598,7 +2413,7 @@ SELECT
     sm.captured_at,
     p.progress_type,
     p.pid,
-    p.relname,
+    COALESCE(p.relid::regclass::text, 'OID:' || p.relid::text) AS relname,
     p.phase,
     p.blocks_done,
     p.blocks_total,
@@ -2614,7 +2429,7 @@ SELECT
 FROM flight_recorder.samples sm
 JOIN flight_recorder.progress_samples p ON p.sample_id = sm.id
 WHERE sm.captured_at > now() - interval '2 hours'
-ORDER BY sm.captured_at DESC, p.progress_type, p.relname;
+ORDER BY sm.captured_at DESC, p.progress_type, p.relid;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.recent_replication - View of replication lag from last 2 hours
@@ -4149,43 +3964,7 @@ BEGIN
         END::text
     FROM flight_recorder._check_statements_health() h;
 
-    -- Component 7: DDL detection status
-    DECLARE
-        v_ddl_enabled BOOLEAN;
-        v_ddl_skips INTEGER;
-    BEGIN
-        v_ddl_enabled := COALESCE(
-            flight_recorder._get_config('ddl_detection_enabled', 'true')::boolean,
-            true
-        );
-
-        SELECT count(*)
-        INTO v_ddl_skips
-        FROM flight_recorder.collection_stats
-        WHERE skipped = true
-          AND started_at > now() - interval '24 hours'
-          AND skipped_reason LIKE '%DDL detected%';
-
-        RETURN QUERY SELECT
-            'DDL Detection'::text,
-            CASE
-                WHEN NOT v_ddl_enabled THEN 'DISABLED'
-                WHEN v_ddl_skips = 0 THEN 'OK'
-                WHEN v_ddl_skips < 10 THEN 'INFO'
-                ELSE 'WARNING'
-            END::text,
-            CASE
-                WHEN NOT v_ddl_enabled THEN 'DDL detection disabled - lock contention possible'
-                ELSE format('Enabled - %s DDL-related skips in last 24h', v_ddl_skips)
-            END,
-            CASE
-                WHEN NOT v_ddl_enabled THEN 'Enable with: UPDATE flight_recorder.config SET value = ''true'' WHERE key = ''ddl_detection_enabled'';'
-                WHEN v_ddl_skips >= 10 THEN 'Frequent DDL activity detected - normal if schema changes are active'
-                ELSE NULL
-            END::text;
-    END;
-
-    -- Component 8: pg_cron Job Health (A+ UPGRADE)
+    -- Component 7: pg_cron Job Health (A+ UPGRADE)
     -- Verify all 4 required jobs exist and are active
     DECLARE
         v_job_count INTEGER;
@@ -4839,8 +4618,8 @@ BEGIN
     RETURN QUERY SELECT
         'Safety Mechanisms'::text,
         'GO'::text,
-        'Circuit breaker, adaptive mode, DDL detection, timeouts all enabled by default',
-        'Flight recorder will auto-reduce overhead under stress and prevent lock contention.'::text;
+        'Circuit breaker, adaptive mode, timeouts all enabled by default',
+        'Flight recorder will auto-reduce overhead under stress.'::text;
 
     -- Summary recommendation
     DECLARE
@@ -4906,7 +4685,6 @@ DECLARE
     v_last_sample TIMESTAMPTZ;
     v_last_snapshot TIMESTAMPTZ;
     v_circuit_breaker_trips INTEGER;
-    v_ddl_skips INTEGER;
     v_failed_collections INTEGER;
     v_sample_count INTEGER;
 BEGIN
@@ -5035,54 +4813,27 @@ BEGIN
             'Frequent circuit breaker trips indicate system stress. Consider switching to light mode permanently.'::text;
     END IF;
 
-    -- Metric 5: DDL detection activity (last 90 days)
-    SELECT count(*) INTO v_ddl_skips
-    FROM flight_recorder.collection_stats
-    WHERE skipped = true
-      AND skipped_reason LIKE '%DDL%'
-      AND started_at > now() - interval '90 days';
-
-    IF v_ddl_skips = 0 THEN
-        RETURN QUERY SELECT
-            '5. DDL Detection Activity'::text,
-            'INFO'::text,
-            '0 DDL-related skips in 90 days',
-            'No schema changes detected during collection windows.'::text;
-    ELSIF v_ddl_skips < 50 THEN
-        RETURN QUERY SELECT
-            '5. DDL Detection Activity'::text,
-            'INFO'::text,
-            format('%s DDL-related skips in 90 days', v_ddl_skips),
-            'DDL detection prevented lock contention. This is working as intended.'::text;
-    ELSE
-        RETURN QUERY SELECT
-            '5. DDL Detection Activity'::text,
-            'INFO'::text,
-            format('%s DDL-related skips in 90 days', v_ddl_skips),
-            'Frequent DDL activity detected. Normal if you have active schema changes. Consider ddl_skip_entire_sample=false if you need lock data during DDL.'::text;
-    END IF;
-
-    -- Metric 6: Data freshness
+    -- Metric 5: Data freshness
     SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples;
     SELECT max(captured_at) INTO v_last_snapshot FROM flight_recorder.snapshots;
 
     IF v_last_sample > now() - interval '10 minutes' AND v_last_snapshot > now() - interval '15 minutes' THEN
         RETURN QUERY SELECT
-            '6. Data Freshness'::text,
+            '5. Data Freshness'::text,
             'EXCELLENT'::text,
             format('Last sample: %s ago | Last snapshot: %s ago',
                    age(now(), v_last_sample)::text, age(now(), v_last_snapshot)::text),
             'Collections are running on schedule.'::text;
     ELSE
         RETURN QUERY SELECT
-            '6. Data Freshness'::text,
+            '5. Data Freshness'::text,
             'ERROR'::text,
             format('Last sample: %s ago | Last snapshot: %s ago',
                    age(now(), v_last_sample)::text, age(now(), v_last_snapshot)::text),
             'Collections are stale. Check pg_cron jobs: SELECT * FROM cron.job WHERE jobname LIKE ''flight_recorder_%'';'::text;
     END IF;
 
-    -- Metric 7: pg_cron Job Health (A+ UPGRADE)
+    -- Metric 6: pg_cron Job Health (A+ UPGRADE)
     -- Verify all 4 required jobs exist and are active
     DECLARE
         v_missing_count INTEGER;
@@ -5109,19 +4860,19 @@ BEGIN
 
         IF v_missing_count = 0 AND v_inactive_count = 0 THEN
             RETURN QUERY SELECT
-                '7. pg_cron Job Health'::text,
+                '6. pg_cron Job Health'::text,
                 'EXCELLENT'::text,
                 '4/4 jobs active (sample, snapshot, cleanup, partition)',
                 'All pg_cron jobs are running correctly.'::text;
         ELSIF v_missing_count > 0 THEN
             RETURN QUERY SELECT
-                '7. pg_cron Job Health'::text,
+                '6. pg_cron Job Health'::text,
                 'CRITICAL'::text,
                 format('%s/%s jobs missing: %s', v_missing_count, 4, array_to_string(v_missing_jobs, ', ')),
                 'CRITICAL: Flight recorder is not collecting data. Run flight_recorder.enable() to restore.'::text;
         ELSE
             RETURN QUERY SELECT
-                '7. pg_cron Job Health'::text,
+                '6. pg_cron Job Health'::text,
                 'CRITICAL'::text,
                 format('%s/%s jobs inactive: %s', v_inactive_count, 4, array_to_string(v_inactive_jobs, ', ')),
                 'CRITICAL: pg_cron jobs exist but are disabled. Run flight_recorder.enable() to reactivate.'::text;

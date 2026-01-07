@@ -117,7 +117,7 @@ Flight recorder has measurable overhead. Exact cost depends on configuration:
 **Additional Resource Costs:**
 
 - **Catalog locks**: 1 AccessShareLock per sample (default snapshot-based collection)
-- **Lock timeout**: 100ms - fails fast if catalogs are locked by DDL operations
+- **Lock timeout**: 100ms - fails fast if catalogs are locked
 - **Memory**: 2MB work_mem per collection (configurable)
 - **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
 - **pg_stat_statements**: 20 queries × 96 snapshots/day = 1,920 rows/day
@@ -126,7 +126,6 @@ Flight recorder has measurable overhead. Exact cost depends on configuration:
 
 - ✓ Production troubleshooting (enable during incidents)
 - ✓ Staging/dev (always-on monitoring)
-- ✓ High-DDL workloads (Phase 6 DDL detection prevents lock contention)
 - ✗ Resource-constrained databases (< 2 CPU cores, < 4GB RAM)
 
 **Reducing Overhead:**
@@ -212,86 +211,6 @@ Each collection section wrapped in exception handlers:
 - Wait events fail → activity samples still collected
 - Lock detection fails → progress tracking continues
 - Partial data better than no data during incidents
-
-### DDL Detection
-
-**NEW in Phase 6**: Prevents lock contention with active schema changes.
-**UPGRADED**: Catalog-based detection for 100% accuracy.
-
-**Problem:**
-- DDL operations (CREATE, ALTER, DROP, TRUNCATE, REINDEX, VACUUM FULL) acquire AccessExclusiveLock on system catalogs
-- Flight recorder acquires AccessShareLock on the same catalogs (pg_stat_activity, pg_locks, etc.)
-- This can cause:
-  - Flight recorder lock timeouts (fails to collect)
-  - DDL operations delayed by flight recorder's catalog locks
-
-**Solution:**
-DDL detection automatically checks for active DDL before collecting, and can:
-1. **Skip lock collection only** (default: `ddl_skip_locks = true`)
-2. **Skip entire sample** (aggressive: `ddl_skip_entire_sample = true`)
-
-**Detection Methods:**
-
-Flight recorder supports two DDL detection methods:
-
-1. **Catalog-based (upgraded, default)**: 100% accurate
-   - Detects AccessExclusiveLock on system catalogs (pg_class, pg_attribute, etc.)
-   - Catches ALL DDL including dynamic SQL, stored procedures, multi-statement blocks
-   - Set: `ddl_detection_use_locks = true` (default)
-   - Detects: TABLE_DDL, FUNCTION_DDL, TYPE_DDL, SCHEMA_DDL, EXTENSION_DDL
-
-2. **Query pattern (fallback)**: 95% accurate
-   - Regex matching on pg_stat_activity.query
-   - Faster but misses edge cases (dynamic SQL: `EXECUTE 'CREATE...'`)
-   - Set: `ddl_detection_use_locks = false`
-
-**Configuration:**
-
-```sql
--- Check DDL detection status
-SELECT * FROM flight_recorder.health_check() WHERE component = 'DDL Detection';
-
--- View DDL detection config
-SELECT key, value FROM flight_recorder.config WHERE key LIKE 'ddl_%';
-
--- Use catalog-based detection (default, recommended)
-UPDATE flight_recorder.config SET value = 'true' WHERE key = 'ddl_detection_use_locks';
-
--- Fallback to query pattern detection (for compatibility)
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_detection_use_locks';
-
--- Disable DDL detection entirely (not recommended for high-DDL workloads)
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_detection_enabled';
-
--- Change behavior: skip entire sample when DDL detected (more aggressive)
-UPDATE flight_recorder.config SET value = 'true' WHERE key = 'ddl_skip_entire_sample';
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_skip_locks';
-
--- View DDL-related skips in last 24 hours
-SELECT started_at, skipped_reason
-FROM flight_recorder.collection_stats
-WHERE skipped = true AND skipped_reason LIKE '%DDL%'
-ORDER BY started_at DESC;
-```
-
-**Default Settings:**
-- `ddl_detection_enabled = true` - Enabled by default
-- `ddl_detection_use_locks = true` - Use catalog-based detection (upgraded)
-- `ddl_skip_locks = true` - Skip lock collection when DDL detected (recommended)
-- `ddl_skip_entire_sample = false` - Still collect wait/activity/progress data
-
-**When DDL is Detected:**
-- Log message: `pg-flight-recorder: DDL detected (N operations: [types]) - skipping lock collection`
-- Collection continues for other sections (wait events, activity, progress)
-- Recorded in collection_stats table
-
-**Monitored DDL Operations:**
-- `CREATE` (tables, indexes, etc.)
-- `ALTER` (schema changes)
-- `DROP` (table/index removal)
-- `TRUNCATE` (table truncation)
-- `REINDEX` (index rebuilding)
-- `VACUUM FULL` (table rewriting)
 
 ### Job Deduplication
 
@@ -480,7 +399,7 @@ Key settings:
 
 ## Catalog Lock Contention
 
-Every collection acquires AccessShareLock on system catalogs. This is generally harmless but can interact with DDL operations on high-churn databases.
+Every collection acquires AccessShareLock on system catalogs (pg_stat_activity, pg_locks, etc.). This is generally harmless. Collection stores OIDs (not names) to avoid querying pg_class during sampling, reducing catalog lock frequency by ~95%.
 
 ### System Views Accessed
 
@@ -490,7 +409,7 @@ Every collection acquires AccessShareLock on system catalogs. This is generally 
 | `pg_stat_replication`  | pg_stat_replication  | snapshot()          | Every 5min |
 | `pg_locks`             | pg_locks             | sample()            | Every 60s  |
 | `pg_stat_statements`   | pg_stat_statements   | snapshot()          | Every 5min |
-| `::regclass` casts     | pg_class             | sample()            | Intermittent (only during progress/lock collection) |
+| `::regclass` casts     | pg_class             | Views (query-time)  | On demand (OID→name conversion) |
 
 ### Lock Timeout Behavior
 
