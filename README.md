@@ -78,9 +78,8 @@ Run tests locally with Docker:
 # Test on specific version
 ./test.sh 15   # PostgreSQL 15
 ./test.sh 17   # PostgreSQL 17
-./test.sh 18   # PostgreSQL 18
 
-# Test on all versions (15, 16, 17, 18)
+# Test on all versions (15, 16, 17)
 ./test.sh all
 ```
 

@@ -580,7 +580,7 @@ Run tests locally with Docker (supports PostgreSQL 15, 16, 17, 18):
 ./test.sh 17   # PostgreSQL 17
 
 # Test on all versions
-./test.sh all  # Tests 118 pgTAP tests on PG 15, 16, 17, 18
+./test.sh all  # Tests 118 pgTAP tests on PG 15, 16, 17
 ```
 
 Or against your own PostgreSQL 15+ instance:

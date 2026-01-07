@@ -3,12 +3,14 @@ set -e
 
 # Test runner for pg-flight-recorder
 # Usage: ./test.sh [version]
-#   version: 15, 16, 17, 18, or "all" (default: 16)
+#   version: 15, 16, 17, or "all" (default: 16)
 #
 # Examples:
 #   ./test.sh        # Test on PostgreSQL 16
 #   ./test.sh 15     # Test on PostgreSQL 15
-#   ./test.sh all    # Test on all versions (15, 16, 17, 18)
+#   ./test.sh all    # Test on all versions (15, 16, 17)
+#
+# Note: PostgreSQL 18 support pending (requires Docker volume layout changes)
 
 VERSION="${1:-16}"
 
@@ -54,7 +56,7 @@ run_tests() {
 }
 
 if [ "$VERSION" = "all" ]; then
-    for v in 15 16 17 18; do
+    for v in 15 16 17; do
         run_tests $v
     done
     echo ""

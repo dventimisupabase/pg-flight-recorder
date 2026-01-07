@@ -148,7 +148,7 @@
 --
 -- DIAGNOSTIC PATTERNS (from real-world testing)
 -- ---------------------------------------------
---   These patterns were validated against PostgreSQL 15, 16, and 17.
+--   Validated against PostgreSQL 15, 16, and 17.
 --
 --   PATTERN 1: Lock Contention
 --   Symptoms:
