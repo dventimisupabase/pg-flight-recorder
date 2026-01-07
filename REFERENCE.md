@@ -131,7 +131,7 @@ Flight recorder has measurable overhead. Exact cost depends on configuration:
 
 - ✓ Production troubleshooting (enable during incidents)
 - ✓ Staging/dev (always-on monitoring)
-- ⚠ High-DDL workloads (frequent CREATE/DROP/ALTER may cause catalog lock contention)
+- ✓ High-DDL workloads (Phase 6 DDL detection prevents lock contention)
 - ✗ Resource-constrained databases (< 2 CPU cores, < 4GB RAM)
 
 **Reducing Overhead:**
@@ -217,6 +217,63 @@ Each collection section wrapped in exception handlers:
 - Wait events fail → activity samples still collected
 - Lock detection fails → progress tracking continues
 - Partial data better than no data during incidents
+
+### DDL Detection
+
+**NEW in Phase 6**: Prevents lock contention with active schema changes.
+
+**Problem:**
+- DDL operations (CREATE, ALTER, DROP, TRUNCATE, REINDEX, VACUUM FULL) acquire AccessExclusiveLock on system catalogs
+- Flight recorder acquires AccessShareLock on the same catalogs (pg_stat_activity, pg_locks, etc.)
+- This can cause:
+  - Flight recorder lock timeouts (fails to collect)
+  - DDL operations delayed by flight recorder's catalog locks
+
+**Solution:**
+DDL detection automatically checks for active DDL before collecting, and can:
+1. **Skip lock collection only** (default: `ddl_skip_locks = true`)
+2. **Skip entire sample** (aggressive: `ddl_skip_entire_sample = true`)
+
+**Configuration:**
+
+```sql
+-- Check DDL detection status
+SELECT * FROM flight_recorder.health_check() WHERE component = 'DDL Detection';
+
+-- View DDL detection config
+SELECT key, value FROM flight_recorder.config WHERE key LIKE 'ddl_%';
+
+-- Disable DDL detection (not recommended for high-DDL workloads)
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_detection_enabled';
+
+-- Change behavior: skip entire sample when DDL detected (more aggressive)
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'ddl_skip_entire_sample';
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_skip_locks';
+
+-- View DDL-related skips in last 24 hours
+SELECT started_at, skipped_reason
+FROM flight_recorder.collection_stats
+WHERE skipped = true AND skipped_reason LIKE '%DDL%'
+ORDER BY started_at DESC;
+```
+
+**Default Settings:**
+- `ddl_detection_enabled = true` - Enabled by default
+- `ddl_skip_locks = true` - Skip lock collection when DDL detected (recommended)
+- `ddl_skip_entire_sample = false` - Still collect wait/activity/progress data
+
+**When DDL is Detected:**
+- Log message: `pg-flight-recorder: DDL detected (N operations: [types]) - skipping lock collection`
+- Collection continues for other sections (wait events, activity, progress)
+- Recorded in collection_stats table
+
+**Monitored DDL Operations:**
+- `CREATE` (tables, indexes, etc.)
+- `ALTER` (schema changes)
+- `DROP` (table/index removal)
+- `TRUNCATE` (table truncation)
+- `REINDEX` (index rebuilding)
+- `VACUUM FULL` (table rewriting)
 
 ## Configuration
 
