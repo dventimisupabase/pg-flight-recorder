@@ -48,12 +48,54 @@ SELECT flight_recorder.enable();               -- Resume
 Built for production with minimal observer effect:
 
 - **UNLOGGED tables** - No WAL overhead for telemetry data
-- **Per-section timeouts** - Each query section limited to 1 second
+- **Per-section timeouts** - Each query section limited to 250ms
 - **O(n) algorithms** - Lock detection uses `pg_blocking_pids()`, not O(n^2) joins
 - **Circuit breaker** - Auto-skips collection when system is stressed
 - **Adaptive mode** - Automatically reduces overhead under load
 - **Size limits** - Auto-disables if schema exceeds 10GB
-- **Result limits** - Caps on rows collected (100 locks, 25 sessions, 50 statements)
+- **Result limits** - Caps on rows collected (50 locks, 25 sessions, 50 statements)
+
+## Observer Effect
+
+pg-flight-recorder has measurable overhead. Exact cost depends on configuration:
+
+| Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
+|--------|-----------------|-----------------|----------------|-------|
+| **Default** | 60s | 250ms | 1.7% | Recommended for production |
+| **Conservative** | 120s | 250ms | 0.8% | Lower overhead, less temporal resolution |
+| **Light Mode** | 60s | 250ms | 1.4% | Disables progress tracking |
+| **Emergency Mode** | 120s | 250ms | 0.5% | Disables locks and progress tracking |
+
+Additional considerations:
+
+- **Catalog locks**: Every collection acquires AccessShareLock on system catalogs (`pg_stat_activity`, `pg_locks`, etc.)
+- **Lock timeout**: 100ms - fails fast if catalogs are locked by DDL operations
+- **Memory**: 2MB work_mem per collection (configurable)
+- **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
+- **pg_stat_statements**: 50 queries × 288 snapshots/day = 14,400 rows/day
+
+### Reducing Overhead
+
+```sql
+-- Switch to light mode (disables progress tracking)
+SELECT flight_recorder.set_mode('light');
+
+-- Switch to emergency mode (disables locks and progress)
+SELECT flight_recorder.set_mode('emergency');
+
+-- Stop completely
+SELECT flight_recorder.disable();
+
+-- Validate your configuration
+SELECT * FROM flight_recorder.validate_config();
+```
+
+### Target Environments
+
+- ✓ Production troubleshooting (enable during incidents)
+- ✓ Staging/dev (always-on monitoring)
+- ⚠ High-DDL workloads (frequent CREATE/DROP/ALTER may cause catalog lock contention)
+- ✗ Resource-constrained databases (< 2 CPU cores, < 4GB RAM)
 
 ## More
 

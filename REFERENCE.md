@@ -186,11 +186,72 @@ Key settings:
 | `circuit_breaker_enabled`         | true    | Enable/disable circuit breaker      |
 | `auto_mode_enabled`               | true    | Auto-adjust collection mode         |
 | `auto_mode_connections_threshold` | 60      | % connections to trigger light mode |
-| `section_timeout_ms`              | 1000    | Per-section query timeout           |
+| `section_timeout_ms`              | 250     | Per-section query timeout           |
+| `lock_timeout_ms`                 | 100     | Max wait for catalog locks          |
+| `skip_locks_threshold`            | 50      | Skip lock collection if > N blocked |
+| `skip_activity_conn_threshold`    | 100     | Skip activity if > N active conns   |
 | `schema_size_warning_mb`          | 5000    | Warning threshold                   |
 | `schema_size_critical_mb`         | 10000   | Auto-disable threshold              |
 | `retention_samples_days`          | 7       | Sample retention                    |
 | `retention_snapshots_days`        | 30      | Snapshot retention                  |
+
+## Catalog Lock Contention
+
+Every collection acquires AccessShareLock on system catalogs. This is generally harmless but can interact with DDL operations on high-churn databases.
+
+### System Views Accessed
+
+| System View            | Lock Target          | Acquired By         | Frequency  |
+|------------------------|----------------------|---------------------|------------|
+| `pg_stat_activity`     | pg_stat_activity     | sample() + snapshot | Every 60s  |
+| `pg_stat_replication`  | pg_stat_replication  | snapshot()          | Every 5min |
+| `pg_locks`             | pg_locks             | sample()            | Every 60s  |
+| `pg_stat_statements`   | pg_stat_statements   | snapshot()          | Every 5min |
+| `pg_relation_size()`   | Target relation      | snapshot()          | Every 5min |
+
+### Lock Timeout Behavior
+
+Default `lock_timeout` = 100ms:
+
+- **If catalog is locked by DDL > 100ms**: Collection fails with lock timeout error
+- **If collection starts before DDL**: DDL operation waits up to 100ms behind flight recorder
+- **Circuit breaker**: After 3 lock timeout failures in 15 minutes, auto-switches to emergency mode
+
+### High-DDL Workloads
+
+Multi-tenant SaaS with frequent CREATE/DROP/ALTER operations:
+
+**Symptoms:**
+- `collection_stats` shows frequent `lock_timeout` errors
+- Circuit breaker trips repeatedly
+- Auto-mode switches to emergency mode
+
+**Mitigations:**
+```sql
+-- Option 1: Disable tracked table monitoring (eliminates pg_relation_size locks)
+SELECT flight_recorder.untrack_table('table_name');
+
+-- Option 2: Reduce lock_timeout further (fail even faster)
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
+
+-- Option 3: Use emergency mode during high-DDL periods
+SELECT flight_recorder.set_mode('emergency');
+
+-- Option 4: Disable during maintenance windows
+SELECT flight_recorder.disable();
+```
+
+**Check for lock failures:**
+```sql
+SELECT
+    collection_type,
+    count(*) AS lock_failures,
+    max(started_at) AS last_failure
+FROM flight_recorder.collection_stats
+WHERE error_message LIKE '%lock_timeout%'
+  AND started_at > now() - interval '1 hour'
+GROUP BY collection_type;
+```
 
 ## Diagnostic Patterns
 
