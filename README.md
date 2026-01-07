@@ -61,18 +61,18 @@ pg-flight-recorder has measurable overhead. Exact cost depends on configuration:
 
 | Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
 |--------|-----------------|-----------------|----------------|-------|
-| **Default** | 60s | 250ms | 1.7% | Recommended for production |
-| **Conservative** | 120s | 250ms | 0.8% | Lower overhead, less temporal resolution |
-| **Light Mode** | 60s | 250ms | 1.4% | Disables progress tracking |
+| **Default** | 120s | 250ms | 0.8% | Recommended for production |
+| **High Resolution** | 60s | 250ms | 1.7% | Configurable - higher temporal resolution |
+| **Light Mode** | 120s | 250ms | 0.7% | Disables progress tracking |
 | **Emergency Mode** | 120s | 250ms | 0.5% | Disables locks and progress tracking |
 
 Additional considerations:
 
-- **Catalog locks**: Every collection acquires AccessShareLock on system catalogs (`pg_stat_activity`, `pg_locks`, etc.)
+- **Catalog locks**: Every collection acquires AccessShareLock on system catalogs (configurable to 1 lock per sample)
 - **Lock timeout**: 100ms - fails fast if catalogs are locked by DDL operations
 - **Memory**: 2MB work_mem per collection (configurable)
 - **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
-- **pg_stat_statements**: 50 queries × 288 snapshots/day = 14,400 rows/day
+- **pg_stat_statements**: 20 queries × 96 snapshots/day = 1,920 rows/day (87% reduction from older versions)
 
 ### Reducing Overhead
 
@@ -89,6 +89,23 @@ SELECT flight_recorder.disable();
 -- Validate your configuration
 SELECT * FROM flight_recorder.validate_config();
 ```
+
+### Advanced Optimizations (Opt-In)
+
+Additional features available via configuration:
+
+```sql
+-- Reduce catalog locks from 3 to 1 per sample (snapshot-based collection)
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'snapshot_based_collection';
+
+-- Skip collection when system idle (adaptive sampling)
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'adaptive_sampling';
+
+-- Adjust sample interval (60s = higher resolution, 180s = lower overhead)
+UPDATE flight_recorder.config SET value = '60' WHERE key = 'sample_interval_seconds';
+```
+
+See [REFERENCE.md](REFERENCE.md) for detailed configuration options.
 
 ### Target Environments
 

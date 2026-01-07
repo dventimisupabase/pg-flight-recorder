@@ -180,20 +180,26 @@ SELECT * FROM flight_recorder.config;
 
 Key settings:
 
-| Key                               | Default | Purpose                             |
-|-----------------------------------|---------|-------------------------------------|
-| `circuit_breaker_threshold_ms`    | 1000    | Max collection duration             |
-| `circuit_breaker_enabled`         | true    | Enable/disable circuit breaker      |
-| `auto_mode_enabled`               | true    | Auto-adjust collection mode         |
-| `auto_mode_connections_threshold` | 60      | % connections to trigger light mode |
-| `section_timeout_ms`              | 250     | Per-section query timeout           |
-| `lock_timeout_ms`                 | 100     | Max wait for catalog locks          |
-| `skip_locks_threshold`            | 50      | Skip lock collection if > N blocked |
-| `skip_activity_conn_threshold`    | 100     | Skip activity if > N active conns   |
-| `schema_size_warning_mb`          | 5000    | Warning threshold                   |
-| `schema_size_critical_mb`         | 10000   | Auto-disable threshold              |
-| `retention_samples_days`          | 7       | Sample retention                    |
-| `retention_snapshots_days`        | 30      | Snapshot retention                  |
+| Key                                 | Default | Purpose                                        |
+|-------------------------------------|---------|------------------------------------------------|
+| `circuit_breaker_threshold_ms`      | 1000    | Max collection duration                        |
+| `circuit_breaker_enabled`           | true    | Enable/disable circuit breaker                 |
+| `auto_mode_enabled`                 | true    | Auto-adjust collection mode                    |
+| `auto_mode_connections_threshold`   | 60      | % connections to trigger light mode            |
+| `section_timeout_ms`                | 250     | Per-section query timeout                      |
+| `lock_timeout_ms`                   | 100     | Max wait for catalog locks                     |
+| `skip_locks_threshold`              | 50      | Skip lock collection if > N blocked            |
+| `skip_activity_conn_threshold`      | 100     | Skip activity if > N active conns              |
+| `sample_interval_seconds`           | 120     | Sample collection interval (60, 120, 180, ...) |
+| `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
+| `statements_top_n`                  | 20      | Number of top queries to capture               |
+| `snapshot_based_collection`         | false   | Use temp table snapshot (reduces catalog locks)|
+| `adaptive_sampling`                 | false   | Skip collection when system idle               |
+| `adaptive_sampling_idle_threshold`  | 5       | Skip if < N active connections                 |
+| `schema_size_warning_mb`            | 5000    | Warning threshold                              |
+| `schema_size_critical_mb`           | 10000   | Auto-disable threshold                         |
+| `retention_samples_days`            | 7       | Sample retention                               |
+| `retention_snapshots_days`          | 30      | Snapshot retention                             |
 
 ## Catalog Lock Contention
 
@@ -252,6 +258,90 @@ WHERE error_message LIKE '%lock_timeout%'
   AND started_at > now() - interval '1 hour'
 GROUP BY collection_type;
 ```
+
+## Advanced Optimizations
+
+Flight recorder includes several opt-in features to further reduce overhead and catalog lock contention.
+
+### Snapshot-Based Collection (Phase 5B)
+
+**Purpose:** Reduce catalog locks from 3 to 1 per sample
+
+**How it works:** Creates a temp table snapshot of `pg_stat_activity` once per sample, then all sections query from the snapshot instead of querying the catalog 3 separate times.
+
+**Enable:**
+```sql
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'snapshot_based_collection';
+```
+
+**Impact:**
+- Catalog locks: 3 → 1 per sample (67% reduction)
+- Overhead: Negligible (temp table is ~100KB for 100 connections)
+- Consistency: All sections see same snapshot (more accurate)
+
+**When to use:**
+- High-DDL workloads with frequent catalog lock contention
+- Systems where you've observed lock timeout errors in `collection_stats`
+
+### Adaptive Sampling (Phase 5C)
+
+**Purpose:** Reduce average overhead by skipping collection when system is idle
+
+**How it works:** Before each sample, checks active connection count. If fewer than threshold (default: 5), skips collection entirely.
+
+**Enable:**
+```sql
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'adaptive_sampling';
+UPDATE flight_recorder.config SET value = '5' WHERE key = 'adaptive_sampling_idle_threshold';  -- Optional
+```
+
+**Impact:**
+- Overhead during idle: ~0% (skips collection)
+- Overhead during busy: 0.8% (unchanged)
+- Average overhead: 0.3-0.5% depending on workload
+
+**Trade-offs:**
+- May miss the *start* of an incident (first sample after idle period)
+- Non-uniform sampling (gaps in data during idle periods)
+
+**When to use:**
+- Workloads with idle periods (dev/staging, batch processing)
+- Systems where you want absolute minimum overhead
+
+### Adjustable Sample Interval
+
+**Purpose:** Trade temporal resolution for lower overhead
+
+**Configure:**
+```sql
+-- High resolution (1.7% overhead)
+UPDATE flight_recorder.config SET value = '60' WHERE key = 'sample_interval_seconds';
+
+-- Default (0.8% overhead)
+UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
+
+-- Low overhead (0.4% overhead)
+UPDATE flight_recorder.config SET value = '240' WHERE key = 'sample_interval_seconds';
+```
+
+**Note:** Must call `flight_recorder.disable()` then `flight_recorder.enable()` to reschedule pg_cron jobs.
+
+### pg_stat_statements Tuning
+
+**Purpose:** Reduce memory pressure on pg_stat_statements hash table
+
+**Configure:**
+```sql
+-- Collection interval (default: every 15 minutes)
+UPDATE flight_recorder.config SET value = '15' WHERE key = 'statements_interval_minutes';
+
+-- Number of top queries to capture (default: 20)
+UPDATE flight_recorder.config SET value = '20' WHERE key = 'statements_top_n';
+```
+
+**Impact:**
+- Default: 20 queries × 96 snapshots/day = 1,920 rows/day
+- Old default: 50 queries × 288 snapshots/day = 14,400 rows/day (87% reduction)
 
 ## Diagnostic Patterns
 

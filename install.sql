@@ -644,8 +644,11 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 -- Default configuration
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
+    -- Phase 5A: Configurable sample interval (default 120s for 0.8% overhead)
+    ('sample_interval_seconds', '120'),        -- Sample collection frequency (was hardcoded 60s)
     ('statements_enabled', 'auto'),
-    ('statements_top_n', '50'),
+    ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
+    ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
     ('statements_min_calls', '1'),
     ('enable_locks', 'true'),
     ('enable_progress', 'true'),
@@ -681,7 +684,12 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     -- P4: Advanced features
     ('alert_enabled', 'false'),                -- Enable alert notifications
     ('alert_circuit_breaker_count', '5'),      -- Alert if circuit breaker trips N times in hour
-    ('alert_schema_size_mb', '8000')           -- Alert if schema exceeds threshold (80% of critical)
+    ('alert_schema_size_mb', '8000'),          -- Alert if schema exceeds threshold (80% of critical)
+    -- Phase 5B: Snapshot-based collection (opt-in, reduces catalog locks from 3 to 1)
+    ('snapshot_based_collection', 'false'),    -- Use temp table snapshot of pg_stat_activity
+    -- Phase 5C: Adaptive sampling (opt-in, skips collection when idle)
+    ('adaptive_sampling', 'false'),            -- Skip collection when system idle
+    ('adaptive_sampling_idle_threshold', '5')  -- Skip if < N active connections
 ON CONFLICT (key) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
@@ -1339,9 +1347,40 @@ DECLARE
     v_pg_version INTEGER;
     v_stat_id INTEGER;
     v_should_skip BOOLEAN;
+    v_snapshot_based BOOLEAN;
 BEGIN
     -- P2 Safety: Check and adjust mode automatically based on system load
     PERFORM flight_recorder._check_and_adjust_mode();
+
+    -- Phase 5C: Adaptive sampling - skip if system idle (opt-in)
+    DECLARE
+        v_adaptive_sampling BOOLEAN;
+        v_idle_threshold INTEGER;
+        v_active_count INTEGER;
+    BEGIN
+        v_adaptive_sampling := COALESCE(
+            flight_recorder._get_config('adaptive_sampling', 'false')::boolean,
+            false
+        );
+
+        IF v_adaptive_sampling THEN
+            v_idle_threshold := COALESCE(
+                flight_recorder._get_config('adaptive_sampling_idle_threshold', '5')::integer,
+                5
+            );
+
+            SELECT count(*) INTO v_active_count
+            FROM pg_stat_activity
+            WHERE state = 'active' AND backend_type = 'client backend';
+
+            IF v_active_count < v_idle_threshold THEN
+                PERFORM flight_recorder._record_collection_skip('sample',
+                    format('Adaptive sampling: system idle (%s active connections < %s threshold)',
+                           v_active_count, v_idle_threshold));
+                RETURN v_captured_at;
+            END IF;
+        END IF;
+    END;
 
     -- P0 Safety: Check circuit breaker
     v_should_skip := flight_recorder._check_circuit_breaker('sample');
@@ -1354,10 +1393,10 @@ BEGIN
     -- P0 Safety: Record collection start for circuit breaker (4 sections: wait events, activity, progress, locks)
     v_stat_id := flight_recorder._record_collection_start('sample', 4);
 
-    -- P0 Safety: Set lock timeout and work_mem (A-GRADE: REDUCED THRESHOLDS)
+    -- P0 Safety: Set lock timeout and work_mem
     PERFORM set_config('lock_timeout',
-        COALESCE(flight_recorder._get_config('lock_timeout_ms', '500'), '500'),
-        true);  -- REDUCED from 1000ms to 500ms
+        COALESCE(flight_recorder._get_config('lock_timeout_ms', '100'), '100'),
+        true);
     PERFORM set_config('work_mem',
         COALESCE(flight_recorder._get_config('work_mem_kb', '2048'), '2048') || 'kB',
         true);  -- Limit memory for joins/sorts
@@ -1373,6 +1412,25 @@ BEGIN
     );
     v_pg_version := flight_recorder._pg_version();
 
+    -- Phase 5B: Snapshot-based collection (opt-in) - Query pg_stat_activity once
+    v_snapshot_based := COALESCE(
+        flight_recorder._get_config('snapshot_based_collection', 'false')::boolean,
+        false
+    );
+
+    IF v_snapshot_based THEN
+        -- Create temp table snapshot of pg_stat_activity (ONE catalog lock)
+        -- This replaces 3+ queries to pg_stat_activity with 1 query
+        CREATE TEMP TABLE IF NOT EXISTS _fr_psa_snapshot (
+            LIKE pg_stat_activity
+        ) ON COMMIT DROP;
+
+        TRUNCATE _fr_psa_snapshot;
+
+        INSERT INTO _fr_psa_snapshot
+        SELECT * FROM pg_stat_activity WHERE pid != pg_backend_pid();
+    END IF;
+
     -- Create sample record (set section timeout before each section)
     PERFORM flight_recorder._set_section_timeout();
     INSERT INTO flight_recorder.samples (captured_at)
@@ -1382,18 +1440,34 @@ BEGIN
     -- Section 1: Wait events
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
-        INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
-        SELECT
-            v_sample_id,
-            v_captured_at,
-            COALESCE(backend_type, 'unknown'),
-            COALESCE(wait_event_type, 'Running'),
-            COALESCE(wait_event, 'CPU'),
-            COALESCE(state, 'unknown'),
-            count(*)::integer
-        FROM pg_stat_activity
-        WHERE pid != pg_backend_pid()
-        GROUP BY backend_type, wait_event_type, wait_event, state;
+
+        -- Phase 5B: Use snapshot table if enabled (reduces catalog locks)
+        IF v_snapshot_based THEN
+            INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
+            SELECT
+                v_sample_id,
+                v_captured_at,
+                COALESCE(backend_type, 'unknown'),
+                COALESCE(wait_event_type, 'Running'),
+                COALESCE(wait_event, 'CPU'),
+                COALESCE(state, 'unknown'),
+                count(*)::integer
+            FROM _fr_psa_snapshot
+            GROUP BY backend_type, wait_event_type, wait_event, state;
+        ELSE
+            INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
+            SELECT
+                v_sample_id,
+                v_captured_at,
+                COALESCE(backend_type, 'unknown'),
+                COALESCE(wait_event_type, 'Running'),
+                COALESCE(wait_event, 'CPU'),
+                COALESCE(state, 'unknown'),
+                count(*)::integer
+            FROM pg_stat_activity
+            WHERE pid != pg_backend_pid()
+            GROUP BY backend_type, wait_event_type, wait_event, state;
+        END IF;
 
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
@@ -1412,36 +1486,68 @@ BEGIN
                 100
             );
 
+            -- Phase 5B: Use snapshot table if enabled (reduces catalog locks)
             -- Quick count (minimal overhead)
-            SELECT COUNT(*) INTO v_active_conn_count
-            FROM pg_stat_activity
-            WHERE state != 'idle' AND pid != pg_backend_pid();
+            IF v_snapshot_based THEN
+                SELECT COUNT(*) INTO v_active_conn_count
+                FROM _fr_psa_snapshot
+                WHERE state != 'idle';
+            ELSE
+                SELECT COUNT(*) INTO v_active_conn_count
+                FROM pg_stat_activity
+                WHERE state != 'idle' AND pid != pg_backend_pid();
+            END IF;
 
             IF v_active_conn_count > v_skip_activity_threshold THEN
                 RAISE NOTICE 'pg-flight-recorder: Skipping activity collection - % active connections exceeds threshold %',
                     v_active_conn_count, v_skip_activity_threshold;
             ELSE
-                INSERT INTO flight_recorder.activity_samples (
-                    sample_id, sample_captured_at, pid, usename, application_name, backend_type,
-                    state, wait_event_type, wait_event, query_start, state_change, query_preview
-                )
-                SELECT
-                    v_sample_id,
-                    v_captured_at,
-                    pid,
-                    usename,
-                    application_name,
-                    backend_type,
-                    state,
-                    wait_event_type,
-                    wait_event,
-                    query_start,
-                    state_change,
-                    left(query, 200)
-                FROM pg_stat_activity
-                WHERE state != 'idle' AND pid != pg_backend_pid()
-                ORDER BY query_start ASC NULLS LAST
-                LIMIT 25;
+                -- Phase 5B: Use snapshot table if enabled
+                IF v_snapshot_based THEN
+                    INSERT INTO flight_recorder.activity_samples (
+                        sample_id, sample_captured_at, pid, usename, application_name, backend_type,
+                        state, wait_event_type, wait_event, query_start, state_change, query_preview
+                    )
+                    SELECT
+                        v_sample_id,
+                        v_captured_at,
+                        pid,
+                        usename,
+                        application_name,
+                        backend_type,
+                        state,
+                        wait_event_type,
+                        wait_event,
+                        query_start,
+                        state_change,
+                        left(query, 200)
+                    FROM _fr_psa_snapshot
+                    WHERE state != 'idle'
+                    ORDER BY query_start ASC NULLS LAST
+                    LIMIT 25;
+                ELSE
+                    INSERT INTO flight_recorder.activity_samples (
+                        sample_id, sample_captured_at, pid, usename, application_name, backend_type,
+                        state, wait_event_type, wait_event, query_start, state_change, query_preview
+                    )
+                    SELECT
+                        v_sample_id,
+                        v_captured_at,
+                        pid,
+                        usename,
+                        application_name,
+                        backend_type,
+                        state,
+                        wait_event_type,
+                        wait_event,
+                        query_start,
+                        state_change,
+                        left(query, 200)
+                    FROM pg_stat_activity
+                    WHERE state != 'idle' AND pid != pg_backend_pid()
+                    ORDER BY query_start ASC NULLS LAST
+                    LIMIT 25;
+                END IF;
             END IF;
         END;
 
@@ -1593,55 +1699,101 @@ BEGIN
                 50
             );
 
+            -- Phase 5B: Use snapshot table if enabled (reduces catalog locks)
             -- Quick count of blocked sessions (minimal overhead)
-            SELECT COUNT(*) INTO v_blocked_count
-            FROM pg_stat_activity
-            WHERE pid != pg_backend_pid()
-              AND cardinality(pg_blocking_pids(pid)) > 0;
+            IF v_snapshot_based THEN
+                SELECT COUNT(*) INTO v_blocked_count
+                FROM _fr_psa_snapshot
+                WHERE cardinality(pg_blocking_pids(pid)) > 0;
+            ELSE
+                SELECT COUNT(*) INTO v_blocked_count
+                FROM pg_stat_activity
+                WHERE pid != pg_backend_pid()
+                  AND cardinality(pg_blocking_pids(pid)) > 0;
+            END IF;
 
             IF v_blocked_count > v_skip_locks_threshold THEN
                 RAISE NOTICE 'pg-flight-recorder: Skipping lock collection - % blocked sessions exceeds threshold % (potential lock storm)',
                     v_blocked_count, v_skip_locks_threshold;
             ELSE
+                -- Phase 5B: Use snapshot table if enabled
                 -- O(n) lock detection using pg_blocking_pids()
                 -- pg_blocking_pids(pid) returns array of PIDs blocking a given PID
                 -- This is much more efficient than the O(n²) self-join on pg_locks
-                INSERT INTO flight_recorder.lock_samples (
-                    sample_id, sample_captured_at, blocked_pid, blocked_user, blocked_app, blocked_query_preview, blocked_duration,
-                    blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation
-                )
-                SELECT DISTINCT ON (blocked.pid, blocking_pid)
-                    v_sample_id,
-                    v_captured_at,
-                    blocked.pid,
-                    blocked.usename,
-                    blocked.application_name,
-                    left(blocked.query, 200),
-                    v_captured_at - blocked.query_start,
-                    blocking_pid,
-                    blocking.usename,
-                    blocking.application_name,
-                    left(blocking.query, 200),
-                    -- Get lock type from the blocked session's wait_event
-                    CASE
-                        WHEN blocked.wait_event_type = 'Lock' THEN blocked.wait_event
-                        ELSE 'unknown'
-                    END,
-                    -- Get relation if waiting on a relation lock
-                    CASE
-                        WHEN blocked.wait_event IN ('relation', 'extend', 'page', 'tuple') THEN
-                            (SELECT l.relation::regclass::text
-                             FROM pg_locks l
-                             WHERE l.pid = blocked.pid AND NOT l.granted
-                             LIMIT 1)
-                        ELSE NULL
-                    END
-                FROM pg_stat_activity blocked
-                CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pid
-                JOIN pg_stat_activity blocking ON blocking.pid = blocking_pid
-                WHERE blocked.pid != pg_backend_pid()
-                ORDER BY blocked.pid, blocking_pid
-                LIMIT 100;
+                IF v_snapshot_based THEN
+                    INSERT INTO flight_recorder.lock_samples (
+                        sample_id, sample_captured_at, blocked_pid, blocked_user, blocked_app, blocked_query_preview, blocked_duration,
+                        blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation
+                    )
+                    SELECT DISTINCT ON (blocked.pid, blocking_pid)
+                        v_sample_id,
+                        v_captured_at,
+                        blocked.pid,
+                        blocked.usename,
+                        blocked.application_name,
+                        left(blocked.query, 200),
+                        v_captured_at - blocked.query_start,
+                        blocking_pid,
+                        blocking.usename,
+                        blocking.application_name,
+                        left(blocking.query, 200),
+                        -- Get lock type from the blocked session's wait_event
+                        CASE
+                            WHEN blocked.wait_event_type = 'Lock' THEN blocked.wait_event
+                            ELSE 'unknown'
+                        END,
+                        -- Get relation if waiting on a relation lock
+                        CASE
+                            WHEN blocked.wait_event IN ('relation', 'extend', 'page', 'tuple') THEN
+                                (SELECT l.relation::regclass::text
+                                 FROM pg_locks l
+                                 WHERE l.pid = blocked.pid AND NOT l.granted
+                                 LIMIT 1)
+                            ELSE NULL
+                        END
+                    FROM _fr_psa_snapshot blocked
+                    CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pid
+                    JOIN _fr_psa_snapshot blocking ON blocking.pid = blocking_pid
+                    ORDER BY blocked.pid, blocking_pid
+                    LIMIT 100;
+                ELSE
+                    INSERT INTO flight_recorder.lock_samples (
+                        sample_id, sample_captured_at, blocked_pid, blocked_user, blocked_app, blocked_query_preview, blocked_duration,
+                        blocking_pid, blocking_user, blocking_app, blocking_query_preview, lock_type, locked_relation
+                    )
+                    SELECT DISTINCT ON (blocked.pid, blocking_pid)
+                        v_sample_id,
+                        v_captured_at,
+                        blocked.pid,
+                        blocked.usename,
+                        blocked.application_name,
+                        left(blocked.query, 200),
+                        v_captured_at - blocked.query_start,
+                        blocking_pid,
+                        blocking.usename,
+                        blocking.application_name,
+                        left(blocking.query, 200),
+                        -- Get lock type from the blocked session's wait_event
+                        CASE
+                            WHEN blocked.wait_event_type = 'Lock' THEN blocked.wait_event
+                            ELSE 'unknown'
+                        END,
+                        -- Get relation if waiting on a relation lock
+                        CASE
+                            WHEN blocked.wait_event IN ('relation', 'extend', 'page', 'tuple') THEN
+                                (SELECT l.relation::regclass::text
+                                 FROM pg_locks l
+                                 WHERE l.pid = blocked.pid AND NOT l.granted
+                                 LIMIT 1)
+                            ELSE NULL
+                        END
+                    FROM pg_stat_activity blocked
+                    CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pid
+                    JOIN pg_stat_activity blocking ON blocking.pid = blocking_pid
+                    WHERE blocked.pid != pg_backend_pid()
+                    ORDER BY blocked.pid, blocking_pid
+                    LIMIT 100;
+                END IF;
             END IF;
         END;
 
@@ -1972,16 +2124,40 @@ BEGIN
     THEN
         DECLARE
             v_stmt_status TEXT;
+            v_last_statements_collection TIMESTAMPTZ;
+            v_statements_interval_minutes INTEGER;
+            v_should_collect BOOLEAN := TRUE;
         BEGIN
-            PERFORM flight_recorder._set_section_timeout();
-            -- Check if statement tracking is healthy (not under high churn)
-            SELECT status INTO v_stmt_status
-            FROM flight_recorder._check_statements_health();
+            -- Phase 5A: Check if enough time has elapsed since last statements collection
+            v_statements_interval_minutes := COALESCE(
+                flight_recorder._get_config('statements_interval_minutes', '15')::integer,
+                15
+            );
 
-            -- Skip if utilization too high (indicates excessive churn)
-            IF v_stmt_status = 'HIGH_CHURN' THEN
-                RAISE WARNING 'pg-flight-recorder: Skipping pg_stat_statements collection - high churn detected (>95%% utilization)';
-            ELSE
+            SELECT max(s.captured_at) INTO v_last_statements_collection
+            FROM flight_recorder.snapshots s
+            WHERE EXISTS (
+                SELECT 1 FROM flight_recorder.statement_snapshots ss
+                WHERE ss.snapshot_id = s.id
+            );
+
+            -- Skip if collected within interval
+            IF v_last_statements_collection IS NOT NULL
+               AND v_last_statements_collection > now() - (v_statements_interval_minutes || ' minutes')::interval
+            THEN
+                v_should_collect := FALSE;
+            END IF;
+
+            IF v_should_collect THEN
+                PERFORM flight_recorder._set_section_timeout();
+                -- Check if statement tracking is healthy (not under high churn)
+                SELECT status INTO v_stmt_status
+                FROM flight_recorder._check_statements_health();
+
+                -- Skip if utilization too high (indicates excessive churn)
+                IF v_stmt_status = 'HIGH_CHURN' THEN
+                    RAISE WARNING 'pg-flight-recorder: Skipping pg_stat_statements collection - high churn detected (>95%% utilization)';
+                ELSE
                 INSERT INTO flight_recorder.statement_snapshots (
                 snapshot_id, queryid, userid, dbid, query_preview,
                 calls, total_exec_time, min_exec_time, max_exec_time,
@@ -2017,10 +2193,11 @@ BEGIN
             WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
               AND s.calls >= COALESCE(flight_recorder._get_config('statements_min_calls', '1')::integer, 1)
             ORDER BY s.total_exec_time DESC
-            LIMIT COALESCE(flight_recorder._get_config('statements_top_n', '50')::integer, 50);
+            LIMIT COALESCE(flight_recorder._get_config('statements_top_n', '20')::integer, 20);
 
-                PERFORM flight_recorder._record_section_success(v_stat_id);
-            END IF;  -- v_stmt_status check
+                    PERFORM flight_recorder._record_section_success(v_stat_id);
+                END IF;  -- v_stmt_status check
+            END IF;  -- v_should_collect check
         EXCEPTION
             WHEN undefined_table THEN NULL;
             WHEN undefined_column THEN NULL;
@@ -3451,9 +3628,18 @@ DECLARE
     v_supports_subsecond BOOLEAN := FALSE;
     v_sample_schedule TEXT;
     v_scheduled INTEGER := 0;
+    v_sample_interval_seconds INTEGER;
+    v_sample_interval_minutes INTEGER;
+    v_cron_expression TEXT;
 BEGIN
     -- Get current mode
     v_mode := flight_recorder._get_config('mode', 'normal');
+
+    -- Phase 5A: Get configurable sample interval (default 120s)
+    v_sample_interval_seconds := COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '120')::integer,
+        120
+    );
 
     BEGIN
         -- Check pg_cron version
@@ -3477,15 +3663,29 @@ BEGIN
         PERFORM cron.schedule('flight_recorder_snapshot', '*/5 * * * *', 'SELECT flight_recorder.snapshot()');
         v_scheduled := v_scheduled + 1;
 
-        -- Schedule sample based on mode and pg_cron capabilities (A-GRADE: INCREASED from 30s to 60s)
-        -- Note: pg_cron interval format only supports 1-59 seconds, so we use cron format for 60s
-        IF v_mode = 'normal' OR v_mode = 'light' THEN
-            PERFORM cron.schedule('flight_recorder_sample', '* * * * *', 'SELECT flight_recorder.sample()');
-            v_sample_schedule := '* * * * * (every minute)';
-        ELSIF v_mode = 'emergency' THEN
-            PERFORM cron.schedule('flight_recorder_sample', '*/2 * * * *', 'SELECT flight_recorder.sample()');
-            v_sample_schedule := '*/2 * * * * (every 2 minutes)';
+        -- Phase 5A: Schedule sample based on configurable interval
+        -- Convert seconds to minutes for cron format (only supports minute granularity)
+        IF v_sample_interval_seconds < 60 THEN
+            -- Sub-minute intervals not supported reliably, default to 60s
+            v_cron_expression := '* * * * *';
+            v_sample_schedule := 'every minute (60s)';
+        ELSIF v_sample_interval_seconds = 60 THEN
+            v_cron_expression := '* * * * *';
+            v_sample_schedule := 'every minute (60s)';
+        ELSE
+            -- Convert to minutes (round up)
+            v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
+            v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
+            v_sample_schedule := format('every %s minutes (%ss)', v_sample_interval_minutes, v_sample_interval_seconds);
         END IF;
+
+        -- Emergency mode overrides with 2-minute minimum interval
+        IF v_mode = 'emergency' AND v_sample_interval_minutes < 2 THEN
+            v_cron_expression := '*/2 * * * *';
+            v_sample_schedule := 'every 2 minutes (emergency mode override)';
+        END IF;
+
+        PERFORM cron.schedule('flight_recorder_sample', v_cron_expression, 'SELECT flight_recorder.sample()');
         v_scheduled := v_scheduled + 1;
 
         -- Schedule cleanup (daily at 3 AM) - now uses drop_old_partitions for samples table
