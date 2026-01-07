@@ -685,8 +685,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('alert_enabled', 'false'),                -- Enable alert notifications
     ('alert_circuit_breaker_count', '5'),      -- Alert if circuit breaker trips N times in hour
     ('alert_schema_size_mb', '8000'),          -- Alert if schema exceeds threshold (80% of critical)
-    -- Phase 5B: Snapshot-based collection (opt-in, reduces catalog locks from 3 to 1)
-    ('snapshot_based_collection', 'false'),    -- Use temp table snapshot of pg_stat_activity
+    -- Phase 5B: Snapshot-based collection (default enabled, reduces catalog locks from 3 to 1)
+    ('snapshot_based_collection', 'true'),     -- Use temp table snapshot of pg_stat_activity
     -- Phase 5C: Adaptive sampling (opt-in, skips collection when idle)
     ('adaptive_sampling', 'false'),            -- Skip collection when system idle
     ('adaptive_sampling_idle_threshold', '5')  -- Skip if < N active connections
@@ -1416,10 +1416,10 @@ BEGIN
     );
     v_pg_version := flight_recorder._pg_version();
 
-    -- Phase 5B: Snapshot-based collection (opt-in) - Query pg_stat_activity once
+    -- Phase 5B: Snapshot-based collection (default enabled) - Query pg_stat_activity once
     v_snapshot_based := COALESCE(
-        flight_recorder._get_config('snapshot_based_collection', 'false')::boolean,
-        false
+        flight_recorder._get_config('snapshot_based_collection', 'true')::boolean,
+        true
     );
 
     IF v_snapshot_based THEN

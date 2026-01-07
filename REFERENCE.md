@@ -199,7 +199,7 @@ Key settings:
 | `sample_interval_seconds`           | 120     | Sample collection interval (60, 120, 180, ...) |
 | `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
 | `statements_top_n`                  | 20      | Number of top queries to capture               |
-| `snapshot_based_collection`         | false   | Use temp table snapshot (reduces catalog locks)|
+| `snapshot_based_collection`         | true    | Use temp table snapshot (reduces catalog locks)|
 | `adaptive_sampling`                 | false   | Skip collection when system idle               |
 | `adaptive_sampling_idle_threshold`  | 5       | Skip if < N active connections                 |
 | `schema_size_warning_mb`            | 5000    | Warning threshold                              |
@@ -267,7 +267,7 @@ GROUP BY collection_type;
 
 ## Advanced Optimizations
 
-Flight recorder includes several opt-in features to further reduce overhead and catalog lock contention.
+Flight recorder includes advanced features to reduce overhead and catalog lock contention. Some are enabled by default, others are opt-in.
 
 ### Snapshot-Based Collection (Phase 5B)
 
@@ -275,19 +275,17 @@ Flight recorder includes several opt-in features to further reduce overhead and 
 
 **How it works:** Creates a temp table snapshot of `pg_stat_activity` once per sample, then all sections query from the snapshot instead of querying the catalog 3 separate times.
 
-**Enable:**
-```sql
-UPDATE flight_recorder.config SET value = 'true' WHERE key = 'snapshot_based_collection';
-```
+**Status:** ✓ Enabled by default
 
 **Impact:**
 - Catalog locks: 3 → 1 per sample (67% reduction)
 - Overhead: Negligible (temp table is ~100KB for 100 connections)
 - Consistency: All sections see same snapshot (more accurate)
 
-**When to use:**
-- High-DDL workloads with frequent catalog lock contention
-- Systems where you've observed lock timeout errors in `collection_stats`
+**To disable (not recommended):**
+```sql
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'snapshot_based_collection';
+```
 
 ### Adaptive Sampling (Phase 5C)
 

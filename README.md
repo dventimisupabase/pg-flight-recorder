@@ -68,7 +68,7 @@ pg-flight-recorder has measurable overhead. Exact cost depends on configuration:
 
 Additional considerations:
 
-- **Catalog locks**: Every collection acquires AccessShareLock on system catalogs (configurable to 1 lock per sample)
+- **Catalog locks**: 1 AccessShareLock per sample (default snapshot-based collection)
 - **Lock timeout**: 100ms - fails fast if catalogs are locked by DDL operations
 - **Memory**: 2MB work_mem per collection (configurable)
 - **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
@@ -95,9 +95,6 @@ SELECT * FROM flight_recorder.validate_config();
 Additional features available via configuration:
 
 ```sql
--- Reduce catalog locks from 3 to 1 per sample (snapshot-based collection)
-UPDATE flight_recorder.config SET value = 'true' WHERE key = 'snapshot_based_collection';
-
 -- Skip collection when system idle (adaptive sampling)
 UPDATE flight_recorder.config SET value = 'true' WHERE key = 'adaptive_sampling';
 
