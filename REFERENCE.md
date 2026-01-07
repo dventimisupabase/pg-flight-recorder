@@ -22,65 +22,65 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ### Analysis
 
-| Function | Purpose |
-|----------|---------|
-| `compare(start, end)` | Compare system stats between time points |
-| `wait_summary(start, end)` | Aggregate wait events over time period |
-| `activity_at(timestamp)` | What was happening at specific moment |
-| `anomaly_report(start, end)` | Auto-detect 6 issue types |
-| `summary_report(start, end)` | Comprehensive diagnostic report |
-| `table_compare(table, start, end)` | Compare table stats (tracked tables only) |
-| `statement_compare(start, end)` | Compare query performance (requires pg_stat_statements) |
+| Function                           | Purpose                                                 |
+|------------------------------------|---------------------------------------------------------|
+| `compare(start, end)`              | Compare system stats between time points                |
+| `wait_summary(start, end)`         | Aggregate wait events over time period                  |
+| `activity_at(timestamp)`           | What was happening at specific moment                   |
+| `anomaly_report(start, end)`       | Auto-detect 6 issue types                               |
+| `summary_report(start, end)`       | Comprehensive diagnostic report                         |
+| `table_compare(table, start, end)` | Compare table stats (tracked tables only)               |
+| `statement_compare(start, end)`    | Compare query performance (requires pg_stat_statements) |
 
 ### Control
 
-| Function | Purpose |
-|----------|---------|
-| `enable()` | Start collection (schedules pg_cron jobs) |
-| `disable()` | Stop all collection immediately |
-| `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity |
-| `get_mode()` | Show current mode and settings |
-| `cleanup(interval)` | Delete old data (default: 7 days) |
+| Function                                 | Purpose                                   |
+|------------------------------------------|-------------------------------------------|
+| `enable()`                               | Start collection (schedules pg_cron jobs) |
+| `disable()`                              | Stop all collection immediately           |
+| `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity               |
+| `get_mode()`                             | Show current mode and settings            |
+| `cleanup(interval)`                      | Delete old data (default: 7 days)         |
 
 ### Table Tracking
 
-| Function | Purpose |
-|----------|---------|
-| `track_table(name, schema)` | Monitor a specific table |
-| `untrack_table(name, schema)` | Stop monitoring |
-| `list_tracked_tables()` | Show tracked tables |
+| Function                      | Purpose                  |
+|-------------------------------|--------------------------|
+| `track_table(name, schema)`   | Monitor a specific table |
+| `untrack_table(name, schema)` | Stop monitoring          |
+| `list_tracked_tables()`       | Show tracked tables      |
 
 **Warning:** Each tracked table adds overhead. Track 5-20 critical tables max.
 
 ### Health & Monitoring
 
-| Function | Purpose |
-|----------|---------|
-| `health_check()` | Component status overview |
+| Function                       | Purpose                           |
+|--------------------------------|-----------------------------------|
+| `health_check()`               | Component status overview         |
 | `performance_report(interval)` | Flight recorder's own performance |
-| `check_alerts(interval)` | Active alerts (if enabled) |
-| `config_recommendations()` | Optimization suggestions |
-| `export_json(start, end)` | AI-friendly data export |
+| `check_alerts(interval)`       | Active alerts (if enabled)        |
+| `config_recommendations()`     | Optimization suggestions          |
+| `export_json(start, end)`      | AI-friendly data export           |
 
 ## Views
 
-| View | Purpose |
-|------|---------|
-| `recent_waits` | Wait events (last 2 hours) |
-| `recent_activity` | Active sessions (last 2 hours) |
-| `recent_locks` | Lock contention (last 2 hours) |
-| `recent_progress` | Vacuum/COPY/analyze progress (last 2 hours) |
-| `recent_replication` | Replication lag (last 2 hours) |
-| `deltas` | Snapshot-over-snapshot changes |
-| `table_deltas` | Tracked table changes |
+| View                 | Purpose                                     |
+|----------------------|---------------------------------------------|
+| `recent_waits`       | Wait events (last 2 hours)                  |
+| `recent_activity`    | Active sessions (last 2 hours)              |
+| `recent_locks`       | Lock contention (last 2 hours)              |
+| `recent_progress`    | Vacuum/COPY/analyze progress (last 2 hours) |
+| `recent_replication` | Replication lag (last 2 hours)              |
+| `deltas`             | Snapshot-over-snapshot changes              |
+| `table_deltas`       | Tracked table changes                       |
 
 ## Collection Modes
 
-| Mode | Sample Interval | Locks | Progress | Use Case |
-|------|-----------------|-------|----------|----------|
-| `normal` | 30 seconds | Yes | Yes | Default |
-| `light` | 60 seconds | Yes | No | Moderate load |
-| `emergency` | 120 seconds | No | No | System stressed |
+| Mode        | Sample Interval | Locks | Progress | Use Case        |
+|-------------|-----------------|-------|----------|-----------------|
+| `normal`    | 30 seconds      | Yes   | Yes      | Default         |
+| `light`     | 60 seconds      | Yes   | No       | Moderate load   |
+| `emergency` | 120 seconds     | No    | No       | System stressed |
 
 ```sql
 SELECT flight_recorder.set_mode('light');
@@ -91,14 +91,14 @@ SELECT * FROM flight_recorder.get_mode();
 
 `anomaly_report()` auto-detects:
 
-| Type | Meaning |
-|------|---------|
-| `CHECKPOINT_DURING_WINDOW` | Checkpoint occurred (I/O spike) |
-| `FORCED_CHECKPOINT` | WAL exceeded max_wal_size |
-| `BUFFER_PRESSURE` | Backends writing directly to disk |
-| `BACKEND_FSYNC` | Backends doing fsync (bgwriter overwhelmed) |
-| `TEMP_FILE_SPILLS` | Queries spilling to disk (work_mem too low) |
-| `LOCK_CONTENTION` | Sessions blocked on locks |
+| Type                       | Meaning                                     |
+|----------------------------|---------------------------------------------|
+| `CHECKPOINT_DURING_WINDOW` | Checkpoint occurred (I/O spike)             |
+| `FORCED_CHECKPOINT`        | WAL exceeded max_wal_size                   |
+| `BUFFER_PRESSURE`          | Backends writing directly to disk           |
+| `BACKEND_FSYNC`            | Backends doing fsync (bgwriter overwhelmed) |
+| `TEMP_FILE_SPILLS`         | Queries spilling to disk (work_mem too low) |
+| `LOCK_CONTENTION`          | Sessions blocked on locks                   |
 
 ## Safety Features
 
@@ -180,17 +180,17 @@ SELECT * FROM flight_recorder.config;
 
 Key settings:
 
-| Key | Default | Purpose |
-|-----|---------|---------|
-| `circuit_breaker_threshold_ms` | 1000 | Max collection duration |
-| `circuit_breaker_enabled` | true | Enable/disable circuit breaker |
-| `auto_mode_enabled` | true | Auto-adjust collection mode |
-| `auto_mode_connections_threshold` | 60 | % connections to trigger light mode |
-| `section_timeout_ms` | 1000 | Per-section query timeout |
-| `schema_size_warning_mb` | 5000 | Warning threshold |
-| `schema_size_critical_mb` | 10000 | Auto-disable threshold |
-| `retention_samples_days` | 7 | Sample retention |
-| `retention_snapshots_days` | 30 | Snapshot retention |
+| Key                               | Default | Purpose                             |
+|-----------------------------------|---------|-------------------------------------|
+| `circuit_breaker_threshold_ms`    | 1000    | Max collection duration             |
+| `circuit_breaker_enabled`         | true    | Enable/disable circuit breaker      |
+| `auto_mode_enabled`               | true    | Auto-adjust collection mode         |
+| `auto_mode_connections_threshold` | 60      | % connections to trigger light mode |
+| `section_timeout_ms`              | 1000    | Per-section query timeout           |
+| `schema_size_warning_mb`          | 5000    | Warning threshold                   |
+| `schema_size_critical_mb`         | 10000   | Auto-disable threshold              |
+| `retention_samples_days`          | 7       | Sample retention                    |
+| `retention_snapshots_days`        | 30      | Snapshot retention                  |
 
 ## Diagnostic Patterns
 
