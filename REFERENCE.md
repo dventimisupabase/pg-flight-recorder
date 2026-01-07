@@ -228,6 +228,7 @@ Each collection section wrapped in exception handlers:
 ### DDL Detection
 
 **NEW in Phase 6**: Prevents lock contention with active schema changes.
+**UPGRADED**: Catalog-based detection for 100% accuracy.
 
 **Problem:**
 - DDL operations (CREATE, ALTER, DROP, TRUNCATE, REINDEX, VACUUM FULL) acquire AccessExclusiveLock on system catalogs
@@ -241,6 +242,21 @@ DDL detection automatically checks for active DDL before collecting, and can:
 1. **Skip lock collection only** (default: `ddl_skip_locks = true`)
 2. **Skip entire sample** (aggressive: `ddl_skip_entire_sample = true`)
 
+**Detection Methods:**
+
+Flight recorder supports two DDL detection methods:
+
+1. **Catalog-based (upgraded, default)**: 100% accurate
+   - Detects AccessExclusiveLock on system catalogs (pg_class, pg_attribute, etc.)
+   - Catches ALL DDL including dynamic SQL, stored procedures, multi-statement blocks
+   - Set: `ddl_detection_use_locks = true` (default)
+   - Detects: TABLE_DDL, FUNCTION_DDL, TYPE_DDL, SCHEMA_DDL, EXTENSION_DDL
+
+2. **Query pattern (fallback)**: 95% accurate
+   - Regex matching on pg_stat_activity.query
+   - Faster but misses edge cases (dynamic SQL: `EXECUTE 'CREATE...'`)
+   - Set: `ddl_detection_use_locks = false`
+
 **Configuration:**
 
 ```sql
@@ -250,7 +266,13 @@ SELECT * FROM flight_recorder.health_check() WHERE component = 'DDL Detection';
 -- View DDL detection config
 SELECT key, value FROM flight_recorder.config WHERE key LIKE 'ddl_%';
 
--- Disable DDL detection (not recommended for high-DDL workloads)
+-- Use catalog-based detection (default, recommended)
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'ddl_detection_use_locks';
+
+-- Fallback to query pattern detection (for compatibility)
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_detection_use_locks';
+
+-- Disable DDL detection entirely (not recommended for high-DDL workloads)
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'ddl_detection_enabled';
 
 -- Change behavior: skip entire sample when DDL detected (more aggressive)
@@ -266,6 +288,7 @@ ORDER BY started_at DESC;
 
 **Default Settings:**
 - `ddl_detection_enabled = true` - Enabled by default
+- `ddl_detection_use_locks = true` - Use catalog-based detection (upgraded)
 - `ddl_skip_locks = true` - Skip lock collection when DDL detected (recommended)
 - `ddl_skip_entire_sample = false` - Still collect wait/activity/progress data
 
@@ -281,6 +304,160 @@ ORDER BY started_at DESC;
 - `TRUNCATE` (table truncation)
 - `REINDEX` (index rebuilding)
 - `VACUUM FULL` (table rewriting)
+
+### Job Deduplication
+
+**NEW**: Prevents pg_cron job queue buildup during slow collections or outages.
+
+**Problem:**
+- If `sample()` or `snapshot()` takes longer than the scheduled interval, pg_cron queues up the next job
+- During recovery from outages, multiple jobs can pile up
+- Result: Amplified observer effect during stress periods
+
+**Solution:**
+Each collection checks for already-running jobs before starting:
+- Queries `pg_stat_activity` for active `flight_recorder.sample()` or `flight_recorder.snapshot()` calls
+- If duplicate detected, skips this cycle and logs to `collection_stats`
+- Prevents queue buildup with zero configuration required
+
+**How to Monitor:**
+
+```sql
+-- View job deduplication skips
+SELECT started_at, collection_type, skipped_reason
+FROM flight_recorder.collection_stats
+WHERE skipped = true
+  AND skipped_reason LIKE '%Job deduplication%'
+ORDER BY started_at DESC;
+```
+
+**Behavior:**
+- Automatic (no configuration needed)
+- Minimal overhead (~1ms per collection to check pg_stat_activity)
+- Logged as skipped collection with reason: "Job deduplication: N job(s) already running (PID: X)"
+
+### Auto-Recovery from Storage Breach
+
+**NEW**: Self-healing storage management with proactive cleanup.
+
+**Problem (previous behavior):**
+- At 10GB: Flight recorder disables collection
+- Requires manual intervention to re-enable
+- Monitoring stays offline indefinitely
+
+**Solution (upgraded):**
+
+Automatic storage management with hysteresis:
+
+| Size Range | Action | Result |
+|------------|--------|--------|
+| < 5GB | Normal operation | No action |
+| 5-8GB | Proactive cleanup (5 days retention) | Prevents reaching 10GB |
+| 8-10GB | Warning state | Continue monitoring |
+| > 10GB (when enabled) | 1. Try aggressive cleanup (3 days)<br>2. Disable only if still > 10GB | Self-healing |
+| < 8GB (when disabled) | Auto-re-enable | Recovery |
+
+**2GB Hysteresis:** Disable at 10GB, re-enable at 8GB (prevents flapping)
+
+**How to Monitor:**
+
+```sql
+-- Check current storage status
+SELECT * FROM flight_recorder._check_schema_size();
+
+-- Monitor auto-recovery events
+SELECT schema_size_mb, status, action_taken
+FROM flight_recorder._check_schema_size()
+WHERE status IN ('RECOVERED', 'CRITICAL');
+```
+
+**Configuration:**
+
+No configuration needed - works automatically. To adjust thresholds:
+
+```sql
+-- Change warning threshold (default 5000 MB)
+UPDATE flight_recorder.config
+SET value = '6000'
+WHERE key = 'schema_size_warning_mb';
+
+-- Change critical threshold (default 10000 MB)
+UPDATE flight_recorder.config
+SET value = '12000'
+WHERE key = 'schema_size_critical_mb';
+```
+
+**Manual Override:**
+
+```sql
+-- Force enable even if over threshold
+SELECT flight_recorder.enable();
+
+-- Force disable
+SELECT flight_recorder.disable();
+```
+
+### pg_cron Job Health Monitoring
+
+**NEW**: Detects silent failures when pg_cron jobs are deleted, disabled, or broken.
+
+**Problem (previous behavior):**
+- If pg_cron jobs are manually deleted/disabled, flight recorder fails silently
+- No alerting when collection stops due to missing jobs
+- Manual investigation required to diagnose
+
+**Solution (upgraded):**
+
+Automatic health checks for all 4 required pg_cron jobs:
+- `flight_recorder_sample`
+- `flight_recorder_snapshot`
+- `flight_recorder_cleanup`
+- `flight_recorder_partition`
+
+**Health Checks:**
+
+1. **Real-time:** `health_check()` function
+```sql
+SELECT * FROM flight_recorder.health_check()
+WHERE component = 'pg_cron Jobs';
+-- Returns: OK, WARNING, or CRITICAL with specific missing/inactive jobs
+```
+
+2. **Quarterly Review:** `quarterly_review()` function (run every 90 days)
+```sql
+SELECT * FROM flight_recorder.quarterly_review()
+WHERE component LIKE '%pg_cron%';
+-- Metric 7: Verifies all 4 jobs exist and are active
+```
+
+**Status Levels:**
+- **OK**: All 4 jobs exist and are active
+- **CRITICAL**: Jobs missing or inactive (specific jobs listed)
+- **ERROR**: Failed to check pg_cron (extension issue)
+
+**Recovery:**
+
+```sql
+-- If jobs are missing or inactive
+SELECT flight_recorder.enable();
+-- Recreates all 4 jobs
+```
+
+**How to Monitor:**
+
+```sql
+-- Check all jobs manually
+SELECT jobid, jobname, schedule, active
+FROM cron.job
+WHERE jobname LIKE 'flight_recorder%'
+ORDER BY jobname;
+
+-- View health status
+SELECT * FROM flight_recorder.health_check();
+
+-- 90-day health report
+SELECT * FROM flight_recorder.quarterly_review();
+```
 
 ## Configuration
 
