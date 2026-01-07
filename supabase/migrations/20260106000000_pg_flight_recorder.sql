@@ -1408,8 +1408,8 @@ BEGIN
             v_skip_activity_threshold INTEGER;
         BEGIN
             v_skip_activity_threshold := COALESCE(
-                flight_recorder._get_config('skip_activity_conn_threshold', '400')::integer,
-                400
+                flight_recorder._get_config('skip_activity_conn_threshold', '100')::integer,
+                100
             );
 
             -- Quick count (minimal overhead)
@@ -1589,8 +1589,8 @@ BEGIN
             v_skip_locks_threshold INTEGER;
         BEGIN
             v_skip_locks_threshold := COALESCE(
-                flight_recorder._get_config('skip_locks_threshold', '200')::integer,
-                200
+                flight_recorder._get_config('skip_locks_threshold', '50')::integer,
+                50
             );
 
             -- Quick count of blocked sessions (minimal overhead)
