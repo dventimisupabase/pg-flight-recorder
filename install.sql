@@ -1352,36 +1352,6 @@ BEGIN
     -- P2 Safety: Check and adjust mode automatically based on system load
     PERFORM flight_recorder._check_and_adjust_mode();
 
-    -- Phase 5C: Adaptive sampling - skip if system idle (opt-in)
-    DECLARE
-        v_adaptive_sampling BOOLEAN;
-        v_idle_threshold INTEGER;
-        v_active_count INTEGER;
-    BEGIN
-        v_adaptive_sampling := COALESCE(
-            flight_recorder._get_config('adaptive_sampling', 'false')::boolean,
-            false
-        );
-
-        IF v_adaptive_sampling THEN
-            v_idle_threshold := COALESCE(
-                flight_recorder._get_config('adaptive_sampling_idle_threshold', '5')::integer,
-                5
-            );
-
-            SELECT count(*) INTO v_active_count
-            FROM pg_stat_activity
-            WHERE state = 'active' AND backend_type = 'client backend';
-
-            IF v_active_count < v_idle_threshold THEN
-                PERFORM flight_recorder._record_collection_skip('sample',
-                    format('Adaptive sampling: system idle (%s active connections < %s threshold)',
-                           v_active_count, v_idle_threshold));
-                RETURN v_captured_at;
-            END IF;
-        END IF;
-    END;
-
     -- P0 Safety: Check circuit breaker
     v_should_skip := flight_recorder._check_circuit_breaker('sample');
     IF v_should_skip THEN
@@ -1400,6 +1370,40 @@ BEGIN
     PERFORM set_config('work_mem',
         COALESCE(flight_recorder._get_config('work_mem_kb', '2048'), '2048') || 'kB',
         true);  -- Limit memory for joins/sorts
+
+    -- Phase 5C: Adaptive sampling - skip if system idle (opt-in)
+    -- IMPORTANT: This check happens AFTER lock_timeout is set, so it's protected
+    DECLARE
+        v_adaptive_sampling BOOLEAN;
+        v_idle_threshold INTEGER;
+        v_active_count INTEGER;
+    BEGIN
+        v_adaptive_sampling := COALESCE(
+            flight_recorder._get_config('adaptive_sampling', 'false')::boolean,
+            false
+        );
+
+        IF v_adaptive_sampling THEN
+            v_idle_threshold := COALESCE(
+                flight_recorder._get_config('adaptive_sampling_idle_threshold', '5')::integer,
+                5
+            );
+
+            -- This query is now protected by lock_timeout=100ms set above
+            SELECT count(*) INTO v_active_count
+            FROM pg_stat_activity
+            WHERE state = 'active' AND backend_type = 'client backend';
+
+            IF v_active_count < v_idle_threshold THEN
+                PERFORM flight_recorder._record_collection_skip('sample',
+                    format('Adaptive sampling: system idle (%s active connections < %s threshold)',
+                           v_active_count, v_idle_threshold));
+                -- Reset timeout before returning
+                PERFORM set_config('statement_timeout', '0', true);
+                RETURN v_captured_at;
+            END IF;
+        END IF;
+    END;
 
     -- Get configuration
     v_enable_locks := COALESCE(
@@ -3726,6 +3730,9 @@ DECLARE
     v_patch INT;
     v_supports_subsecond BOOLEAN := FALSE;
     v_sample_schedule TEXT;
+    v_sample_interval_seconds INTEGER;
+    v_sample_interval_minutes INTEGER;
+    v_cron_expression TEXT;
 BEGIN
     -- Remove existing jobs if any
     BEGIN
@@ -3741,6 +3748,13 @@ BEGIN
         WHEN undefined_table THEN NULL;
         WHEN undefined_function THEN NULL;
     END;
+
+    -- Phase 5A: Read sample interval from config (default 120s)
+    SELECT value::integer INTO v_sample_interval_seconds
+    FROM flight_recorder.config
+    WHERE key = 'sample_interval_seconds';
+
+    v_sample_interval_seconds := COALESCE(v_sample_interval_seconds, 120);
 
     -- Check pg_cron version to determine if sub-minute scheduling is supported
     -- Sub-minute intervals (e.g., '30 seconds') require pg_cron 1.4.1+
@@ -3768,30 +3782,40 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Schedule sample collection based on pg_cron capabilities
-    IF v_supports_subsecond THEN
-        v_sample_schedule := '30 seconds';
-        PERFORM cron.schedule(
-            'flight_recorder_sample',
-            '30 seconds',
-            'SELECT flight_recorder.sample()'
-        );
-        RAISE NOTICE 'pg_cron % supports sub-minute scheduling. Sampling every 30 seconds.', v_pgcron_version;
+    -- Phase 5A: Schedule sample collection based on configured interval
+    IF v_sample_interval_seconds < 60 THEN
+        -- Sub-minute intervals - round up to 60s (not reliably supported)
+        v_cron_expression := '* * * * *';
+        v_sample_schedule := 'every minute (60s, rounded from ' || v_sample_interval_seconds || 's config)';
+    ELSIF v_sample_interval_seconds = 60 THEN
+        v_cron_expression := '* * * * *';
+        v_sample_schedule := 'every minute (60s)';
     ELSE
-        v_sample_schedule := '* * * * * (every minute)';
-        PERFORM cron.schedule(
-            'flight_recorder_sample',
-            '* * * * *',
-            'SELECT flight_recorder.sample()'
-        );
-        RAISE NOTICE 'pg_cron % does not support sub-minute scheduling (requires 1.4.1+). Sampling every minute instead.', v_pgcron_version;
+        -- Multi-minute intervals - convert to minutes
+        v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
+        v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
+        v_sample_schedule := format('every %s minutes (%ss)', v_sample_interval_minutes, v_sample_interval_seconds);
     END IF;
 
-    -- Schedule cleanup (daily at 3 AM, retain 7 days)
+    PERFORM cron.schedule(
+        'flight_recorder_sample',
+        v_cron_expression,
+        'SELECT flight_recorder.sample()'
+    );
+    RAISE NOTICE 'Flight Recorder installed. Sampling %', v_sample_schedule;
+
+    -- Schedule cleanup (daily at 3 AM) - uses drop_old_partitions
     PERFORM cron.schedule(
         'flight_recorder_cleanup',
         '0 3 * * *',
-        'SELECT * FROM flight_recorder.cleanup(''7 days''::interval)'
+        'SELECT flight_recorder.drop_old_partitions(); SELECT * FROM flight_recorder.cleanup(''7 days''::interval);'
+    );
+
+    -- Schedule partition creation (daily at 2 AM) - create future partitions proactively
+    PERFORM cron.schedule(
+        'flight_recorder_partition',
+        '0 2 * * *',
+        'SELECT flight_recorder.create_partitions(3)'
     );
 
 EXCEPTION
