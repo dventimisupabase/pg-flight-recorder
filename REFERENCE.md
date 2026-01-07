@@ -25,12 +25,11 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 | Function                           | Purpose                                                 |
 |------------------------------------|---------------------------------------------------------|
 | `compare(start, end)`              | Compare system stats between time points                |
-| `wait_summary(start, end)`         | Aggregate wait events over time period                  |
-| `activity_at(timestamp)`           | What was happening at specific moment                   |
-| `anomaly_report(start, end)`       | Auto-detect 6 issue types                               |
-| `summary_report(start, end)`       | Comprehensive diagnostic report                         |
-| `table_compare(table, start, end)` | Compare table stats (tracked tables only)               |
-| `statement_compare(start, end)`    | Compare query performance (requires pg_stat_statements) |
+| `wait_summary(start, end)`      | Aggregate wait events over time period                  |
+| `activity_at(timestamp)`        | What was happening at specific moment                   |
+| `anomaly_report(start, end)`    | Auto-detect 6 issue types                               |
+| `summary_report(start, end)`    | Comprehensive diagnostic report                         |
+| `statement_compare(start, end)` | Compare query performance (requires pg_stat_statements) |
 
 ### Control
 
@@ -41,16 +40,6 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 | `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity               |
 | `get_mode()`                             | Show current mode and settings            |
 | `cleanup(interval)`                      | Delete old data (default: 7 days)         |
-
-### Table Tracking
-
-| Function                      | Purpose                  |
-|-------------------------------|--------------------------|
-| `track_table(name, schema)`   | Monitor a specific table |
-| `untrack_table(name, schema)` | Stop monitoring          |
-| `list_tracked_tables()`       | Show tracked tables      |
-
-**Warning:** Each tracked table adds overhead. Track 5-20 critical tables max.
 
 ### Health & Monitoring
 
@@ -79,7 +68,6 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 | `recent_progress`    | Vacuum/COPY/analyze progress (last 2 hours) |
 | `recent_replication` | Replication lag (last 2 hours)              |
 | `deltas`             | Snapshot-over-snapshot changes              |
-| `table_deltas`       | Tracked table changes                       |
 
 ## Collection Modes
 
@@ -163,7 +151,7 @@ Flight recorder is designed to minimize impact on the database it monitors:
 
 **UNLOGGED Tables**
 - 9 telemetry tables use UNLOGGED to eliminate WAL overhead
-- Only `config` and `tracked_tables` (small config data) use WAL
+- Only `config` (small config data) uses WAL
 - Data lost on crash is acceptable for telemetry
 
 **Per-Section Timeouts**
@@ -523,16 +511,13 @@ Multi-tenant SaaS with frequent CREATE/DROP/ALTER operations:
 
 **Mitigations:**
 ```sql
--- Option 1: Disable tracked table monitoring (eliminates pg_relation_size locks)
-SELECT flight_recorder.untrack_table('table_name');
-
--- Option 2: Reduce lock_timeout further (fail even faster)
+-- Option 1: Reduce lock_timeout further (fail even faster)
 UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
 
--- Option 3: Use emergency mode during high-DDL periods
+-- Option 2: Use emergency mode during high-DDL periods
 SELECT flight_recorder.set_mode('emergency');
 
--- Option 4: Disable during maintenance windows
+-- Option 3: Disable during maintenance windows
 SELECT flight_recorder.disable();
 ```
 

@@ -15,10 +15,8 @@ SELECT plan(131);  -- Total number of tests (73 + 15 P0 + 8 P1 + 12 P2 + 9 P3 + 
 -- Test schema exists
 SELECT has_schema('flight_recorder', 'Schema flight_recorder should exist');
 
--- Test all 12 tables exist (11 original + 1 collection_stats)
+-- Test all 10 tables exist (9 original + 1 collection_stats)
 SELECT has_table('flight_recorder', 'snapshots', 'Table flight_recorder.snapshots should exist');
-SELECT has_table('flight_recorder', 'tracked_tables', 'Table flight_recorder.tracked_tables should exist');
-SELECT has_table('flight_recorder', 'table_snapshots', 'Table flight_recorder.table_snapshots should exist');
 SELECT has_table('flight_recorder', 'replication_snapshots', 'Table flight_recorder.replication_snapshots should exist');
 SELECT has_table('flight_recorder', 'statement_snapshots', 'Table flight_recorder.statement_snapshots should exist');
 SELECT has_table('flight_recorder', 'samples', 'Table flight_recorder.samples should exist');
@@ -71,9 +69,8 @@ SELECT ok(
     'lock_samples should have FK to samples'
 );
 
--- Test all 7 views exist
+-- Test all 6 views exist
 SELECT has_view('flight_recorder', 'deltas', 'View flight_recorder.deltas should exist');
-SELECT has_view('flight_recorder', 'table_deltas', 'View flight_recorder.table_deltas should exist');
 SELECT has_view('flight_recorder', 'recent_waits', 'View flight_recorder.recent_waits should exist');
 
 -- =============================================================================
@@ -91,11 +88,7 @@ SELECT has_function('flight_recorder', '_record_collection_skip', 'P0 Safety: Fu
 SELECT has_function('flight_recorder', '_check_schema_size', 'P1 Safety: Function flight_recorder._check_schema_size should exist');
 SELECT has_function('flight_recorder', 'snapshot', 'Function flight_recorder.snapshot should exist');
 SELECT has_function('flight_recorder', 'sample', 'Function flight_recorder.sample should exist');
-SELECT has_function('flight_recorder', 'track_table', 'Function flight_recorder.track_table should exist');
-SELECT has_function('flight_recorder', 'untrack_table', 'Function flight_recorder.untrack_table should exist');
-SELECT has_function('flight_recorder', 'list_tracked_tables', 'Function flight_recorder.list_tracked_tables should exist');
 SELECT has_function('flight_recorder', 'compare', 'Function flight_recorder.compare should exist');
-SELECT has_function('flight_recorder', 'table_compare', 'Function flight_recorder.table_compare should exist');
 SELECT has_function('flight_recorder', 'wait_summary', 'Function flight_recorder.wait_summary should exist');
 SELECT has_function('flight_recorder', 'statement_compare', 'Function flight_recorder.statement_compare should exist');
 SELECT has_function('flight_recorder', 'activity_at', 'Function flight_recorder.activity_at should exist');
@@ -172,50 +165,7 @@ SELECT is(
 );
 
 -- =============================================================================
--- 4. TABLE TRACKING (5 tests)
--- =============================================================================
-
--- Create a test table
-CREATE TABLE public.flight_recorder_test_table (
-    id serial PRIMARY KEY,
-    data text
-);
-
--- Test track_table()
-SELECT lives_ok(
-    $$SELECT flight_recorder.track_table('flight_recorder_test_table')$$,
-    'track_table() should work'
-);
-
--- Verify table is tracked
-SELECT ok(
-    EXISTS (SELECT 1 FROM flight_recorder.tracked_tables WHERE relname = 'flight_recorder_test_table'),
-    'Table should be in tracked_tables'
-);
-
--- Test list_tracked_tables()
-SELECT ok(
-    EXISTS (SELECT 1 FROM flight_recorder.list_tracked_tables() WHERE relname = 'flight_recorder_test_table'),
-    'list_tracked_tables() should show tracked table'
-);
-
--- Test untrack_table()
-SELECT lives_ok(
-    $$SELECT flight_recorder.untrack_table('flight_recorder_test_table')$$,
-    'untrack_table() should work'
-);
-
--- Verify table is untracked
-SELECT ok(
-    NOT EXISTS (SELECT 1 FROM flight_recorder.tracked_tables WHERE relname = 'flight_recorder_test_table'),
-    'Table should be removed from tracked_tables'
-);
-
--- Cleanup test table
-DROP TABLE public.flight_recorder_test_table;
-
--- =============================================================================
--- 5. ANALYSIS FUNCTIONS (8 tests)
+-- 4. ANALYSIS FUNCTIONS (8 tests)
 -- =============================================================================
 
 -- Capture a second snapshot and sample for time-based queries
@@ -288,24 +238,6 @@ SELECT lives_ok(
     )$$,
     'statement_compare() should execute without error'
 );
-
--- Test table_compare() (need a tracked table with activity)
-CREATE TABLE public.flight_recorder_compare_test (id serial, data text);
-SELECT flight_recorder.track_table('flight_recorder_compare_test');
-SELECT flight_recorder.snapshot();
-INSERT INTO public.flight_recorder_compare_test (data) VALUES ('test');
-SELECT flight_recorder.snapshot();
-
-SELECT lives_ok(
-    $$SELECT * FROM flight_recorder.table_compare(
-        'flight_recorder_compare_test',
-        (SELECT start_time FROM test_times),
-        now()
-    )$$,
-    'table_compare() should execute without error'
-);
-
-DROP TABLE public.flight_recorder_compare_test;
 
 -- Test wait_summary returns data
 SELECT ok(

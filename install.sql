@@ -26,7 +26,6 @@
 --      - Replication lag: per-replica write_lag, flush_lag, replay_lag
 --      - Temp files: cumulative temp files and bytes (work_mem spills)
 --      - pg_stat_io (PG16+): I/O by backend type
---      - Per-table stats for tracked tables: size, tuples, vacuum activity
 --
 --   2. Samples (every 30 sec via pg_cron)
 --      Point-in-time snapshots for real-time visibility:
@@ -37,17 +36,13 @@
 --
 -- QUICK START
 -- -----------
---   -- 1. Optionally track specific tables for detailed monitoring
---   SELECT flight_recorder.track_table('orders');
+--   -- 1. Flight Recorder collects automatically in the background
 --
---   -- 2. Flight Recorder collects automatically in the background
---
---   -- 3. Query any time window to diagnose performance
+--   -- 2. Query any time window to diagnose performance
 --   SELECT * FROM flight_recorder.compare('2024-12-16 14:00', '2024-12-16 15:00');
---   SELECT * FROM flight_recorder.table_compare('orders', '2024-12-16 14:00', '2024-12-16 15:00');
 --   SELECT * FROM flight_recorder.wait_summary('2024-12-16 14:00', '2024-12-16 15:00');
 --
---   -- 4. Or use the recent_* views for rolling 2-hour visibility
+--   -- 3. Or use the recent_* views for rolling 2-hour visibility
 --   SELECT * FROM flight_recorder.recent_waits;
 --   SELECT * FROM flight_recorder.recent_locks;
 --   SELECT * FROM flight_recorder.recent_activity;
@@ -62,25 +57,9 @@
 --       Capture point-in-time activity. Called automatically every 30 sec.
 --       Returns: timestamp of capture
 --
---   flight_recorder.track_table(name, schema DEFAULT 'public')
---       Register a table for per-table monitoring.
---       Returns: confirmation message
---
---   flight_recorder.untrack_table(name, schema DEFAULT 'public')
---       Stop monitoring a table.
---       Returns: confirmation message
---
---   flight_recorder.list_tracked_tables()
---       Show all tracked tables.
---       Returns: table of (schemaname, relname, added_at)
---
 --   flight_recorder.compare(start_time, end_time)
 --       Compare cumulative stats between two time points.
 --       Returns: single row with deltas for WAL, checkpoints, bgwriter, I/O
---
---   flight_recorder.table_compare(table, start_time, end_time, schema DEFAULT 'public')
---       Compare table stats between two time points.
---       Returns: single row with size delta, tuple counts, vacuum activity
 --
 --   flight_recorder.wait_summary(start_time, end_time)
 --       Aggregate wait events over a time period.
@@ -99,11 +78,6 @@
 --       Key columns: checkpoint_occurred, wal_bytes_delta, wal_bytes_pretty,
 --                    ckpt_write_time_ms, bgw_buffers_backend_delta,
 --                    temp_files_delta, temp_bytes_pretty
---
---   flight_recorder.table_deltas
---       Changes to tracked tables between consecutive snapshots.
---       Key columns: size_delta_pretty, inserts_delta, n_dead_tup,
---                    dead_tuple_ratio, autovacuum_ran, autoanalyze_ran
 --
 --   flight_recorder.recent_waits
 --       Wait events from last 2 hours.
@@ -221,9 +195,9 @@
 --
 --   PATTERN 4: Autovacuum Interference
 --   Symptoms:
---     - table_compare() shows autovacuum_ran=true during batch
 --     - recent_progress shows vacuum phases overlapping batch
 --     - Wait events: LWLock:BufferContent, IO:DataFileRead
+--     - Check pg_stat_user_tables.last_autovacuum for recent vacuum activity
 --   Resolution:
 --     - Schedule batches to avoid autovacuum (check pg_stat_user_tables)
 --     - Use ALTER TABLE ... SET (autovacuum_enabled = false) temporarily
@@ -268,16 +242,12 @@
 --      SELECT * FROM flight_recorder.wait_summary('START_TIME', 'END_TIME');
 --      => Red flags: Lock:*, LWLock:WALWrite, LWLock:BufferContent
 --
---   4. Table-specific (if tracking):
---      SELECT * FROM flight_recorder.table_compare('mytable', 'START_TIME', 'END_TIME');
---      => Check: autovacuum_ran, dead_tuple_ratio, size_delta
---
---   5. Active operations:
+--   4. Active operations:
 --      SELECT * FROM flight_recorder.recent_progress
 --      WHERE captured_at BETWEEN 'START_TIME' AND 'END_TIME';
 --      => Check: overlapping vacuum, COPY, or index builds
 --
---   6. Replication lag (if using sync replication):
+--   5. Replication lag (if using sync replication):
 --      SELECT * FROM flight_recorder.recent_replication
 --      WHERE captured_at BETWEEN 'START_TIME' AND 'END_TIME';
 --      => Check: replay_lag_bytes, write_lag/flush_lag intervals
@@ -369,53 +339,6 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
-
--- -----------------------------------------------------------------------------
--- Table: tracked_tables - Tables to monitor for batch operations
--- Regular table (not UNLOGGED) - small config data worth preserving
--- -----------------------------------------------------------------------------
-
-CREATE TABLE IF NOT EXISTS flight_recorder.tracked_tables (
-    relid           OID PRIMARY KEY,
-    schemaname      TEXT NOT NULL DEFAULT 'public',
-    relname         TEXT NOT NULL,
-    added_at        TIMESTAMPTZ DEFAULT now()
-);
-
--- -----------------------------------------------------------------------------
--- Table: table_snapshots - Per-table stats captured with each snapshot
--- UNLOGGED: Minimizes WAL overhead. Data lost on crash but acceptable for telemetry.
--- -----------------------------------------------------------------------------
-
-CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.table_snapshots (
-    snapshot_id             INTEGER REFERENCES flight_recorder.snapshots(id) ON DELETE CASCADE,
-    relid                   OID,
-    schemaname              TEXT,
-    relname                 TEXT,
-    -- Size
-    pg_relation_size        BIGINT,
-    pg_total_relation_size  BIGINT,
-    pg_indexes_size         BIGINT,
-    -- Tuple counts (point-in-time)
-    n_live_tup              BIGINT,
-    n_dead_tup              BIGINT,
-    -- Cumulative DML counters
-    n_tup_ins               BIGINT,
-    n_tup_upd               BIGINT,
-    n_tup_del               BIGINT,
-    n_tup_hot_upd           BIGINT,
-    -- Vacuum/analyze timestamps
-    last_vacuum             TIMESTAMPTZ,
-    last_autovacuum         TIMESTAMPTZ,
-    last_analyze            TIMESTAMPTZ,
-    last_autoanalyze        TIMESTAMPTZ,
-    -- Vacuum/analyze counts (cumulative)
-    vacuum_count            BIGINT,
-    autovacuum_count        BIGINT,
-    analyze_count           BIGINT,
-    autoanalyze_count       BIGINT,
-    PRIMARY KEY (snapshot_id, relid)
-);
 
 -- -----------------------------------------------------------------------------
 -- Table: replication_snapshots - Per-replica stats captured with each snapshot
@@ -1117,7 +1040,6 @@ DECLARE
     v_section_timeout INTEGER;
     v_lock_timeout INTEGER;
     v_circuit_breaker_enabled BOOLEAN;
-    v_tracked_count INTEGER;
     v_schema_size_mb NUMERIC;
 BEGIN
     -- Check 1: section_timeout_ms should be <= 500ms for production safety
@@ -1157,19 +1079,7 @@ BEGIN
         format('Current: %s ms. Recommended: <= 100ms to fail fast on catalog lock contention',
                v_lock_timeout);
 
-    -- Check 4: Tracked table count
-    SELECT count(*) INTO v_tracked_count FROM flight_recorder.tracked_tables;
-    RETURN QUERY SELECT
-        'tracked_tables'::text,
-        CASE
-            WHEN v_tracked_count > 50 THEN 'CRITICAL'
-            WHEN v_tracked_count > 20 THEN 'WARNING'
-            ELSE 'OK'
-        END::text,
-        format('Tracking %s tables. Each adds 3 size queries + catalog lock every 5 minutes. Recommend: <= 20 tables',
-               v_tracked_count);
-
-    -- Check 5: Schema size
+    -- Check 4: Schema size
     SELECT schema_size_mb INTO v_schema_size_mb
     FROM flight_recorder._check_schema_size();
 
@@ -1183,7 +1093,7 @@ BEGIN
         format('flight_recorder schema: %s MB (warning: 5000 MB, critical: 10000 MB, auto-disable at critical)',
                round(v_schema_size_mb, 0));
 
-    -- Check 6: Cost-based skip thresholds
+    -- Check 5: Cost-based skip thresholds
     RETURN QUERY SELECT
         'skip_thresholds'::text,
         CASE
@@ -1196,7 +1106,7 @@ BEGIN
                flight_recorder._get_config('skip_activity_conn_threshold'),
                flight_recorder._get_config('skip_locks_threshold'));
 
-    -- Check 7: Recent collection failures
+    -- Check 6: Recent collection failures
     DECLARE
         v_recent_failures INTEGER;
     BEGIN
@@ -1216,7 +1126,7 @@ BEGIN
                    v_recent_failures);
     END;
 
-    -- Check 8: Recent lock timeout errors
+    -- Check 7: Recent lock timeout errors
     DECLARE
         v_lock_timeouts INTEGER;
     BEGIN
@@ -1232,7 +1142,7 @@ BEGIN
                 WHEN v_lock_timeouts > 2 THEN 'WARNING'
                 ELSE 'OK'
             END::text,
-            format('%s lock timeout errors in last hour. Consider reducing lock_timeout_ms or disabling tracked tables',
+            format('%s lock timeout errors in last hour. Consider increasing lock_timeout_ms if DDL is frequent',
                    v_lock_timeouts);
     END;
 END;
@@ -1491,60 +1401,6 @@ BEGIN
         'OK'::TEXT,
         'None'::TEXT;
 END;
-$$;
-
--- -----------------------------------------------------------------------------
--- Table tracking functions
--- -----------------------------------------------------------------------------
-
--- WARNING: Each tracked table adds ~10-50ms overhead per snapshot (every 5 min)
--- Due to pg_relation_size(), pg_total_relation_size(), pg_indexes_size() calls
--- Recommend tracking max 5-20 critical tables
-CREATE OR REPLACE FUNCTION flight_recorder.track_table(p_table TEXT, p_schema TEXT DEFAULT 'public')
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_relid OID;
-BEGIN
-    SELECT c.oid INTO v_relid
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relname = p_table AND n.nspname = p_schema AND c.relkind = 'r';
-
-    IF v_relid IS NULL THEN
-        RAISE EXCEPTION 'Table %.% not found', p_schema, p_table;
-    END IF;
-
-    INSERT INTO flight_recorder.tracked_tables (relid, schemaname, relname)
-    VALUES (v_relid, p_schema, p_table)
-    ON CONFLICT (relid) DO NOTHING;
-
-    RAISE NOTICE 'pg-flight-recorder: Tracking table %.%. This adds overhead: pg_relation_size() + pg_total_relation_size() + pg_indexes_size() every 5 minutes. Tracked table count: %',
-        p_schema, p_table, (SELECT count(*) FROM flight_recorder.tracked_tables);
-
-    RETURN format('Now tracking %I.%I', p_schema, p_table);
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION flight_recorder.untrack_table(p_table TEXT, p_schema TEXT DEFAULT 'public')
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-BEGIN
-    DELETE FROM flight_recorder.tracked_tables
-    WHERE relname = p_table AND schemaname = p_schema;
-
-    IF NOT FOUND THEN
-        RETURN format('Table %I.%I was not being tracked', p_schema, p_table);
-    END IF;
-
-    RETURN format('Stopped tracking %I.%I', p_schema, p_table);
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION flight_recorder.list_tracked_tables()
-RETURNS TABLE(schemaname TEXT, relname TEXT, added_at TIMESTAMPTZ)
-LANGUAGE sql STABLE AS $$
-    SELECT schemaname, relname, added_at FROM flight_recorder.tracked_tables ORDER BY added_at;
 $$;
 
 -- -----------------------------------------------------------------------------
@@ -2181,8 +2037,8 @@ BEGIN
     -- P1 Safety: Check schema size (runs every 5 minutes, auto-disables if critical)
     PERFORM flight_recorder._check_schema_size();
 
-    -- P0 Safety: Record collection start for circuit breaker (5 sections: system stats, snapshot INSERT, tracked tables, replication, statements)
-    v_stat_id := flight_recorder._record_collection_start('snapshot', 5);
+    -- P0 Safety: Record collection start for circuit breaker (4 sections: system stats, snapshot INSERT, replication, statements)
+    v_stat_id := flight_recorder._record_collection_start('snapshot', 4);
 
     -- P0 Safety: Set lock timeout and work_mem
     PERFORM set_config('lock_timeout',
@@ -2366,48 +2222,7 @@ BEGIN
     -- Main snapshot INSERT completed successfully
     PERFORM flight_recorder._record_section_success(v_stat_id);
 
-    -- Section 3: Capture stats for tracked tables
-    BEGIN
-        PERFORM flight_recorder._set_section_timeout();
-        INSERT INTO flight_recorder.table_snapshots (
-            snapshot_id, relid, schemaname, relname,
-            pg_relation_size, pg_total_relation_size, pg_indexes_size,
-            n_live_tup, n_dead_tup,
-            n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
-            last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
-            vacuum_count, autovacuum_count, analyze_count, autoanalyze_count
-        )
-        SELECT
-            v_snapshot_id,
-            t.relid,
-            t.schemaname,
-            t.relname,
-            pg_relation_size(t.relid),
-            pg_total_relation_size(t.relid),
-            pg_indexes_size(t.relid),
-            s.n_live_tup,
-            s.n_dead_tup,
-            s.n_tup_ins,
-            s.n_tup_upd,
-            s.n_tup_del,
-            s.n_tup_hot_upd,
-            s.last_vacuum,
-            s.last_autovacuum,
-            s.last_analyze,
-            s.last_autoanalyze,
-            s.vacuum_count,
-            s.autovacuum_count,
-            s.analyze_count,
-            s.autoanalyze_count
-        FROM flight_recorder.tracked_tables t
-        JOIN pg_stat_user_tables s ON s.relid = t.relid;
-
-        PERFORM flight_recorder._record_section_success(v_stat_id);
-    EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'pg-flight-recorder: Tracked tables collection failed: %', SQLERRM;
-    END;
-
-    -- Section 4: Capture replication stats
+    -- Section 3: Capture replication stats
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         INSERT INTO flight_recorder.replication_snapshots (
@@ -2436,7 +2251,7 @@ BEGIN
         RAISE WARNING 'pg-flight-recorder: Replication stats collection failed: %', SQLERRM;
     END;
 
-    -- Section 5: Capture pg_stat_statements (if available and enabled)
+    -- Section 4: Capture pg_stat_statements (if available and enabled)
     IF flight_recorder._has_pg_stat_statements()
        AND flight_recorder._get_config('statements_enabled', 'auto') != 'false'
     THEN
@@ -2713,54 +2528,6 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- -----------------------------------------------------------------------------
--- flight_recorder.table_deltas - View showing deltas for tracked tables
--- -----------------------------------------------------------------------------
-
-CREATE OR REPLACE VIEW flight_recorder.table_deltas AS
-SELECT
-    ts.snapshot_id,
-    s.captured_at,
-    ts.schemaname,
-    ts.relname,
-    EXTRACT(EPOCH FROM (s.captured_at - prev_s.captured_at))::numeric AS interval_seconds,
-
-    -- Size changes
-    ts.pg_relation_size - prev_ts.pg_relation_size AS size_delta_bytes,
-    flight_recorder._pretty_bytes(ts.pg_relation_size - prev_ts.pg_relation_size) AS size_delta_pretty,
-    ts.pg_total_relation_size - prev_ts.pg_total_relation_size AS total_size_delta_bytes,
-
-    -- Tuple counts (point-in-time)
-    ts.n_live_tup,
-    ts.n_dead_tup,
-    ts.n_dead_tup::float / NULLIF(ts.n_live_tup, 0) AS dead_tuple_ratio,
-
-    -- DML deltas
-    ts.n_tup_ins - prev_ts.n_tup_ins AS inserts_delta,
-    ts.n_tup_upd - prev_ts.n_tup_upd AS updates_delta,
-    ts.n_tup_del - prev_ts.n_tup_del AS deletes_delta,
-    ts.n_tup_hot_upd - prev_ts.n_tup_hot_upd AS hot_updates_delta,
-
-    -- Vacuum/analyze activity
-    (ts.last_autovacuum IS DISTINCT FROM prev_ts.last_autovacuum) AS autovacuum_ran,
-    (ts.last_autoanalyze IS DISTINCT FROM prev_ts.last_autoanalyze) AS autoanalyze_ran,
-    ts.autovacuum_count - prev_ts.autovacuum_count AS autovacuum_count_delta,
-    ts.autoanalyze_count - prev_ts.autoanalyze_count AS autoanalyze_count_delta,
-    ts.last_autovacuum,
-    ts.last_autoanalyze
-
-FROM flight_recorder.table_snapshots ts
-JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
-JOIN flight_recorder.table_snapshots prev_ts ON (
-    prev_ts.relid = ts.relid AND
-    prev_ts.snapshot_id = (
-        SELECT MAX(snapshot_id) FROM flight_recorder.table_snapshots
-        WHERE relid = ts.relid AND snapshot_id < ts.snapshot_id
-    )
-)
-JOIN flight_recorder.snapshots prev_s ON prev_s.id = prev_ts.snapshot_id
-ORDER BY s.captured_at DESC, ts.relname;
-
--- -----------------------------------------------------------------------------
 -- flight_recorder.recent_waits - View of wait events from last 2 hours
 -- -----------------------------------------------------------------------------
 
@@ -2918,92 +2685,6 @@ LANGUAGE sql STABLE AS $$
     WHERE w.state NOT IN ('idle', 'idle in transaction')
     GROUP BY w.backend_type, w.wait_event_type, w.wait_event, t.cnt
     ORDER BY total_waiters DESC, sample_count DESC;
-$$;
-
--- -----------------------------------------------------------------------------
--- flight_recorder.table_compare() - Compare table stats between two time points
--- -----------------------------------------------------------------------------
-
-CREATE OR REPLACE FUNCTION flight_recorder.table_compare(
-    p_table TEXT,
-    p_start_time TIMESTAMPTZ,
-    p_end_time TIMESTAMPTZ,
-    p_schema TEXT DEFAULT 'public'
-)
-RETURNS TABLE(
-    table_name              TEXT,
-    start_snapshot_at       TIMESTAMPTZ,
-    end_snapshot_at         TIMESTAMPTZ,
-    elapsed_seconds         NUMERIC,
-
-    size_start              TEXT,
-    size_end                TEXT,
-    size_delta              TEXT,
-    total_size_delta        TEXT,
-
-    n_live_tup_start        BIGINT,
-    n_live_tup_end          BIGINT,
-    n_dead_tup_end          BIGINT,
-    dead_tuple_ratio        NUMERIC,
-
-    inserts_delta           BIGINT,
-    updates_delta           BIGINT,
-    deletes_delta           BIGINT,
-    hot_updates_delta       BIGINT,
-
-    autovacuum_ran          BOOLEAN,
-    autoanalyze_ran         BOOLEAN,
-    autovacuum_count_delta  BIGINT,
-    autoanalyze_count_delta BIGINT
-)
-LANGUAGE sql STABLE AS $$
-    WITH
-    start_snap AS (
-        SELECT ts.*, s.captured_at
-        FROM flight_recorder.table_snapshots ts
-        JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
-        WHERE ts.schemaname = p_schema
-          AND ts.relname = p_table
-          AND s.captured_at <= p_start_time
-        ORDER BY s.captured_at DESC
-        LIMIT 1
-    ),
-    end_snap AS (
-        SELECT ts.*, s.captured_at
-        FROM flight_recorder.table_snapshots ts
-        JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
-        WHERE ts.schemaname = p_schema
-          AND ts.relname = p_table
-          AND s.captured_at >= p_end_time
-        ORDER BY s.captured_at ASC
-        LIMIT 1
-    )
-    SELECT
-        p_schema || '.' || p_table,
-        s.captured_at,
-        e.captured_at,
-        EXTRACT(EPOCH FROM (e.captured_at - s.captured_at))::numeric,
-
-        flight_recorder._pretty_bytes(s.pg_relation_size),
-        flight_recorder._pretty_bytes(e.pg_relation_size),
-        flight_recorder._pretty_bytes(e.pg_relation_size - s.pg_relation_size),
-        flight_recorder._pretty_bytes(e.pg_total_relation_size - s.pg_total_relation_size),
-
-        s.n_live_tup,
-        e.n_live_tup,
-        e.n_dead_tup,
-        round(e.n_dead_tup::numeric / NULLIF(e.n_live_tup, 0), 4),
-
-        e.n_tup_ins - s.n_tup_ins,
-        e.n_tup_upd - s.n_tup_upd,
-        e.n_tup_del - s.n_tup_del,
-        e.n_tup_hot_upd - s.n_tup_hot_upd,
-
-        (s.last_autovacuum IS DISTINCT FROM e.last_autovacuum),
-        (s.last_autoanalyze IS DISTINCT FROM e.last_autoanalyze),
-        e.autovacuum_count - s.autovacuum_count,
-        e.autoanalyze_count - s.autoanalyze_count
-    FROM start_snap s, end_snap e
 $$;
 
 -- -----------------------------------------------------------------------------
@@ -3732,7 +3413,7 @@ BEGIN
     )
     SELECT count(*) INTO v_deleted_samples FROM deleted;
 
-    -- Delete old snapshots (cascades to table_snapshots, replication_snapshots)
+    -- Delete old snapshots (cascades to replication_snapshots, statement_snapshots)
     WITH deleted AS (
         DELETE FROM flight_recorder.snapshots WHERE captured_at < v_snapshots_cutoff RETURNING 1
     )
@@ -5502,28 +5183,20 @@ BEGIN
     RAISE NOTICE '  - Samples: % (wait events, activity, progress, locks)', COALESCE(v_sample_schedule, 'not scheduled');
     RAISE NOTICE '  - Cleanup: daily at 3 AM (retains 7 days)';
     RAISE NOTICE '';
-    RAISE NOTICE 'Quick start for batch monitoring:';
-    RAISE NOTICE '  1. Track your target table:';
-    RAISE NOTICE '     SELECT flight_recorder.track_table(''my_table'');';
+    RAISE NOTICE 'Quick start:';
+    RAISE NOTICE '  1. Flight Recorder collects automatically in the background';
     RAISE NOTICE '';
-    RAISE NOTICE '  2. Run your batch job, then analyze:';
+    RAISE NOTICE '  2. Query any time window to diagnose performance:';
     RAISE NOTICE '     SELECT * FROM flight_recorder.compare(''2024-12-16 14:00'', ''2024-12-16 15:00'');';
-    RAISE NOTICE '     SELECT * FROM flight_recorder.table_compare(''my_table'', ''2024-12-16 14:00'', ''2024-12-16 15:00'');';
     RAISE NOTICE '     SELECT * FROM flight_recorder.wait_summary(''2024-12-16 14:00'', ''2024-12-16 15:00'');';
     RAISE NOTICE '';
     RAISE NOTICE 'Views for recent activity:';
     RAISE NOTICE '  - flight_recorder.deltas            (snapshot deltas incl. temp files)';
-    RAISE NOTICE '  - flight_recorder.table_deltas      (tracked table deltas)';
     RAISE NOTICE '  - flight_recorder.recent_waits      (wait events, last 2 hours)';
     RAISE NOTICE '  - flight_recorder.recent_activity   (active sessions, last 2 hours)';
     RAISE NOTICE '  - flight_recorder.recent_locks      (lock contention, last 2 hours)';
     RAISE NOTICE '  - flight_recorder.recent_progress   (vacuum/copy/analyze progress, last 2 hours)';
     RAISE NOTICE '  - flight_recorder.recent_replication (replication lag, last 2 hours)';
-    RAISE NOTICE '';
-    RAISE NOTICE 'Table management:';
-    RAISE NOTICE '  - flight_recorder.track_table(name, schema)';
-    RAISE NOTICE '  - flight_recorder.untrack_table(name, schema)';
-    RAISE NOTICE '  - flight_recorder.list_tracked_tables()';
     RAISE NOTICE '';
 EXCEPTION
     WHEN undefined_table THEN
