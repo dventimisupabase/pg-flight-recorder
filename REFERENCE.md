@@ -490,7 +490,7 @@ Every collection acquires AccessShareLock on system catalogs. This is generally 
 | `pg_stat_replication`  | pg_stat_replication  | snapshot()          | Every 5min |
 | `pg_locks`             | pg_locks             | sample()            | Every 60s  |
 | `pg_stat_statements`   | pg_stat_statements   | snapshot()          | Every 5min |
-| `pg_relation_size()`   | Target relation      | snapshot()          | Every 5min |
+| `::regclass` casts     | pg_class             | sample()            | Intermittent (only during progress/lock collection) |
 
 ### Lock Timeout Behavior
 
