@@ -641,7 +641,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 
--- Default configuration (A-GRADE SAFETY DEFAULTS)
+-- Default configuration
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
     ('statements_enabled', 'auto'),
@@ -655,13 +655,13 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('circuit_breaker_window_minutes', '15'),  -- Look back window for moving average
     -- P0: Statement and lock timeouts (applied in collection functions)
     ('statement_timeout_ms', '2000'),          -- Max total collection time (REDUCED from 5000ms)
-    ('lock_timeout_ms', '500'),                -- Max wait for catalog locks (REDUCED from 1000ms)
+    ('lock_timeout_ms', '100'),                -- Max wait for catalog locks (fail fast on contention)
     ('work_mem_kb', '2048'),                   -- work_mem limit for flight recorder queries (2MB)
     -- Per-section sub-timeouts (prevent one section consuming entire budget)
-    ('section_timeout_ms', '1000'),            -- Max time per section (reset before each section)
-    -- P0: Cost-based skip thresholds (NEW - proactive checks before expensive queries)
-    ('skip_locks_threshold', '200'),           -- Skip lock collection if > N blocked locks
-    ('skip_activity_conn_threshold', '400'),   -- Skip activity if > N active connections
+    ('section_timeout_ms', '250'),             -- Max time per section (reset before each section)
+    -- P0: Cost-based skip thresholds (proactive checks before expensive queries)
+    ('skip_locks_threshold', '50'),            -- Skip lock collection if > N blocked locks
+    ('skip_activity_conn_threshold', '100'),   -- Skip activity if > N active connections
     -- P1: Schema size monitoring
     ('schema_size_warning_mb', '5000'),        -- Warn when schema exceeds 5GB
     ('schema_size_critical_mb', '10000'),      -- Auto-disable when schema exceeds 10GB
@@ -730,8 +730,8 @@ BEGIN
 
     -- Get threshold
     v_threshold_ms := COALESCE(
-        flight_recorder._get_config('circuit_breaker_threshold_ms', '5000')::integer,
-        5000
+        flight_recorder._get_config('circuit_breaker_threshold_ms', '1000')::integer,
+        1000
     );
 
     -- Get look back window
@@ -850,8 +850,8 @@ DECLARE
     v_timeout_ms INTEGER;
 BEGIN
     v_timeout_ms := COALESCE(
-        flight_recorder._get_config('section_timeout_ms', '400')::integer,
-        400
+        flight_recorder._get_config('section_timeout_ms', '250')::integer,
+        250
     );
     PERFORM set_config('statement_timeout', v_timeout_ms::text, true);
 END;
@@ -894,8 +894,8 @@ BEGIN
     -- Get current mode and thresholds
     v_current_mode := flight_recorder._get_config('mode', 'normal');
     v_connections_threshold := COALESCE(
-        flight_recorder._get_config('auto_mode_connections_threshold', '80')::integer,
-        80
+        flight_recorder._get_config('auto_mode_connections_threshold', '60')::integer,
+        60
     );
     v_trips_threshold := COALESCE(
         flight_recorder._get_config('auto_mode_trips_threshold', '3')::integer,
@@ -964,6 +964,142 @@ BEGIN
 
     -- No action taken
     RETURN;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- validate_config() - Validate configuration for production safety
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.validate_config()
+RETURNS TABLE(
+    check_name TEXT,
+    status TEXT,
+    message TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_section_timeout INTEGER;
+    v_lock_timeout INTEGER;
+    v_circuit_breaker_enabled BOOLEAN;
+    v_tracked_count INTEGER;
+    v_schema_size_mb NUMERIC;
+BEGIN
+    -- Check 1: section_timeout_ms should be <= 500ms for production safety
+    v_section_timeout := flight_recorder._get_config('section_timeout_ms', '250')::integer;
+    RETURN QUERY SELECT
+        'section_timeout_ms'::text,
+        CASE
+            WHEN v_section_timeout > 1000 THEN 'CRITICAL'
+            WHEN v_section_timeout > 500 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('Current: %s ms. Recommended: <= 250ms for minimal overhead. Worst-case CPU: %s%% (4 sections × %sms / 60s)',
+               v_section_timeout,
+               round((v_section_timeout * 4.0 / 60000.0) * 100, 1),
+               v_section_timeout);
+
+    -- Check 2: circuit_breaker should be enabled
+    v_circuit_breaker_enabled := COALESCE(
+        flight_recorder._get_config('circuit_breaker_enabled', 'true')::boolean,
+        true
+    );
+    RETURN QUERY SELECT
+        'circuit_breaker_enabled'::text,
+        CASE WHEN v_circuit_breaker_enabled THEN 'OK' ELSE 'CRITICAL' END::text,
+        format('Current: %s. Circuit breaker provides automatic protection under load',
+               v_circuit_breaker_enabled);
+
+    -- Check 3: lock_timeout should be low (< 500ms)
+    v_lock_timeout := flight_recorder._get_config('lock_timeout_ms', '100')::integer;
+    RETURN QUERY SELECT
+        'lock_timeout_ms'::text,
+        CASE
+            WHEN v_lock_timeout > 500 THEN 'WARNING'
+            WHEN v_lock_timeout > 1000 THEN 'CRITICAL'
+            ELSE 'OK'
+        END::text,
+        format('Current: %s ms. Recommended: <= 100ms to fail fast on catalog lock contention',
+               v_lock_timeout);
+
+    -- Check 4: Tracked table count
+    SELECT count(*) INTO v_tracked_count FROM flight_recorder.tracked_tables;
+    RETURN QUERY SELECT
+        'tracked_tables'::text,
+        CASE
+            WHEN v_tracked_count > 50 THEN 'CRITICAL'
+            WHEN v_tracked_count > 20 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('Tracking %s tables. Each adds 3 size queries + catalog lock every 5 minutes. Recommend: <= 20 tables',
+               v_tracked_count);
+
+    -- Check 5: Schema size
+    SELECT schema_size_mb INTO v_schema_size_mb
+    FROM flight_recorder._check_schema_size();
+
+    RETURN QUERY SELECT
+        'schema_size'::text,
+        CASE
+            WHEN v_schema_size_mb > 10000 THEN 'CRITICAL'
+            WHEN v_schema_size_mb > 5000 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('flight_recorder schema: %s MB (warning: 5000 MB, critical: 10000 MB, auto-disable at critical)',
+               round(v_schema_size_mb, 0));
+
+    -- Check 6: Cost-based skip thresholds
+    RETURN QUERY SELECT
+        'skip_thresholds'::text,
+        CASE
+            WHEN flight_recorder._get_config('skip_activity_conn_threshold')::integer > 200
+                OR flight_recorder._get_config('skip_locks_threshold')::integer > 100
+            THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('Activity threshold: %s, Locks threshold: %s. Recommended: 100/50 for early protection',
+               flight_recorder._get_config('skip_activity_conn_threshold'),
+               flight_recorder._get_config('skip_locks_threshold'));
+
+    -- Check 7: Recent collection failures
+    DECLARE
+        v_recent_failures INTEGER;
+    BEGIN
+        SELECT count(*) INTO v_recent_failures
+        FROM flight_recorder.collection_stats
+        WHERE success = false
+          AND started_at > now() - interval '1 hour';
+
+        RETURN QUERY SELECT
+            'recent_failures'::text,
+            CASE
+                WHEN v_recent_failures > 10 THEN 'CRITICAL'
+                WHEN v_recent_failures > 3 THEN 'WARNING'
+                ELSE 'OK'
+            END::text,
+            format('%s collection failures in last hour. Check collection_stats for error_message details',
+                   v_recent_failures);
+    END;
+
+    -- Check 8: Recent lock timeout errors
+    DECLARE
+        v_lock_timeouts INTEGER;
+    BEGIN
+        SELECT count(*) INTO v_lock_timeouts
+        FROM flight_recorder.collection_stats
+        WHERE error_message LIKE '%lock_timeout%'
+          AND started_at > now() - interval '1 hour';
+
+        RETURN QUERY SELECT
+            'lock_timeout_errors'::text,
+            CASE
+                WHEN v_lock_timeouts > 5 THEN 'CRITICAL'
+                WHEN v_lock_timeouts > 2 THEN 'WARNING'
+                ELSE 'OK'
+            END::text,
+            format('%s lock timeout errors in last hour. Consider reducing lock_timeout_ms or disabling tracked tables',
+                   v_lock_timeouts);
+    END;
 END;
 $$;
 
@@ -1158,6 +1294,9 @@ BEGIN
     INSERT INTO flight_recorder.tracked_tables (relid, schemaname, relname)
     VALUES (v_relid, p_schema, p_table)
     ON CONFLICT (relid) DO NOTHING;
+
+    RAISE NOTICE 'pg-flight-recorder: Tracking table %.%. This adds overhead: pg_relation_size() + pg_total_relation_size() + pg_indexes_size() every 5 minutes. Tracked table count: %',
+        p_schema, p_table, (SELECT count(*) FROM flight_recorder.tracked_tables);
 
     RETURN format('Now tracking %I.%I', p_schema, p_table);
 END;
