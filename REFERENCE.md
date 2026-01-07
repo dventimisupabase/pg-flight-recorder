@@ -76,15 +76,21 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ## Collection Modes
 
-| Mode        | Sample Interval | Locks | Progress | Use Case        |
-|-------------|-----------------|-------|----------|-----------------|
-| `normal`    | 30 seconds      | Yes   | Yes      | Default         |
-| `light`     | 60 seconds      | Yes   | No       | Moderate load   |
-| `emergency` | 120 seconds     | No    | No       | System stressed |
+Modes control **what** is collected, not **how often**. Sample interval is configured separately via `sample_interval_seconds` (default: 120s).
+
+| Mode        | Locks | Progress | Interval Behavior | Use Case        |
+|-------------|-------|----------|-------------------|-----------------|
+| `normal`    | Yes   | Yes      | Uses configured interval | Default (4 sections) |
+| `light`     | Yes   | No       | Uses configured interval | Moderate load (3 sections) |
+| `emergency` | No    | No       | Forces min 120s | System stressed (2 sections) |
 
 ```sql
 SELECT flight_recorder.set_mode('light');
 SELECT * FROM flight_recorder.get_mode();
+
+-- Sample interval is independent of mode
+UPDATE flight_recorder.config SET value = '180' WHERE key = 'sample_interval_seconds';
+SELECT flight_recorder.enable();  -- Reschedule with new interval
 ```
 
 ## Anomaly Detection
