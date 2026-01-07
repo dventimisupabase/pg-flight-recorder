@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(131);  -- Total number of tests (73 + 15 P0 + 8 P1 + 12 P2 + 9 P3 + 10 P4 = 127 + 4 FK tests)
+SELECT plan(118);  -- Total number of tests (removed 13 per-table tracking tests)
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
