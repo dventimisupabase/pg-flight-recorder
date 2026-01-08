@@ -32,14 +32,20 @@ SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:
 ## Emergency Controls
 
 ```sql
-SELECT flight_recorder.set_mode('emergency');  -- Reduce overhead
+SELECT flight_recorder.set_mode('light');      -- Sample every 2 min (50% less overhead)
+SELECT flight_recorder.set_mode('emergency');  -- Sample every 5 min (80% less overhead)
 SELECT flight_recorder.disable();              -- Stop completely
 SELECT flight_recorder.enable();               -- Resume
 ```
 
+Modes automatically adjust sampling frequency:
+- **Normal**: 60-second intervals (2-hour retention)
+- **Light**: 120-second intervals (4-hour retention, 50% reduction)
+- **Emergency**: 300-second intervals (10-hour retention, 80% reduction)
+
 ## Is It Safe?
 
-**Yes.** Uses less than 0.1% of your CPU. Safe to run 24/7.
+**Yes.** Uses less than 0.1% of your CPU in normal mode, <0.05% in emergency mode. Safe to run 24/7.
 
 Built-in safety controls automatically protect your database. If things get busy, it backs off automatically.
 

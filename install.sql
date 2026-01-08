@@ -17,11 +17,12 @@
 --
 -- THREE-TIER ARCHITECTURE
 -- -----------------------
---   TIER 1: Ring Buffers (every 60 sec, 2-hour rolling window, UNLOGGED)
+--   TIER 1: Ring Buffers (adaptive frequency, 2-10 hour retention, UNLOGGED)
 --      - Wait events: aggregated by backend_type, wait_event_type, wait_event
 --      - Active sessions: top 25 non-idle sessions with query preview
 --      - Lock contention: blocked/blocking PIDs with queries
---      - Low overhead (<0.1% CPU): HOT updates, aggressive autovacuum
+--      - Adaptive intervals: normal=60s/2h, light=120s/4h, emergency=300s/10h
+--      - Low overhead (<0.1% CPU normal, <0.05% emergency): HOT updates, zero WAL
 --
 --   TIER 2: Aggregates (flushed every 5 min from ring buffer, 7-day retention)
 --      - Wait event patterns summarized over 5-minute windows
@@ -45,9 +46,9 @@
 --   SELECT * FROM flight_recorder.compare('2024-12-16 14:00', '2024-12-16 15:00');
 --   SELECT * FROM flight_recorder.wait_summary('2024-12-16 14:00', '2024-12-16 15:00');
 --
---   -- 3. Or use the recent_* views for rolling 2-hour visibility
---   SELECT * FROM flight_recorder.recent_waits;
---   SELECT * FROM flight_recorder.recent_locks;
+--   -- 3. Or use the recent_* views for rolling visibility (2-10h based on mode)
+--   SELECT * FROM flight_recorder.recent_waits;         -- Up to 10h retention
+--   SELECT * FROM flight_recorder.recent_waits_current();  -- Current mode retention
 --   SELECT * FROM flight_recorder.recent_activity;
 --
 -- FUNCTIONS
@@ -264,7 +265,7 @@
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
 --   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes - snapshots, replication)
---   flight_recorder_sample    : 60 seconds    (fixed 60s - ring buffer requires consistent intervals)
+--   flight_recorder_sample    : adaptive      (60s normal, 120s light, 300s emergency)
 --   flight_recorder_flush     : */5 * * * *   (every 5 minutes - flush ring buffer to aggregates)
 --   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - cleans old aggregates and snapshots)
 --
@@ -419,17 +420,17 @@ CREATE INDEX IF NOT EXISTS statement_snapshots_queryid_idx
 -- Implements circular buffers using modular arithmetic
 -- Fixed memory footprint: 120 slots × ~1KB = ~120KB total
 -- Automatic overwrite via UPSERT - no manual cleanup needed
--- Retains last 2 hours at 60-second intervals
+-- Adaptive frequency: 60s intervals (normal/2h), 120s (light/4h), 300s (emergency/10h)
 -- -----------------------------------------------------------------------------
 
--- Ring buffer master table (120 slots = 2 hours at 60s intervals)
+-- Ring buffer master table (120 slots, variable retention based on mode)
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     slot_id             INTEGER PRIMARY KEY CHECK (slot_id >= 0 AND slot_id < 120),
     captured_at         TIMESTAMPTZ NOT NULL,
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
 
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, 60s intervals, 2 hours retention). Fill factor 70 enables HOT updates (UPSERT pattern updates non-indexed columns 1,440x/day).';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=60s/2h, light=120s/4h, emergency=300s/10h retention. Fill factor 70 enables HOT updates.';
 
 -- Wait events ring buffer (UPDATE-only pattern for zero dead tuples)
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
@@ -640,8 +641,8 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 -- Default configuration
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
-    -- Configurable sample interval (default 180s for 0.5% overhead)
-    ('sample_interval_seconds', '180'),        -- Sample collection frequency
+    -- Configurable sample interval (default 60s for normal mode, adjusts per mode)
+    ('sample_interval_seconds', '60'),         -- Sample collection frequency (60s=normal, 120s=light, 300s=emergency)
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
     ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
@@ -1544,7 +1545,8 @@ LANGUAGE plpgsql AS $$
 DECLARE
     v_captured_at TIMESTAMPTZ := now();
     v_epoch BIGINT := extract(epoch from v_captured_at)::bigint;
-    v_slot_id INTEGER := (v_epoch / 60) % 120;  -- Ring buffer slot calculation
+    v_slot_id INTEGER;  -- Ring buffer slot (calculated dynamically based on interval)
+    v_sample_interval_seconds INTEGER;
     v_enable_locks BOOLEAN;
     v_snapshot_based BOOLEAN;
     v_blocked_count INTEGER;
@@ -1552,6 +1554,24 @@ DECLARE
     v_stat_id INTEGER;
     v_should_skip BOOLEAN;
 BEGIN
+    -- P0 Safety: Calculate slot based on configured interval (adaptive frequency)
+    -- Read configured sample interval (default 60s)
+    v_sample_interval_seconds := COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
+    );
+
+    -- Validate bounds (60s minimum, 3600s maximum)
+    IF v_sample_interval_seconds < 60 THEN
+        v_sample_interval_seconds := 60;
+    ELSIF v_sample_interval_seconds > 3600 THEN
+        v_sample_interval_seconds := 3600;
+    END IF;
+
+    -- Calculate ring buffer slot: (epoch / interval) % 120
+    -- This provides variable retention: 60s=2h, 120s=4h, 300s=10h
+    v_slot_id := (v_epoch / v_sample_interval_seconds) % 120;
+
     -- P0 Safety: Collection jitter (A+ upgrade: prevent synchronized monitoring)
     DECLARE
         v_jitter_enabled BOOLEAN;
@@ -2752,7 +2772,9 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- -----------------------------------------------------------------------------
--- flight_recorder.recent_waits - View of wait events from last 2 hours
+-- flight_recorder.recent_waits - View of wait events from ring buffer
+-- Conservative 10-hour filter covers all modes (normal=2h, light=4h, emergency=10h)
+-- For current mode retention, use recent_waits_current() function
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW flight_recorder.recent_waits AS
@@ -2765,12 +2787,14 @@ SELECT
     w.count
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.wait_samples_ring w ON w.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '2 hours'
+WHERE sr.captured_at > now() - interval '10 hours'
   AND w.backend_type IS NOT NULL  -- Filter out NULL (unused) rows
 ORDER BY sr.captured_at DESC, w.count DESC;
 
 -- -----------------------------------------------------------------------------
--- flight_recorder.recent_activity - View of active sessions from last 2 hours
+-- flight_recorder.recent_activity - View of active sessions from ring buffer
+-- Conservative 10-hour filter covers all modes (normal=2h, light=4h, emergency=10h)
+-- For current mode retention, use recent_activity_current() function
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW flight_recorder.recent_activity AS
@@ -2788,12 +2812,14 @@ SELECT
     a.query_preview
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '2 hours'
+WHERE sr.captured_at > now() - interval '10 hours'
   AND a.pid IS NOT NULL  -- Filter out NULL (unused) rows
 ORDER BY sr.captured_at DESC, a.query_start ASC;
 
 -- -----------------------------------------------------------------------------
--- flight_recorder.recent_locks - View of lock contention from last 2 hours
+-- flight_recorder.recent_locks - View of lock contention from ring buffer
+-- Conservative 10-hour filter covers all modes (normal=2h, light=4h, emergency=10h)
+-- For current mode retention, use recent_locks_current() function
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW flight_recorder.recent_locks AS
@@ -2812,9 +2838,139 @@ SELECT
     l.blocking_query_preview
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.lock_samples_ring l ON l.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '2 hours'
+WHERE sr.captured_at > now() - interval '10 hours'
   AND l.blocked_pid IS NOT NULL  -- Filter out NULL (unused) rows
 ORDER BY sr.captured_at DESC, l.blocked_duration DESC;
+
+-- -----------------------------------------------------------------------------
+-- Dynamic retention functions (adaptive frequency control)
+-- These functions calculate actual retention based on current sampling interval
+-- Use these for precise filtering based on mode (normal=2h, light=4h, emergency=10h)
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.recent_waits_current()
+RETURNS TABLE (
+    captured_at TIMESTAMPTZ,
+    backend_type TEXT,
+    wait_event_type TEXT,
+    wait_event TEXT,
+    state TEXT,
+    count INTEGER
+) AS $$
+DECLARE
+    v_retention_interval INTERVAL;
+BEGIN
+    -- Calculate retention: 120 slots × interval
+    v_retention_interval := (120 * COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
+    ))::text || ' seconds';
+
+    RETURN QUERY
+    SELECT
+        sr.captured_at,
+        w.backend_type,
+        w.wait_event_type,
+        w.wait_event,
+        w.state,
+        w.count
+    FROM flight_recorder.samples_ring sr
+    JOIN flight_recorder.wait_samples_ring w ON w.slot_id = sr.slot_id
+    WHERE sr.captured_at > now() - v_retention_interval
+      AND w.backend_type IS NOT NULL
+    ORDER BY sr.captured_at DESC, w.count DESC;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION flight_recorder.recent_activity_current()
+RETURNS TABLE (
+    captured_at TIMESTAMPTZ,
+    pid INTEGER,
+    usename TEXT,
+    application_name TEXT,
+    backend_type TEXT,
+    state TEXT,
+    wait_event_type TEXT,
+    wait_event TEXT,
+    query_start TIMESTAMPTZ,
+    running_for INTERVAL,
+    query_preview TEXT
+) AS $$
+DECLARE
+    v_retention_interval INTERVAL;
+BEGIN
+    -- Calculate retention: 120 slots × interval
+    v_retention_interval := (120 * COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
+    ))::text || ' seconds';
+
+    RETURN QUERY
+    SELECT
+        sr.captured_at,
+        a.pid,
+        a.usename,
+        a.application_name,
+        a.backend_type,
+        a.state,
+        a.wait_event_type,
+        a.wait_event,
+        a.query_start,
+        sr.captured_at - a.query_start AS running_for,
+        a.query_preview
+    FROM flight_recorder.samples_ring sr
+    JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
+    WHERE sr.captured_at > now() - v_retention_interval
+      AND a.pid IS NOT NULL
+    ORDER BY sr.captured_at DESC, a.query_start ASC;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION flight_recorder.recent_locks_current()
+RETURNS TABLE (
+    captured_at TIMESTAMPTZ,
+    blocked_pid INTEGER,
+    blocked_user TEXT,
+    blocked_app TEXT,
+    blocked_duration INTERVAL,
+    blocking_pid INTEGER,
+    blocking_user TEXT,
+    blocking_app TEXT,
+    lock_type TEXT,
+    locked_relation TEXT,
+    blocked_query_preview TEXT,
+    blocking_query_preview TEXT
+) AS $$
+DECLARE
+    v_retention_interval INTERVAL;
+BEGIN
+    -- Calculate retention: 120 slots × interval
+    v_retention_interval := (120 * COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
+    ))::text || ' seconds';
+
+    RETURN QUERY
+    SELECT
+        sr.captured_at,
+        l.blocked_pid,
+        l.blocked_user,
+        l.blocked_app,
+        l.blocked_duration,
+        l.blocking_pid,
+        l.blocking_user,
+        l.blocking_app,
+        l.lock_type,
+        COALESCE(l.locked_relation_oid::regclass::text, 'OID:' || l.locked_relation_oid::text) AS locked_relation,
+        l.blocked_query_preview,
+        l.blocking_query_preview
+    FROM flight_recorder.samples_ring sr
+    JOIN flight_recorder.lock_samples_ring l ON l.slot_id = sr.slot_id
+    WHERE sr.captured_at > now() - v_retention_interval
+      AND l.blocked_pid IS NOT NULL
+    ORDER BY sr.captured_at DESC, l.blocked_duration DESC;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.recent_progress - REMOVED (not in ring buffer architecture)
@@ -3454,29 +3610,28 @@ BEGIN
 
     -- Get current sample interval from config
     v_current_interval := COALESCE(
-        flight_recorder._get_config('sample_interval_seconds', '120')::integer,
-        120
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
     );
 
     -- Set mode-specific configuration
-    -- Modes control WHAT is collected (locks, progress), not HOW OFTEN (interval)
+    -- Adaptive frequency: Each mode sets explicit interval (normal=60s, light=120s, emergency=300s)
     CASE p_mode
         WHEN 'normal' THEN
             v_enable_locks := TRUE;
             v_enable_progress := TRUE;
-            v_sample_interval_seconds := v_current_interval;  -- Respect current config
-            v_description := format('Normal mode: %ss sampling, all collectors enabled', v_sample_interval_seconds);
+            v_sample_interval_seconds := 60;  -- Normal mode: 60s intervals (2h retention)
+            v_description := 'Normal mode: 60s sampling, all collectors enabled (2h retention)';
         WHEN 'light' THEN
             v_enable_locks := TRUE;
             v_enable_progress := FALSE;
-            v_sample_interval_seconds := v_current_interval;  -- Respect current config
-            v_description := format('Light mode: %ss sampling, progress tracking disabled', v_sample_interval_seconds);
+            v_sample_interval_seconds := 120;  -- Light mode: 120s intervals (4h retention, 50% reduction)
+            v_description := 'Light mode: 120s sampling, progress disabled (4h retention, 50% less overhead)';
         WHEN 'emergency' THEN
             v_enable_locks := FALSE;
             v_enable_progress := FALSE;
-            -- Emergency mode forces minimum 120s interval
-            v_sample_interval_seconds := GREATEST(v_current_interval, 120);
-            v_description := format('Emergency mode: %ss sampling, locks and progress disabled', v_sample_interval_seconds);
+            v_sample_interval_seconds := 300;  -- Emergency mode: 300s intervals (10h retention, 80% reduction)
+            v_description := 'Emergency mode: 300s sampling, locks/progress disabled (10h retention, 80% less overhead)';
     END CASE;
 
     -- Update configuration
@@ -3492,12 +3647,10 @@ BEGIN
     VALUES ('enable_progress', v_enable_progress::text, now())
     ON CONFLICT (key) DO UPDATE SET value = v_enable_progress::text, updated_at = now();
 
-    -- If emergency mode and interval < 120s, update interval
-    IF p_mode = 'emergency' AND v_sample_interval_seconds > v_current_interval THEN
-        INSERT INTO flight_recorder.config (key, value, updated_at)
-        VALUES ('sample_interval_seconds', v_sample_interval_seconds::text, now())
-        ON CONFLICT (key) DO UPDATE SET value = v_sample_interval_seconds::text, updated_at = now();
-    END IF;
+    -- Update sample interval (adaptive frequency control)
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('sample_interval_seconds', v_sample_interval_seconds::text, now())
+    ON CONFLICT (key) DO UPDATE SET value = v_sample_interval_seconds::text, updated_at = now();
 
     -- Reschedule pg_cron job (if pg_cron available)
     BEGIN
@@ -3776,10 +3929,10 @@ BEGIN
     -- Get current mode
     v_mode := flight_recorder._get_config('mode', 'normal');
 
-    -- Get configurable sample interval (default 120s)
+    -- Get configurable sample interval (default 60s)
     v_sample_interval_seconds := COALESCE(
-        flight_recorder._get_config('sample_interval_seconds', '120')::integer,
-        120
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
     );
 
     BEGIN
@@ -3804,10 +3957,24 @@ BEGIN
         PERFORM cron.schedule('flight_recorder_snapshot', '*/5 * * * *', 'SELECT flight_recorder.snapshot()');
         v_scheduled := v_scheduled + 1;
 
-        -- Schedule sample (fixed 60 second interval for ring buffer)
-        -- Ring buffer architecture requires consistent 60s intervals for proper slot rotation
-        PERFORM cron.schedule('flight_recorder_sample', '* * * * *', 'SELECT flight_recorder.sample()');
-        v_sample_schedule := 'every 60 seconds (ring buffer)';
+        -- Schedule sample with configured interval (adaptive frequency control)
+        -- Generate cron expression based on configured interval
+        IF v_sample_interval_seconds <= 60 THEN
+            v_cron_expression := '* * * * *';  -- Every minute
+            v_sample_schedule := 'every 60 seconds';
+        ELSIF v_sample_interval_seconds % 60 = 0 THEN
+            -- Clean multiple of minutes
+            v_sample_interval_minutes := v_sample_interval_seconds / 60;
+            v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
+            v_sample_schedule := format('every %s seconds', v_sample_interval_seconds);
+        ELSE
+            -- Round up to nearest minute
+            v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
+            v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
+            v_sample_schedule := format('approximately every %s seconds', v_sample_interval_seconds);
+        END IF;
+
+        PERFORM cron.schedule('flight_recorder_sample', v_cron_expression, 'SELECT flight_recorder.sample()');
         v_scheduled := v_scheduled + 1;
 
         -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
