@@ -540,7 +540,238 @@ SELECT * FROM flight_recorder.health_check();
 SELECT * FROM flight_recorder.quarterly_review();
 ```
 
+## Configuration Profiles
+
+**Simplified Configuration:** Instead of managing 41+ individual parameters, use configuration profiles for common use cases.
+
+### Quick Start
+
+```sql
+-- See available profiles
+SELECT * FROM flight_recorder.list_profiles();
+
+-- Preview what a profile will change (without applying)
+SELECT * FROM flight_recorder.explain_profile('production_safe');
+
+-- Apply a profile
+SELECT * FROM flight_recorder.apply_profile('production_safe');
+
+-- Check which profile matches your current configuration
+SELECT * FROM flight_recorder.get_current_profile();
+```
+
+### Available Profiles
+
+#### `default` - Balanced Configuration
+**Use case:** General purpose monitoring for most environments
+
+**Key settings:**
+- Sample interval: 180s (every 3 minutes, 6h retention)
+- All safety features enabled (load shedding, throttling, circuit breaker)
+- Adaptive sampling enabled (skips when idle)
+- All collectors enabled (locks, progress, statements)
+- Overhead: ~0.013% CPU sustained
+
+**When to use:**
+- First-time installation (this is the default)
+- Staging and development environments
+- General production monitoring
+
+```sql
+SELECT flight_recorder.apply_profile('default');
+```
+
+#### `production_safe` - Ultra-Conservative for Production
+**Use case:** Production always-on monitoring with maximum safety margins
+
+**Key settings:**
+- Sample interval: 300s (every 5 minutes, 10h retention) - 40% less overhead
+- Aggressive load shedding (60% vs 70% connection threshold)
+- Stricter circuit breaker (800ms vs 1000ms)
+- Locks and progress disabled (reduces catalog contention)
+- Faster lock timeout (50ms vs 100ms)
+- Overhead: ~0.008% CPU sustained
+
+**When to use:**
+- Production databases with strict SLAs
+- Systems running near capacity
+- Risk-averse deployments
+
+```sql
+SELECT flight_recorder.apply_profile('production_safe');
+```
+
+#### `development` - Balanced for Staging/Dev
+**Use case:** Active development and testing environments
+
+**Key settings:**
+- Sample interval: 180s (every 3 minutes, 6h retention)
+- Adaptive sampling **disabled** (always collect, even when idle)
+- All collectors enabled
+- Shorter retention (7 days snapshots, 3 days aggregates)
+- Overhead: ~0.013% CPU sustained
+
+**When to use:**
+- Development databases
+- Staging environments
+- Testing and QA systems
+
+```sql
+SELECT flight_recorder.apply_profile('development');
+```
+
+#### `troubleshooting` - Aggressive Collection During Incidents
+**Use case:** Active incident response requiring detailed data
+
+**Key settings:**
+- Sample interval: 60s (every minute, 2h retention) - high frequency
+- Load shedding and throttling **disabled** (collect even under load)
+- All collectors enabled
+- More lenient circuit breaker (2000ms)
+- Collects top 50 queries (vs 20)
+- Overhead: ~0.04% CPU sustained
+
+**When to use:**
+- Active performance incidents
+- Debugging intermittent issues
+- Root cause analysis
+- **Temporary use only** - switch back after incident
+
+```sql
+-- Enable during incident
+SELECT flight_recorder.apply_profile('troubleshooting');
+
+-- Collect data for 10-15 minutes
+
+-- Switch back to normal
+SELECT flight_recorder.apply_profile('default');
+```
+
+#### `minimal_overhead` - Absolute Minimum Footprint
+**Use case:** Resource-constrained systems, replicas, or minimal monitoring needs
+
+**Key settings:**
+- Sample interval: 300s (every 5 minutes, 10h retention)
+- Very aggressive load shedding (50% connection threshold)
+- Higher idle threshold (10 vs 5 connections)
+- Strict circuit breaker (500ms)
+- Locks, progress, and statements **disabled**
+- Overhead: ~0.008% CPU sustained
+
+**When to use:**
+- Replicas (monitoring followers)
+- Resource-constrained systems (< 4 CPU cores, < 8GB RAM)
+- Cost-sensitive deployments
+- Systems where even minimal overhead is unacceptable
+
+```sql
+SELECT flight_recorder.apply_profile('minimal_overhead');
+```
+
+#### `high_ddl` - Optimized for Frequent Schema Changes
+**Use case:** Multi-tenant SaaS or systems with high DDL frequency
+
+**Key settings:**
+- Sample interval: 180s (every 3 minutes, 6h retention)
+- Snapshot-based collection (critical for DDL safety)
+- Lock timeout strategy: `skip_if_locked` (pre-checks for DDL locks)
+- Very fast lock timeout (50ms)
+- Pre-collection DDL lock checks enabled
+- All collectors enabled
+- Overhead: ~0.013% CPU sustained
+
+**When to use:**
+- Multi-tenant SaaS with per-tenant schemas
+- Systems with >10 DDL operations per hour
+- Migration-heavy workloads
+- Schema evolution during deployments
+
+```sql
+SELECT flight_recorder.apply_profile('high_ddl');
+```
+
+### Profile Comparison Table
+
+| Profile | Sample Interval | Overhead | Collectors | Safety | Retention |
+|---------|----------------|----------|------------|--------|-----------|
+| `default` | 180s | 0.013% | All | Balanced | 30d/7d |
+| `production_safe` | 300s | 0.008% | Wait/activity only | Aggressive | 30d/7d |
+| `development` | 180s | 0.013% | All | Balanced | 7d/3d |
+| `troubleshooting` | 60s | 0.04% | All + top 50 queries | Lenient | 7d/3d |
+| `minimal_overhead` | 300s | 0.008% | Wait/activity only | Very aggressive | 7d/3d |
+| `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d |
+
+### Advanced Usage
+
+**Check current configuration match:**
+```sql
+-- See which profile you're closest to
+SELECT * FROM flight_recorder.get_current_profile();
+
+-- Example output:
+-- closest_profile | match_percentage | differences | recommendation
+-- ----------------+------------------+-------------+----------------
+-- production_safe | 85.7             | {enable_locks, lock_timeout_ms} | Configuration is close to "production_safe" profile
+```
+
+**Preview changes before applying:**
+```sql
+-- See exactly what will change
+SELECT * FROM flight_recorder.explain_profile('production_safe')
+WHERE will_change = true
+ORDER BY setting_key;
+
+-- Example output:
+-- setting_key           | current_value | profile_value | will_change | description
+-- ----------------------+---------------+---------------+-------------+-------------
+-- enable_locks          | true          | false         | true        | Disable lock collection
+-- lock_timeout_ms       | 100           | 50            | true        | Faster lock timeout
+-- sample_interval_seconds| 180          | 300           | true        | Sample every 5 minutes
+```
+
+**Combine profiles with manual overrides:**
+```sql
+-- Apply profile as base
+SELECT flight_recorder.apply_profile('production_safe');
+
+-- Override specific settings
+UPDATE flight_recorder.config SET value = '450' WHERE key = 'sample_interval_seconds';
+UPDATE flight_recorder.config SET value = '14' WHERE key = 'retention_snapshots_days';
+
+-- Verify
+SELECT * FROM flight_recorder.get_current_profile();
+-- Shows: "Configuration is partially based on 'production_safe' profile"
+```
+
+### Recommended Workflow
+
+**Initial deployment:**
+1. Install with defaults: `psql -f install.sql`
+2. Optionally apply environment-specific profile
+3. Monitor for 24-48 hours
+4. Adjust if needed
+
+**Production rollout:**
+1. Test in staging with `development` profile
+2. Deploy to production with `production_safe` profile
+3. Monitor collection stats: `SELECT * FROM flight_recorder.health_check();`
+4. After 1 week, consider upgrading to `default` if overhead is acceptable
+
+**Incident response:**
+1. Switch to `troubleshooting` profile during active incident
+2. Collect detailed data for 10-15 minutes
+3. Switch back to previous profile after incident
+4. Analyze collected data at leisure
+
+**Cost optimization:**
+1. Start with `default` profile
+2. If overhead is concern, try `production_safe`
+3. If still too much, use `minimal_overhead`
+4. Monitor with `SELECT * FROM flight_recorder.performance_report('1 day');`
+
 ## Configuration
+
+**Advanced users:** Direct access to all configuration parameters.
 
 All settings in `flight_recorder.config`:
 

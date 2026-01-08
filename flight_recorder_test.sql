@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(125);  -- Ring buffer architecture: 124 assertions + finish()
+SELECT plan(140);  -- Ring buffer + Profiles: 139 assertions + finish()
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -720,6 +720,119 @@ SELECT has_function(
 SELECT ok(
     (SELECT count(*) FROM flight_recorder.config_recommendations()) >= 1,
     'P4: config_recommendations() should return at least one row'
+);
+
+-- =============================================================================
+-- 10. CONFIGURATION PROFILES (15 tests)
+-- =============================================================================
+
+-- Test profile functions exist
+SELECT has_function(
+    'flight_recorder', 'list_profiles',
+    'Profiles: Function list_profiles should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', 'explain_profile',
+    'Profiles: Function explain_profile should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', 'apply_profile',
+    'Profiles: Function apply_profile should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', 'get_current_profile',
+    'Profiles: Function get_current_profile should exist'
+);
+
+-- Test list_profiles returns expected profiles
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles()) = 6,
+    'Profiles: list_profiles should return 6 profiles'
+);
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'default') = 1,
+    'Profiles: default profile should exist'
+);
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'production_safe') = 1,
+    'Profiles: production_safe profile should exist'
+);
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'development') = 1,
+    'Profiles: development profile should exist'
+);
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'troubleshooting') = 1,
+    'Profiles: troubleshooting profile should exist'
+);
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'minimal_overhead') = 1,
+    'Profiles: minimal_overhead profile should exist'
+);
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'high_ddl') = 1,
+    'Profiles: high_ddl profile should exist'
+);
+
+-- Test explain_profile works for each profile
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.explain_profile('default')$$,
+    'Profiles: explain_profile(default) should execute'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.explain_profile('production_safe')$$,
+    'Profiles: explain_profile(production_safe) should execute'
+);
+
+-- Test explain_profile returns expected columns
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.explain_profile('default')) > 5,
+    'Profiles: explain_profile should return multiple settings'
+);
+
+-- Test apply_profile works
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.apply_profile('production_safe')$$,
+    'Profiles: apply_profile(production_safe) should execute'
+);
+
+-- Test profile actually changed config
+SELECT ok(
+    (SELECT value FROM flight_recorder.config WHERE key = 'sample_interval_seconds') = '300',
+    'Profiles: production_safe should set sample_interval_seconds to 300'
+);
+
+SELECT ok(
+    (SELECT value FROM flight_recorder.config WHERE key = 'enable_locks') = 'false',
+    'Profiles: production_safe should disable locks'
+);
+
+-- Test get_current_profile works
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.get_current_profile()$$,
+    'Profiles: get_current_profile should execute'
+);
+
+-- Test explain_profile rejects invalid profile
+SELECT throws_ok(
+    $$SELECT * FROM flight_recorder.explain_profile('invalid_profile')$$,
+    'Profiles: explain_profile should reject invalid profile name'
+);
+
+-- Test apply_profile rejects invalid profile
+SELECT throws_ok(
+    $$SELECT * FROM flight_recorder.apply_profile('invalid_profile')$$,
+    'Profiles: apply_profile should reject invalid profile name'
 );
 
 SELECT * FROM finish();

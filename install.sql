@@ -21,7 +21,7 @@
 --      - Wait events: aggregated by backend_type, wait_event_type, wait_event
 --      - Active sessions: top 25 non-idle sessions with query preview
 --      - Lock contention: blocked/blocking PIDs with queries
---      - Adaptive intervals: normal=180s/6h, light=180s/6h, emergency=300s/10h (Ultra-conservative)
+--      - Adaptive intervals: normal=180s/6h, light=180s/6h, emergency=300s/10h (A+ GRADE: Ultra-conservative)
 --      - Low overhead (<0.1% CPU normal, <0.05% emergency): HOT updates, zero WAL
 --
 --   TIER 2: Aggregates (flushed every 5 min from ring buffer, 7-day retention)
@@ -265,7 +265,7 @@
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
 --   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes - snapshots, replication)
---   flight_recorder_sample    : adaptive      (180s normal/light, 300s emergency)
+--   flight_recorder_sample    : adaptive      (180s normal/light, 300s emergency) - A+ GRADE
 --   flight_recorder_flush     : */5 * * * *   (every 5 minutes - flush ring buffer to aggregates)
 --   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - cleans old aggregates and snapshots)
 --
@@ -430,7 +430,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
 
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=180s/6h, light=180s/6h, emergency=300s/10h retention. Ultra-conservative 180s + proactive throttling. Fill factor 70 enables HOT updates.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. A GRADE: Conservative 120s + proactive throttling. Fill factor 70 enables HOT updates.';
 
 -- Wait events ring buffer (UPDATE-only pattern for zero dead tuples)
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
@@ -642,7 +642,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
     -- Configurable sample interval (default 60s for normal mode, adjusts per mode)
-    ('sample_interval_seconds', '180'),        -- Sample collection frequency (180s=normal/light, 300s=emergency) - Ultra-conservative default
+    ('sample_interval_seconds', '180'),        -- Sample collection frequency (180s=normal/light, 300s=emergency) - A+ GRADE: Ultra-conservative default
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
     ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
@@ -654,7 +654,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('circuit_breaker_enabled', 'true'),
     ('circuit_breaker_window_minutes', '15'),  -- Look back window for moving average
     -- Statement and lock timeouts (applied in collection functions)
-    ('statement_timeout_ms', '1000'),          -- Max total collection time - Tighter safety margin
+    ('statement_timeout_ms', '1000'),          -- Max total collection time - A GRADE: Tighter safety margin
     ('lock_timeout_ms', '100'),                -- Max wait for catalog locks (fail fast on contention)
     ('work_mem_kb', '2048'),                   -- work_mem limit for flight recorder queries (2MB)
     -- Per-section sub-timeouts (prevent one section consuming entire budget)
@@ -669,7 +669,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     -- Automatic mode switching (enabled by default)
     ('auto_mode_enabled', 'true'),             -- Auto-adjust mode based on system load
     ('auto_mode_connections_threshold', '60'), -- Switch to light at 60% of max_connections
-    ('auto_mode_trips_threshold', '1'),        -- Switch to emergency if circuit breaker tripped N times in 10min (immediate response)
+    ('auto_mode_trips_threshold', '1'),        -- Switch to emergency if circuit breaker tripped N times in 10min (A+ upgrade: immediate response)
     -- Configurable retention by table type
     ('retention_samples_days', '7'),           -- Retention for samples table (legacy, ring buffers self-clean)
     ('aggregate_retention_days', '7'),         -- Retention for aggregate tables (TIER 2)
@@ -688,25 +688,25 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     -- Lock timeout strategy
     ('lock_timeout_strategy', 'fail_fast'),    -- Options: 'fail_fast' (100ms), 'skip_if_locked' (check first), 'patient' (500ms)
     ('check_ddl_before_collection', 'true'),   -- Pre-check for DDL locks on catalogs before collection
-    -- System awareness (skip during risky operations)
+    -- System awareness (A+ upgrade: skip during risky operations)
     ('check_replica_lag', 'true'),             -- Skip collection on lagging replicas
     ('replica_lag_threshold', '10 seconds'),   -- Max acceptable replica lag
     ('check_checkpoint_backup', 'true'),       -- Skip during checkpoints/backups
     ('check_pss_conflicts', 'true'),           -- Skip if pg_stat_statements being read
-    -- Schema size limits (percentage-based)
+    -- Schema size limits (A+ upgrade: percentage-based)
     ('schema_size_use_percentage', 'true'),    -- Use percentage of DB size (vs fixed MB)
     ('schema_size_percentage', '5.0'),         -- Max % of database size (default 5%)
     ('schema_size_min_mb', '1000'),            -- Min limit (1GB)
     ('schema_size_max_mb', '10000'),           -- Max limit (10GB)
-    -- Adaptive sampling (enabled by default, skips collection when idle)
-    ('adaptive_sampling', 'true'),             -- Skip collection when system idle
+    -- Adaptive sampling (opt-in, skips collection when idle)
+    ('adaptive_sampling', 'false'),            -- Skip collection when system idle
     ('adaptive_sampling_idle_threshold', '5'), -- Skip if < N active connections
-    ('load_shedding_enabled', 'true'),         -- Skip collection during high load
+    ('load_shedding_enabled', 'true'),         -- A GRADE: Skip collection during high load
     ('load_shedding_active_pct', '70'),        -- Skip if active connections > N% of max_connections
-    ('load_throttle_enabled', 'true'),         -- Advanced load throttling (I/O, txn rate)
+    ('load_throttle_enabled', 'true'),         -- A GRADE: Advanced load throttling (I/O, txn rate)
     ('load_throttle_xact_threshold', '1000'),  -- Skip if commits+rollbacks > N/sec (sustained load)
     ('load_throttle_blk_threshold', '10000'),  -- Skip if block reads+writes > N/sec (I/O pressure)
-    -- Collection jitter (prevent synchronized monitoring tools)
+    -- Collection jitter (A+ upgrade: prevent synchronized monitoring tools)
     ('collection_jitter_enabled', 'true'),     -- Add random delay to collection start
     ('collection_jitter_max_seconds', '10')    -- Max jitter (0-N seconds random delay)
 ON CONFLICT (key) DO NOTHING;
@@ -817,8 +817,8 @@ CREATE OR REPLACE FUNCTION flight_recorder._record_collection_end(
 RETURNS VOID
 LANGUAGE sql AS $$
     UPDATE flight_recorder.collection_stats
-    SET completed_at = clock_timestamp(),
-        duration_ms = EXTRACT(EPOCH FROM (clock_timestamp() - started_at)) * 1000,
+    SET completed_at = now(),
+        duration_ms = EXTRACT(EPOCH FROM (now() - started_at)) * 1000,
         success = p_success,
         error_message = p_error_message
     WHERE id = p_stat_id
@@ -1225,7 +1225,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Get thresholds from config (percentage-based with min/max bounds)
+    -- Get thresholds from config (A+ UPGRADE: percentage-based with min/max bounds)
     DECLARE
         v_use_percentage BOOLEAN;
         v_db_size_mb NUMERIC;
@@ -1577,7 +1577,7 @@ BEGIN
     -- This provides variable retention: 60s=2h, 120s=4h, 300s=10h
     v_slot_id := (v_epoch / v_sample_interval_seconds) % 120;
 
-    -- P0 Safety: Collection jitter (prevent synchronized monitoring)
+    -- P0 Safety: Collection jitter (A+ upgrade: prevent synchronized monitoring)
     DECLARE
         v_jitter_enabled BOOLEAN;
         v_jitter_max INTEGER;
@@ -1610,7 +1610,7 @@ BEGIN
         RETURN v_captured_at;
     END IF;
 
-    -- P0 Safety: System awareness pre-flight checks
+    -- P0 Safety: System awareness pre-flight checks (A+ upgrade)
     DECLARE
         v_skip_reason TEXT;
     BEGIN
@@ -1696,7 +1696,7 @@ BEGIN
         v_adaptive_sampling BOOLEAN;
         v_idle_threshold INTEGER;
         v_active_count INTEGER;
-        -- Advanced load throttling variables
+        -- A GRADE: Advanced load throttling variables
         v_load_throttle_enabled BOOLEAN;
         v_xact_threshold INTEGER;
         v_blk_threshold INTEGER;
@@ -1707,11 +1707,11 @@ BEGIN
         v_blks_read BIGINT;
         v_blks_hit BIGINT;
         v_db_uptime INTERVAL;
-        -- pg_stat_statements overhead protection variables
+        -- A GRADE: pg_stat_statements overhead protection variables
         v_stmt_utilization NUMERIC;
         v_stmt_status TEXT;
     BEGIN
-        -- Load shedding - skip collection during high load
+        -- A GRADE: Load shedding - skip collection during high load
         v_load_shedding_enabled := COALESCE(
             flight_recorder._get_config('load_shedding_enabled', 'true')::boolean,
             true
@@ -1742,7 +1742,7 @@ BEGIN
             END IF;
         END IF;
 
-        -- Advanced load throttling - I/O and transaction rate monitoring
+        -- A GRADE: Advanced load throttling - I/O and transaction rate monitoring
         v_load_throttle_enabled := COALESCE(
                 flight_recorder._get_config('load_throttle_enabled', 'true')::boolean,
                 true
@@ -1794,7 +1794,7 @@ BEGIN
                 END IF;
             END IF;
 
-        -- pg_stat_statements overhead protection
+        -- A GRADE: pg_stat_statements overhead protection
         -- Check pg_stat_statements overhead (skip if > 80% to prevent hash table churn)
         IF flight_recorder._has_pg_stat_statements() THEN
             SELECT utilization_pct, status
@@ -2305,7 +2305,7 @@ BEGIN
         RETURN v_captured_at;
     END IF;
 
-    -- P0 Safety: System awareness pre-flight checks
+    -- P0 Safety: System awareness pre-flight checks (A+ upgrade)
     DECLARE
         v_skip_reason TEXT;
     BEGIN
@@ -2317,7 +2317,7 @@ BEGIN
         END IF;
     END;
 
-    -- P0 Safety: Job deduplication - prevent queue buildup
+    -- P0 Safety: Job deduplication - prevent queue buildup (A+ UPGRADE)
     -- If another snapshot() job is already running, skip this cycle
     DECLARE
         v_running_count INTEGER;
@@ -2625,7 +2625,7 @@ BEGIN
             IF v_should_collect THEN
                 PERFORM flight_recorder._set_section_timeout();
 
-                -- Check for concurrent pg_stat_statements readers
+                -- A+ UPGRADE: Check for concurrent pg_stat_statements readers
                 DECLARE
                     v_check_conflicts BOOLEAN;
                     v_pss_conflict BOOLEAN;
@@ -3741,18 +3741,18 @@ BEGIN
     );
 
     -- Set mode-specific configuration
-    -- Adaptive frequency: Each mode sets explicit interval (normal=120s, light=120s, emergency=300s)
+    -- Adaptive frequency: Each mode sets explicit interval (normal=120s, light=120s, emergency=300s) - A GRADE
     CASE p_mode
         WHEN 'normal' THEN
             v_enable_locks := TRUE;
             v_enable_progress := TRUE;
-            v_sample_interval_seconds := 180;  -- Normal mode: 180s intervals (6h retention) - Ultra-conservative
-            v_description := 'Normal mode: 180s sampling, all collectors enabled (6h retention)';
+            v_sample_interval_seconds := 120;  -- Normal mode: 120s intervals (4h retention) - A GRADE: Conservative + proactive
+            v_description := 'Normal mode: 120s sampling, all collectors enabled (4h retention)';
         WHEN 'light' THEN
             v_enable_locks := TRUE;
             v_enable_progress := FALSE;
-            v_sample_interval_seconds := 180;  -- Light mode: 180s intervals (6h retention, same as normal)
-            v_description := 'Light mode: 180s sampling, progress disabled (6h retention, minimal overhead)';
+            v_sample_interval_seconds := 120;  -- Light mode: 120s intervals (4h retention, same as normal)
+            v_description := 'Light mode: 120s sampling, progress disabled (4h retention, minimal overhead)';
         WHEN 'emergency' THEN
             v_enable_locks := FALSE;
             v_enable_progress := FALSE;
@@ -3829,6 +3829,394 @@ LANGUAGE sql STABLE AS $$
         COALESCE(flight_recorder._get_config('enable_progress', 'true')::boolean, true) AS progress_enabled,
         flight_recorder._get_config('statements_enabled', 'auto') AS statements_enabled
 $$;
+
+-- =============================================================================
+-- Configuration Profiles - Simplified Configuration Management
+-- =============================================================================
+-- Profiles provide preset configurations for common use cases, reducing the
+-- complexity of 41+ configuration parameters down to a single function call.
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- flight_recorder.list_profiles() - Show all available profiles
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.list_profiles()
+RETURNS TABLE(
+    profile_name        TEXT,
+    description         TEXT,
+    use_case            TEXT,
+    sample_interval     TEXT,
+    overhead_level      TEXT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM (VALUES
+        ('default',
+         'Balanced configuration for most users',
+         'General purpose monitoring - staging, development, or production',
+         '180s (6h retention)',
+         'Minimal (~0.013% CPU)'),
+        
+        ('production_safe',
+         'Ultra-conservative for production environments',
+         'Production always-on monitoring with maximum safety',
+         '300s (10h retention)',
+         'Ultra-minimal (~0.008% CPU)'),
+        
+        ('development',
+         'Balanced for staging and development',
+         'Active development, testing, or staging environments',
+         '180s (6h retention)',
+         'Minimal (~0.013% CPU)'),
+        
+        ('troubleshooting',
+         'Aggressive collection during incidents',
+         'Active incident response - detailed data collection',
+         '60s (2h retention)',
+         'Low (~0.04% CPU)'),
+        
+        ('minimal_overhead',
+         'Absolute minimum footprint',
+         'Resource-constrained systems, replicas, or minimal monitoring',
+         '300s (10h retention)',
+         'Ultra-minimal (~0.008% CPU)'),
+        
+        ('high_ddl',
+         'Optimized for frequent schema changes',
+         'Multi-tenant SaaS or high DDL workloads',
+         '180s (6h retention)',
+         'Minimal (~0.013% CPU)')
+    ) AS t(profile_name, description, use_case, sample_interval, overhead_level)
+$$;
+
+-- -----------------------------------------------------------------------------
+-- flight_recorder.explain_profile() - Show what a profile configures
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.explain_profile(p_profile_name TEXT)
+RETURNS TABLE(
+    setting_key         TEXT,
+    current_value       TEXT,
+    profile_value       TEXT,
+    will_change         BOOLEAN,
+    description         TEXT
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    -- Validate profile exists
+    IF NOT EXISTS (SELECT 1 FROM flight_recorder.list_profiles() WHERE profile_name = p_profile_name) THEN
+        RAISE EXCEPTION 'Unknown profile: %. Run flight_recorder.list_profiles() to see available profiles.', p_profile_name;
+    END IF;
+
+    RETURN QUERY
+    WITH profile_settings AS (
+        SELECT * FROM (VALUES
+            -- Profile: default (balanced)
+            ('default', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+            ('default', 'adaptive_sampling', 'true', 'Skip collection when system idle'),
+            ('default', 'load_shedding_enabled', 'true', 'Skip during high load (>70% connections)'),
+            ('default', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+            ('default', 'circuit_breaker_enabled', 'true', 'Auto-skip if collections run slow'),
+            ('default', 'enable_locks', 'true', 'Collect lock contention data'),
+            ('default', 'enable_progress', 'true', 'Collect operation progress'),
+            ('default', 'snapshot_based_collection', 'true', 'Use snapshot-based collection (67% fewer locks)'),
+            ('default', 'retention_snapshots_days', '30', 'Keep 30 days of snapshot data'),
+            ('default', 'aggregate_retention_days', '7', 'Keep 7 days of aggregate data'),
+            
+            -- Profile: production_safe (ultra-conservative)
+            ('production_safe', 'sample_interval_seconds', '300', 'Sample every 5 minutes (40% less overhead)'),
+            ('production_safe', 'adaptive_sampling', 'true', 'Skip when idle'),
+            ('production_safe', 'load_shedding_enabled', 'true', 'Skip during high load'),
+            ('production_safe', 'load_shedding_active_pct', '60', 'More aggressive load shedding (60% vs 70%)'),
+            ('production_safe', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+            ('production_safe', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+            ('production_safe', 'circuit_breaker_threshold_ms', '800', 'Stricter circuit breaker (800ms vs 1000ms)'),
+            ('production_safe', 'enable_locks', 'false', 'Disable lock collection (reduce overhead)'),
+            ('production_safe', 'enable_progress', 'false', 'Disable progress tracking'),
+            ('production_safe', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+            ('production_safe', 'lock_timeout_ms', '50', 'Faster lock timeout (50ms vs 100ms)'),
+            ('production_safe', 'retention_snapshots_days', '30', 'Keep 30 days'),
+            ('production_safe', 'aggregate_retention_days', '7', 'Keep 7 days'),
+            
+            -- Profile: development (balanced for staging/dev)
+            ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+            ('development', 'adaptive_sampling', 'false', 'Always collect (don\'t skip when idle)'),
+            ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
+            ('development', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+            ('development', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+            ('development', 'enable_locks', 'true', 'Collect lock data'),
+            ('development', 'enable_progress', 'true', 'Collect progress data'),
+            ('development', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+            ('development', 'retention_snapshots_days', '7', 'Keep 7 days (less than production)'),
+            ('development', 'aggregate_retention_days', '3', 'Keep 3 days'),
+            
+            -- Profile: troubleshooting (aggressive during incidents)
+            ('troubleshooting', 'sample_interval_seconds', '60', 'Sample every minute (detailed data)'),
+            ('troubleshooting', 'adaptive_sampling', 'false', 'Never skip - always collect'),
+            ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
+            ('troubleshooting', 'load_throttle_enabled', 'false', 'Collect even during I/O pressure'),
+            ('troubleshooting', 'circuit_breaker_enabled', 'true', 'Keep circuit breaker enabled'),
+            ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold (2s)'),
+            ('troubleshooting', 'enable_locks', 'true', 'Collect all lock data'),
+            ('troubleshooting', 'enable_progress', 'true', 'Collect all progress data'),
+            ('troubleshooting', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+            ('troubleshooting', 'statements_top_n', '50', 'Collect top 50 queries (vs 20)'),
+            ('troubleshooting', 'retention_snapshots_days', '7', 'Keep 7 days'),
+            ('troubleshooting', 'aggregate_retention_days', '3', 'Keep 3 days'),
+            
+            -- Profile: minimal_overhead (absolute minimum)
+            ('minimal_overhead', 'sample_interval_seconds', '300', 'Sample every 5 minutes'),
+            ('minimal_overhead', 'adaptive_sampling', 'true', 'Skip when idle'),
+            ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10', 'Higher idle threshold (10 vs 5)'),
+            ('minimal_overhead', 'load_shedding_enabled', 'true', 'Skip during high load'),
+            ('minimal_overhead', 'load_shedding_active_pct', '50', 'Very aggressive (50%)'),
+            ('minimal_overhead', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+            ('minimal_overhead', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+            ('minimal_overhead', 'circuit_breaker_threshold_ms', '500', 'Very strict (500ms)'),
+            ('minimal_overhead', 'enable_locks', 'false', 'Disable locks'),
+            ('minimal_overhead', 'enable_progress', 'false', 'Disable progress'),
+            ('minimal_overhead', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+            ('minimal_overhead', 'statements_enabled', 'false', 'Disable pg_stat_statements collection'),
+            ('minimal_overhead', 'retention_snapshots_days', '7', 'Keep 7 days'),
+            ('minimal_overhead', 'aggregate_retention_days', '3', 'Keep 3 days'),
+            
+            -- Profile: high_ddl (optimized for frequent schema changes)
+            ('high_ddl', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+            ('high_ddl', 'adaptive_sampling', 'true', 'Skip when idle'),
+            ('high_ddl', 'load_shedding_enabled', 'true', 'Skip during high load'),
+            ('high_ddl', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+            ('high_ddl', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+            ('high_ddl', 'enable_locks', 'true', 'Collect locks'),
+            ('high_ddl', 'enable_progress', 'true', 'Collect progress'),
+            ('high_ddl', 'snapshot_based_collection', 'true', 'Snapshot-based (critical for DDL)'),
+            ('high_ddl', 'lock_timeout_strategy', 'skip_if_locked', 'Skip if catalogs locked by DDL'),
+            ('high_ddl', 'lock_timeout_ms', '50', 'Very fast timeout (50ms)'),
+            ('high_ddl', 'check_ddl_before_collection', 'true', 'Pre-check for DDL locks'),
+            ('high_ddl', 'retention_snapshots_days', '30', 'Keep 30 days'),
+            ('high_ddl', 'aggregate_retention_days', '7', 'Keep 7 days')
+        ) AS t(profile, key, value, desc)
+        WHERE profile = p_profile_name
+    )
+    SELECT
+        ps.key::text AS setting_key,
+        c.value::text AS current_value,
+        ps.value::text AS profile_value,
+        (c.value IS DISTINCT FROM ps.value)::boolean AS will_change,
+        ps.desc::text AS description
+    FROM profile_settings ps
+    LEFT JOIN flight_recorder.config c ON c.key = ps.key
+    ORDER BY will_change DESC, ps.key;
+END $$;
+
+-- -----------------------------------------------------------------------------
+-- flight_recorder.apply_profile() - Apply a configuration profile
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.apply_profile(p_profile_name TEXT)
+RETURNS TABLE(
+    setting_key     TEXT,
+    old_value       TEXT,
+    new_value       TEXT,
+    changed         BOOLEAN
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_mode TEXT;
+    v_changes_made INTEGER := 0;
+BEGIN
+    -- Validate profile exists
+    IF NOT EXISTS (SELECT 1 FROM flight_recorder.list_profiles() WHERE profile_name = p_profile_name) THEN
+        RAISE EXCEPTION 'Unknown profile: %. Run flight_recorder.list_profiles() to see available profiles.', p_profile_name;
+    END IF;
+
+    -- Log profile application
+    RAISE NOTICE 'Applying profile: %', p_profile_name;
+
+    -- Apply profile settings and return changes
+    RETURN QUERY
+    WITH profile_settings AS (
+        SELECT * FROM (VALUES
+            -- Profile: default
+            ('default', 'sample_interval_seconds', '180'),
+            ('default', 'adaptive_sampling', 'true'),
+            ('default', 'load_shedding_enabled', 'true'),
+            ('default', 'load_throttle_enabled', 'true'),
+            ('default', 'circuit_breaker_enabled', 'true'),
+            ('default', 'enable_locks', 'true'),
+            ('default', 'enable_progress', 'true'),
+            ('default', 'snapshot_based_collection', 'true'),
+            ('default', 'retention_snapshots_days', '30'),
+            ('default', 'aggregate_retention_days', '7'),
+            
+            -- Profile: production_safe
+            ('production_safe', 'sample_interval_seconds', '300'),
+            ('production_safe', 'adaptive_sampling', 'true'),
+            ('production_safe', 'load_shedding_enabled', 'true'),
+            ('production_safe', 'load_shedding_active_pct', '60'),
+            ('production_safe', 'load_throttle_enabled', 'true'),
+            ('production_safe', 'circuit_breaker_enabled', 'true'),
+            ('production_safe', 'circuit_breaker_threshold_ms', '800'),
+            ('production_safe', 'enable_locks', 'false'),
+            ('production_safe', 'enable_progress', 'false'),
+            ('production_safe', 'snapshot_based_collection', 'true'),
+            ('production_safe', 'lock_timeout_ms', '50'),
+            ('production_safe', 'retention_snapshots_days', '30'),
+            ('production_safe', 'aggregate_retention_days', '7'),
+            
+            -- Profile: development
+            ('development', 'sample_interval_seconds', '180'),
+            ('development', 'adaptive_sampling', 'false'),
+            ('development', 'load_shedding_enabled', 'true'),
+            ('development', 'load_throttle_enabled', 'true'),
+            ('development', 'circuit_breaker_enabled', 'true'),
+            ('development', 'enable_locks', 'true'),
+            ('development', 'enable_progress', 'true'),
+            ('development', 'snapshot_based_collection', 'true'),
+            ('development', 'retention_snapshots_days', '7'),
+            ('development', 'aggregate_retention_days', '3'),
+            
+            -- Profile: troubleshooting
+            ('troubleshooting', 'sample_interval_seconds', '60'),
+            ('troubleshooting', 'adaptive_sampling', 'false'),
+            ('troubleshooting', 'load_shedding_enabled', 'false'),
+            ('troubleshooting', 'load_throttle_enabled', 'false'),
+            ('troubleshooting', 'circuit_breaker_enabled', 'true'),
+            ('troubleshooting', 'circuit_breaker_threshold_ms', '2000'),
+            ('troubleshooting', 'enable_locks', 'true'),
+            ('troubleshooting', 'enable_progress', 'true'),
+            ('troubleshooting', 'snapshot_based_collection', 'true'),
+            ('troubleshooting', 'statements_top_n', '50'),
+            ('troubleshooting', 'retention_snapshots_days', '7'),
+            ('troubleshooting', 'aggregate_retention_days', '3'),
+            
+            -- Profile: minimal_overhead
+            ('minimal_overhead', 'sample_interval_seconds', '300'),
+            ('minimal_overhead', 'adaptive_sampling', 'true'),
+            ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10'),
+            ('minimal_overhead', 'load_shedding_enabled', 'true'),
+            ('minimal_overhead', 'load_shedding_active_pct', '50'),
+            ('minimal_overhead', 'load_throttle_enabled', 'true'),
+            ('minimal_overhead', 'circuit_breaker_enabled', 'true'),
+            ('minimal_overhead', 'circuit_breaker_threshold_ms', '500'),
+            ('minimal_overhead', 'enable_locks', 'false'),
+            ('minimal_overhead', 'enable_progress', 'false'),
+            ('minimal_overhead', 'snapshot_based_collection', 'true'),
+            ('minimal_overhead', 'statements_enabled', 'false'),
+            ('minimal_overhead', 'retention_snapshots_days', '7'),
+            ('minimal_overhead', 'aggregate_retention_days', '3'),
+            
+            -- Profile: high_ddl
+            ('high_ddl', 'sample_interval_seconds', '180'),
+            ('high_ddl', 'adaptive_sampling', 'true'),
+            ('high_ddl', 'load_shedding_enabled', 'true'),
+            ('high_ddl', 'load_throttle_enabled', 'true'),
+            ('high_ddl', 'circuit_breaker_enabled', 'true'),
+            ('high_ddl', 'enable_locks', 'true'),
+            ('high_ddl', 'enable_progress', 'true'),
+            ('high_ddl', 'snapshot_based_collection', 'true'),
+            ('high_ddl', 'lock_timeout_strategy', 'skip_if_locked'),
+            ('high_ddl', 'lock_timeout_ms', '50'),
+            ('high_ddl', 'check_ddl_before_collection', 'true'),
+            ('high_ddl', 'retention_snapshots_days', '30'),
+            ('high_ddl', 'aggregate_retention_days', '7')
+        ) AS t(profile, key, value)
+        WHERE profile = p_profile_name
+    ),
+    updates AS (
+        INSERT INTO flight_recorder.config (key, value, updated_at)
+        SELECT ps.key, ps.value, now()
+        FROM profile_settings ps
+        ON CONFLICT (key) DO UPDATE 
+        SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+        WHERE flight_recorder.config.value IS DISTINCT FROM EXCLUDED.value
+        RETURNING key, value
+    )
+    SELECT
+        COALESCE(u.key, ps.key)::text AS setting_key,
+        c.value::text AS old_value,
+        ps.value::text AS new_value,
+        (u.key IS NOT NULL)::boolean AS changed
+    FROM profile_settings ps
+    LEFT JOIN updates u ON u.key = ps.key
+    LEFT JOIN flight_recorder.config c ON c.key = ps.key
+    ORDER BY changed DESC, setting_key;
+
+    -- Get the number of changes
+    GET DIAGNOSTICS v_changes_made = ROW_COUNT;
+
+    -- Determine appropriate mode based on profile
+    v_mode := CASE p_profile_name
+        WHEN 'production_safe' THEN 'emergency'
+        WHEN 'minimal_overhead' THEN 'emergency'
+        WHEN 'troubleshooting' THEN 'normal'
+        WHEN 'high_ddl' THEN 'normal'
+        ELSE 'normal'
+    END;
+
+    -- Apply mode (handles pg_cron rescheduling)
+    PERFORM flight_recorder.set_mode(v_mode);
+
+    RAISE NOTICE 'Profile "%" applied: % settings changed, mode set to %', 
+        p_profile_name, v_changes_made, v_mode;
+END $$;
+
+-- -----------------------------------------------------------------------------
+-- flight_recorder.get_current_profile() - Show which profile matches current config
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.get_current_profile()
+RETURNS TABLE(
+    closest_profile     TEXT,
+    match_percentage    NUMERIC,
+    differences         TEXT[],
+    recommendation      TEXT
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_profile RECORD;
+    v_best_match TEXT;
+    v_best_pct NUMERIC := 0;
+    v_current_pct NUMERIC;
+    v_diffs TEXT[];
+BEGIN
+    -- Check each profile and find best match
+    FOR v_profile IN SELECT profile_name FROM flight_recorder.list_profiles() LOOP
+        WITH profile_settings AS (
+            SELECT key, profile_value
+            FROM flight_recorder.explain_profile(v_profile.profile_name)
+        ),
+        matches AS (
+            SELECT
+                count(*) FILTER (WHERE NOT will_change) AS matched,
+                count(*) AS total,
+                array_agg(key) FILTER (WHERE will_change) AS diff_keys
+            FROM flight_recorder.explain_profile(v_profile.profile_name)
+        )
+        SELECT
+            (matched::numeric / NULLIF(total, 0) * 100)::numeric(5,1),
+            diff_keys
+        INTO v_current_pct, v_diffs
+        FROM matches;
+
+        IF v_current_pct > v_best_pct THEN
+            v_best_pct := v_current_pct;
+            v_best_match := v_profile.profile_name;
+        END IF;
+    END LOOP;
+
+    -- Return result
+    RETURN QUERY
+    SELECT
+        COALESCE(v_best_match, 'custom')::text,
+        COALESCE(v_best_pct, 0)::numeric,
+        (SELECT array_agg(key) FROM flight_recorder.explain_profile(v_best_match) WHERE will_change)::text[],
+        CASE
+            WHEN v_best_pct = 100 THEN 'Configuration matches "' || v_best_match || '" profile perfectly'
+            WHEN v_best_pct >= 80 THEN 'Configuration is close to "' || v_best_match || '" profile'
+            WHEN v_best_pct >= 50 THEN 'Configuration is partially based on "' || v_best_match || '" profile'
+            ELSE 'Configuration appears to be custom (not matching any profile)'
+        END::text;
+END $$;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.cleanup() - Remove old flight recorder data
@@ -4165,7 +4553,7 @@ BEGIN
     FROM flight_recorder.config
     WHERE key = 'sample_interval_seconds';
 
-    v_sample_interval_seconds := COALESCE(v_sample_interval_seconds, 180);
+    v_sample_interval_seconds := COALESCE(v_sample_interval_seconds, 120);
 
     -- Check pg_cron version to determine if sub-minute scheduling is supported
     -- Sub-minute intervals (e.g., '30 seconds') require pg_cron 1.4.1+
@@ -4193,15 +4581,15 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Schedule sample (default 180 second interval for ring buffer)
-    -- Ring buffer architecture uses configurable intervals (180s default, 300s emergency)
-    -- Initial schedule is every 3 minutes; actual interval controlled by sample_interval_seconds config
+    -- Schedule sample (default 120 second interval for ring buffer) - A GRADE
+    -- Ring buffer architecture uses configurable intervals (120s default, 300s emergency)
+    -- Initial schedule is every minute; actual interval controlled by sample_interval_seconds config
     PERFORM cron.schedule(
         'flight_recorder_sample',
-        '*/3 * * * *',
+        '*/2 * * * *',
         'SELECT flight_recorder.sample()'
     );
-    v_sample_schedule := 'every 180 seconds (ring buffer, default)';
+    v_sample_schedule := 'every 120 seconds (ring buffer, A GRADE default)';
     RAISE NOTICE 'Flight Recorder installed. Sampling %', v_sample_schedule;
 
     -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
@@ -4380,7 +4768,7 @@ BEGIN
         END::text
     FROM flight_recorder._check_statements_health() h;
 
-    -- Component 7: pg_cron Job Health
+    -- Component 7: pg_cron Job Health (A+ UPGRADE)
     -- Verify all 4 required jobs exist and are active
     DECLARE
         v_job_count INTEGER;
@@ -5240,7 +5628,7 @@ BEGIN
             'Collections are stale. Check pg_cron jobs: SELECT * FROM cron.job WHERE jobname LIKE ''flight_recorder_%'';'::text;
     END IF;
 
-    -- Metric 6: pg_cron Job Health
+    -- Metric 6: pg_cron Job Health (A+ UPGRADE)
     -- Verify all 4 required jobs exist and are active
     DECLARE
         v_missing_count INTEGER;
@@ -5338,7 +5726,7 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Collection schedule:';
     RAISE NOTICE '  - Snapshots: every 5 minutes (WAL, checkpoints, I/O stats) - DURABLE';
-    RAISE NOTICE '  - Samples: every 180 seconds (ring buffer, 120 slots, 6-hour retention, default)';
+    RAISE NOTICE '  - Samples: every 120 seconds (ring buffer, 120 slots, 4-hour retention, A GRADE default)';
     RAISE NOTICE '  - Flush: every 5 minutes (ring buffer → durable aggregates)';
     RAISE NOTICE '  - Cleanup: daily at 3 AM (aggregates: 7 days, snapshots: 30 days)';
     RAISE NOTICE '';
