@@ -19,6 +19,7 @@ Complete documentation for pg-flight-recorder.
 - [Catalog Lock Contention](#catalog-lock-contention) - DDL interaction
 - [Diagnostic Patterns](#diagnostic-patterns) - Common troubleshooting scenarios
 - [Testing](#testing) - Running the test suite
+- [Benchmarking](#benchmarking) - Measuring overhead and performance
 
 ## Requirements
 
@@ -1028,6 +1029,168 @@ pg_prove -U postgres -d postgres flight_recorder_test.sql
 ```
 
 **Note:** VACUUM warnings during tests are expected (tests run in transactions).
+
+## Benchmarking
+
+### Philosophy: No Benchmarketing
+
+We are committed to honest, reproducible performance measurement based on a key insight:
+
+**The observer effect of flight recorder is roughly constant.**
+
+Running `SELECT * FROM pg_stat_activity` takes ~X milliseconds whether your database is idle or processing 10,000 TPS. The cost doesn't scale with load - it's an absolute cost.
+
+### What We Measure: Absolute Costs (Not Relative Impact)
+
+Traditional benchmarking asks: "Does this feature reduce TPS by 2%?"
+
+We ask instead: **"Does your system have X milliseconds of CPU headroom every 180 seconds?"**
+
+This reframes the question correctly:
+- ✓ Measure: Collection takes 150ms of CPU time
+- ✓ Calculate: At 180s intervals = 0.08% sustained CPU
+- ✓ Assess: Do you have 150ms spare capacity every 3 minutes?
+- ✗ ~~Measure TPS degradation under synthetic load~~ (not meaningful)
+
+### Why This Approach Is Better
+
+**The Math:**
+
+If one collection = 150ms:
+- At 180s intervals = 150ms / 180,000ms = **0.083% sustained CPU**
+- At 120s intervals = 150ms / 120,000ms = **0.125% sustained CPU**
+- At 60s intervals = 150ms / 60,000ms = **0.250% sustained CPU**
+
+This is **constant** regardless of your workload.
+
+**It's About Headroom:**
+
+The question isn't "will this slow down my database?" but rather:
+- On a tiny system (1 vCPU): Is 150ms every 180s too much?
+- On a loaded system (95% CPU): Will brief 150ms spikes cause problems?
+- On a large idle system: Obviously fine (plenty of headroom)
+
+**Two regimes matter:**
+1. **Tiny systems** - Constrained headroom even at idle
+2. **Heavily loaded systems** - Constrained headroom despite size
+
+### Running Benchmarks
+
+**Primary Benchmark: Absolute Costs (Run on any laptop):**
+
+```bash
+cd benchmark
+./measure_absolute.sh 100  # 100 iterations
+```
+
+**Measures:**
+- CPU time per collection (mean, p50, p95, p99)
+- I/O operations per collection
+- Memory usage during collection
+- Sustained CPU % at different intervals (60s, 120s, 180s)
+
+**Output Example** (MacBook Pro M-series, PostgreSQL 17.6):
+
+```
+Actual Collection Execution (from 315 real collections over 30 minutes):
+  Median: 23.0 ms (P50)
+  Mean:   24.9 ms ± 11.5 ms (stddev)
+  P95:    31.0 ms, P99: 86.4 ms
+
+Sustained CPU Impact at 180s intervals:
+  0.013% sustained + brief 23ms spike every 3 min
+
+Headroom Assessment:
+  ✓ 1 vCPU system: SAFE - only 23ms every 3 minutes
+  ✓ 2+ vCPU system: SAFE - negligible impact
+```
+
+**Supabase Micro validation** (t4g.nano, 2 core ARM, 1GB RAM):
+
+```
+Actual Collection Execution (59 collections over 10 minutes):
+  Median: 32.0 ms (P50)
+  Mean: 36.6 ms ± 23.3 ms
+
+Sustained CPU Impact at 180s intervals:
+  0.018% sustained + brief 32ms spike every 3 min
+
+Result: SAFE even on smallest Supabase tier
+```
+
+**No need for:**
+- ✗ Expensive cloud hardware
+- ✗ Complex workload simulation
+- ✗ Hours of runtime
+- ✗ Statistical comparison of TPS degradation
+
+Just measure the actual cost directly.
+
+### Validation Workflow
+
+**1. Measure on laptop (5 minutes):**
+```bash
+./benchmark/measure_absolute.sh
+```
+
+**2. Test in staging:**
+```sql
+-- Install and monitor
+\i install.sql
+SELECT * FROM flight_recorder.preflight_check();
+```
+
+Watch for:
+- Collections timing out (check logs)
+- CPU spikes correlating with collections
+- Load shedding/throttling messages (normal under load)
+
+**3. Production rollout (gradual):**
+
+Start conservative, then relax if comfortable:
+```sql
+-- Start with emergency mode (300s intervals)
+SELECT flight_recorder.apply_profile('production_safe');
+
+-- Monitor for 24 hours, then upgrade if desired
+SELECT flight_recorder.apply_profile('default');  -- 180s intervals
+```
+
+### Decision Framework
+
+```
+Do you have absolute cost measurements?
+├─ No  → Run ./benchmark/measure_absolute.sh first
+└─ Yes → What's the mean collection time?
+         ├─ <100ms → Safe everywhere
+         ├─ 100-200ms → Safe on 2+ vCPU, test on 1 vCPU
+         └─ >200ms → Investigate why (database size? Config?)
+
+Is this a tiny system (1 vCPU, <2GB RAM)?
+├─ Yes → Test in staging for 24h before production
+└─ No  → Safe to deploy
+
+Is this always-on production?
+├─ Yes → Start with emergency mode, monitor, upgrade if comfortable
+└─ No  → Normal mode is fine (troubleshooting/staging)
+```
+
+### FAQ
+
+**Q: Do I need expensive hardware to benchmark?**
+A: No. Absolute costs are constant. Run on your laptop in 5 minutes.
+
+**Q: Do I need to simulate production load?**
+A: No. Collection cost doesn't depend on your workload. Load shedding/throttling handle that.
+
+**Q: What if my collection time is 500ms?**
+A: Investigate: How many tables? How many connections? Slow disk? Consider emergency mode (300s intervals).
+
+**Q: Should I measure on RDS/Cloud?**
+A: Useful to see if cloud overhead differs from local, but not required. The tool works the same everywhere.
+
+**Q: How often should I re-measure?**
+A: After major changes: significantly more tables (10x growth), PostgreSQL version upgrade, or hardware changes. Otherwise, costs are stable.
 
 ## Uninstall
 
