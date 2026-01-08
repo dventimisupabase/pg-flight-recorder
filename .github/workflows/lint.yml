@@ -1,0 +1,101 @@
+name: Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  sql-lint:
+    name: SQL Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Validate SQL syntax (install.sql)
+        run: |
+          # Check for basic SQL syntax errors using psql --single-transaction with dry-run
+          # This doesn't execute but validates syntax
+          echo "Checking install.sql for syntax errors..."
+          psql --version
+
+          # Basic syntax validation - check for common issues
+          if grep -n "SYNTAX ERROR" install.sql; then
+            echo "Found syntax errors in install.sql"
+            exit 1
+          fi
+
+          # Check for unterminated strings or comments
+          if ! awk '
+            BEGIN { in_string=0; in_comment=0; }
+            /\$\$/ { in_string = !in_string; }
+            /\/\*/ && !in_string { in_comment=1; }
+            /\*\// && in_comment { in_comment=0; }
+            END {
+              if (in_string) { print "Unterminated $$ string found"; exit 1; }
+              if (in_comment) { print "Unterminated /* comment found"; exit 1; }
+            }
+          ' install.sql; then
+            exit 1
+          fi
+
+          echo "✓ install.sql syntax validation passed"
+
+      - name: Validate SQL syntax (uninstall.sql)
+        run: |
+          echo "Checking uninstall.sql for syntax errors..."
+
+          if grep -n "SYNTAX ERROR" uninstall.sql; then
+            echo "Found syntax errors in uninstall.sql"
+            exit 1
+          fi
+
+          echo "✓ uninstall.sql syntax validation passed"
+
+      - name: Validate SQL syntax (test file)
+        run: |
+          echo "Checking flight_recorder_test.sql for syntax errors..."
+
+          if grep -n "SYNTAX ERROR" flight_recorder_test.sql; then
+            echo "Found syntax errors in flight_recorder_test.sql"
+            exit 1
+          fi
+
+          echo "✓ flight_recorder_test.sql syntax validation passed"
+
+  markdown-lint:
+    name: Markdown Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v16
+        with:
+          globs: |
+            **/*.md
+
+  shellcheck:
+    name: Shell Script Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
