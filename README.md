@@ -7,6 +7,7 @@ Server-side flight recorder for PostgreSQL. Runs automatically via pg_cron. Zero
 ## Install
 
 **PostgreSQL 15+** (requires pg_cron):
+
 ```bash
 psql -f install.sql
 ```
@@ -34,16 +35,19 @@ SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:
 **Most users:** Just install. The defaults work.
 
 **Production tuning:**
+
 ```sql
 SELECT flight_recorder.apply_profile('production_safe');
 ```
 
 **Troubleshooting an incident:**
+
 ```sql
 SELECT flight_recorder.apply_profile('troubleshooting');
 ```
 
 **Need to stop it:**
+
 ```sql
 SELECT flight_recorder.disable();
 ```
@@ -55,6 +59,7 @@ See [REFERENCE.md](REFERENCE.md) for all profiles and settings.
 **Yes.** ~0.02% CPU overhead. 23-32ms per collection every 3 minutes.
 
 **Validated on resource-constrained hardware:**
+
 - Supabase Micro (2 core, 1GB): 0% DDL blocking across 202 operations
 - Built-in protection: load shedding, circuit breakers, fast timeouts
 

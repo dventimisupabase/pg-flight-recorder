@@ -9,6 +9,7 @@ This framework measures the **absolute cost** of pg-flight-recorder collections.
 We measure **absolute costs** (CPU time per collection), not relative impact (TPS degradation).
 
 **Why?** Because the cost is constant:
+
 - Running `SELECT * FROM pg_stat_activity` takes ~150ms whether your DB is idle or processing 10,000 TPS
 - The question isn't "does this slow my queries?" but "do I have 150ms headroom every 180 seconds?"
 
@@ -40,6 +41,7 @@ cd benchmark
 ```
 
 Example output:
+
 ```
 Collection Timing:
   Mean:   127.3 ms ± 23.1 ms
@@ -65,6 +67,7 @@ Headroom Assessment:
 Measure how often and how long flight recorder blocks DDL operations (ALTER TABLE, CREATE INDEX, etc.) due to AccessShareLock contention on system catalogs.
 
 **Key Questions Answered:**
+
 - What % of DDL operations encounter blocking from flight recorder?
 - How long do blocked DDL operations wait?
 - What's the expected collision rate at different workload levels?
@@ -119,12 +122,14 @@ Recommendation: Safe for production use with high DDL workloads
 ### Interpreting Results
 
 **Collision Rate:**
+
 - **<1%**: Negligible impact - safe for DDL-heavy workloads
 - **1-3%**: Low impact - acceptable for most workloads
 - **3-5%**: Moderate impact - monitor if >50 DDL ops/hour
 - **>5%**: High impact - consider emergency mode (300s) during DDL-heavy periods
 
 **Average Delay:**
+
 - **<10ms**: Minimal impact
 - **10-50ms**: Acceptable for most applications
 - **50-100ms**: May be noticeable for latency-sensitive DDL
@@ -133,12 +138,14 @@ Recommendation: Safe for production use with high DDL workloads
 ### What This Measures
 
 The test:
+
 1. Runs flight recorder at specified interval (default: 180s)
 2. Continuously executes DDL operations (ALTER, CREATE INDEX, DROP, VACUUM)
 3. Detects when DDL waits for locks via pg_locks
 4. Identifies if flight recorder's catalog queries are the blocker
 
 **AccessShareLock Contention:**
+
 - Flight recorder queries: pg_stat_activity, pg_locks, pg_class, etc.
 - These acquire AccessShareLock on system catalogs
 - DDL operations need AccessExclusiveLock
@@ -166,11 +173,13 @@ SELECT flight_recorder.enable();
 ### When to Run This Test
 
 **Required for:**
+
 - High-DDL workloads (multi-tenant SaaS with frequent schema changes)
 - Latency-sensitive applications where DDL timing matters
 - Before enabling always-on production monitoring
 
 **Less critical for:**
+
 - Low-DDL workloads (<10 DDL ops/hour)
 - Troubleshooting/staging use (not always-on)
 - Maintenance-window-only DDL
@@ -182,6 +191,7 @@ The scenario-based tests validate **safety features work**, not performance impa
 ### Purpose
 
 Confirm that:
+
 - ✓ Load shedding triggers correctly (>70% connections)
 - ✓ Load throttling activates under high TPS/IO
 - ✓ pg_stat_statements protection works
@@ -191,10 +201,12 @@ Confirm that:
 ### Available Scenarios
 
 #### light_oltp (Implemented)
+
 - **Pattern**: 80% SELECT, 15% UPDATE, 5% INSERT
 - **Purpose**: Validate safety features under moderate OLTP load
 
 #### Others (TODO)
+
 - heavy_oltp: Stress test load shedding/throttling
 - analytical: Test during heavy I/O
 - high_ddl: Catalog lock contention
@@ -229,15 +241,18 @@ cat results/*/comparison_*.md
 ### Interpreting Results
 
 **Collection time <100ms:**
+
 - ✓ Safe everywhere (1+ vCPU)
 - Negligible sustained CPU (<0.06% at 180s)
 
 **Collection time 100-200ms:**
+
 - ✓ Safe on 2+ vCPU systems
 - ⚠ Test on 1 vCPU systems first
 - Low sustained CPU (<0.11% at 180s)
 
 **Collection time >200ms:**
+
 - ⚠ Investigate: Why so slow?
   - Large catalog (many tables)?
   - Many active connections?
@@ -249,6 +264,7 @@ cat results/*/comparison_*.md
 Help us understand: Does cost scale with DB size?
 
 Run `measure_absolute.sh` on databases of different sizes and share results:
+
 - Empty database
 - 1GB, 10GB, 100GB, 1TB
 - Different table counts (10, 100, 1000, 10000)
@@ -286,6 +302,7 @@ SELECT flight_recorder.set_mode('normal');  -- 180s
 ### For 1 vCPU Systems
 
 Test in staging for 24h first:
+
 - Watch for collection timeouts
 - Monitor CPU spikes
 - Check if load shedding triggers frequently
@@ -324,6 +341,7 @@ Ways to help:
 ## Summary
 
 **Simple workflow:**
+
 1. `cd benchmark && ./measure_absolute.sh` (5 min)
 2. Review: "Mean: X ms"
 3. Calculate: X / 180000 = sustained CPU %
@@ -331,6 +349,7 @@ Ways to help:
 5. Deploy accordingly
 
 **Philosophy:**
+
 - Measure what's constant (absolute cost)
 - Not what's variable (relative TPS impact)
 - Reproducible on any laptop

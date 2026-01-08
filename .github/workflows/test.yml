@@ -26,16 +26,16 @@ jobs:
 
       - name: Build PostgreSQL ${{ matrix.pg_version }} image with pg_cron
         run: |
-          PG_VERSION=${{ matrix.pg_version }} docker-compose build
+          PG_VERSION=${{ matrix.pg_version }} docker compose build
 
       - name: Start PostgreSQL ${{ matrix.pg_version }} with pg_cron
         run: |
-          PG_VERSION=${{ matrix.pg_version }} docker-compose up -d
+          PG_VERSION=${{ matrix.pg_version }} docker compose up -d
 
       - name: Wait for PostgreSQL to be ready
         run: |
           for i in {1..30}; do
-            if docker-compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; then
+            if docker compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; then
               echo "PostgreSQL is ready"
               break
             fi
@@ -45,29 +45,29 @@ jobs:
 
       - name: Install pg_cron extension
         run: |
-          docker-compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
+          docker compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
 
       - name: Install pg-flight-recorder
         run: |
-          docker-compose exec -T postgres psql -U postgres -d postgres -f /install.sql
+          docker compose exec -T postgres psql -U postgres -d postgres -f /install.sql
 
       - name: Install pgTAP extension
         run: |
-          docker-compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
+          docker compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
 
       - name: Run pgTAP tests (118 tests)
         run: |
-          docker-compose exec -T postgres pg_prove -U postgres -d postgres /flight_recorder_test.sql
+          docker compose exec -T postgres pg_prove -U postgres -d postgres /flight_recorder_test.sql
 
       - name: Show PostgreSQL logs on failure
         if: failure()
         run: |
-          docker-compose logs postgres
+          docker compose logs postgres
 
       - name: Clean up
         if: always()
         run: |
-          docker-compose down -v
+          docker compose down -v
 
   test-summary:
     name: Test Summary

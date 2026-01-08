@@ -10,7 +10,6 @@ OUTPUT_FILE="$SCRIPT_DIR/results/absolute_costs_$(date +%Y%m%d_%H%M%S).json"
 
 # Colors
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
@@ -171,22 +170,6 @@ else
     # Fallback if no Python
     STATS='{"error": "Python3 required for statistical analysis"}'
 fi
-
-# Get catalog lock info
-LOCK_INFO=$(psql -t -c "
-    SELECT
-        count(*) as lock_count,
-        array_agg(DISTINCT relation::regclass::text) as tables_locked
-    FROM pg_locks
-    WHERE locktype = 'relation'
-    AND relation IN (
-        SELECT oid FROM pg_class
-        WHERE relnamespace = 'pg_catalog'::regnamespace
-        AND relkind = 'r'
-    )
-    AND granted = true
-    LIMIT 1
-")
 
 # Calculate sustained CPU percentage at different intervals
 MEAN_TIME=$(echo "$STATS" | python3 -c "import json, sys; print(json.load(sys.stdin)['timing_ms']['mean'])")

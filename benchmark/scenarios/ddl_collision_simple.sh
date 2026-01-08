@@ -45,7 +45,7 @@ OPERATION_COUNT=0
 
 echo "Running DDL operations until $(date -r $END_TIME '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d @$END_TIME '+%Y-%m-%d %H:%M:%S')"
 
-while [ $(date +%s) -lt $END_TIME ]; do
+while [ "$(date +%s)" -lt "$END_TIME" ]; do
     OPERATION_COUNT=$((OPERATION_COUNT + 1))
 
     # Rotate through different DDL operations

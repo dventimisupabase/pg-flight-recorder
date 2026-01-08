@@ -5,6 +5,7 @@
 This benchmark measures how often flight recorder blocks DDL operations (ALTER TABLE, CREATE INDEX, etc.) due to AccessShareLock contention on system catalogs.
 
 **What it answers:**
+
 - What % of DDL operations encounter blocking from flight recorder?
 - How long do blocked DDL operations wait?
 - What's the expected collision rate at your workload level?
@@ -57,12 +58,14 @@ Risk Level: LOW - Minimal DDL impact
 ### Risk Levels
 
 **Collision Rate:**
+
 - **<1%**: Negligible - safe for DDL-heavy workloads
 - **1-3%**: Low - acceptable for most workloads
 - **3-5%**: Moderate - monitor if >50 DDL ops/hour
 - **>5%**: High - consider emergency mode (300s) during DDL-heavy periods
 
 **Average Delay:**
+
 - **<10ms**: Minimal impact
 - **10-50ms**: Acceptable for most applications
 - **50-100ms**: May be noticeable for latency-sensitive DDL
@@ -73,6 +76,7 @@ Risk Level: LOW - Minimal DDL impact
 ### AccessShareLock Contention
 
 Flight recorder queries system catalogs:
+
 ```
 pg_stat_activity  -- Active sessions
 pg_locks          -- Lock information
@@ -102,12 +106,14 @@ DDL operations need **AccessExclusiveLock** (exclusive).
 If collision rate is concerning:
 
 ### Option 1: Emergency Mode (300s intervals)
+
 ```sql
 SELECT flight_recorder.set_mode('emergency');
 -- 40% fewer collections = 40% fewer collision opportunities
 ```
 
 ### Option 2: Faster Lock Timeout
+
 ```sql
 -- Fail faster, less DDL delay
 UPDATE flight_recorder.config
@@ -116,6 +122,7 @@ WHERE key = 'lock_timeout_ms';
 ```
 
 ### Option 3: Disable During DDL-Heavy Periods
+
 ```sql
 -- Before maintenance window
 SELECT flight_recorder.disable();
@@ -129,18 +136,21 @@ SELECT flight_recorder.enable();
 ```
 
 ### Option 4: Schedule DDL During Low-Traffic
+
 - Flight recorder runs every 180s (normal mode)
 - Schedule DDL between collection cycles
 - Use `collection_stats` table to find recent collection times
 
 ## When to Run This Test
 
-### Required For:
+### Required For
+
 - High-DDL workloads (multi-tenant SaaS with frequent schema changes)
 - Latency-sensitive applications where DDL timing matters
 - Before enabling always-on production monitoring
 
-### Less Critical For:
+### Less Critical For
+
 - Low-DDL workloads (<10 DDL ops/hour)
 - Troubleshooting/staging use (not always-on)
 - Maintenance-window-only DDL
@@ -209,11 +219,13 @@ psql -c "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recor
 ### High Collision Rate (>10%)
 
 This is unusual. Possible causes:
+
 1. Database under extreme DDL load during test
 2. Very slow system catalogs (thousands of tables)
 3. Other processes holding catalog locks
 
 Investigate:
+
 ```sql
 -- Check catalog size
 SELECT schemaname, tablename, pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename))
@@ -258,6 +270,7 @@ This builds evidence about DDL impact across different environments.
 ## Summary
 
 **Simple workflow:**
+
 1. `./measure_ddl_impact.sh` (5 min)
 2. Review collision rate and delay
 3. If <3% collision rate + <50ms delay → safe for production

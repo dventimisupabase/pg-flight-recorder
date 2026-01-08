@@ -7,24 +7,29 @@ This document describes the GitHub Actions workflows configured for pg-flight-re
 ### 1. Test Suite (`test.yml`)
 
 **Triggers:**
+
 - Push to `main` branch
 - Pull requests to `main` branch
 - Manual dispatch via GitHub Actions UI
 
 **What it does:**
+
 - Runs the full pgTAP test suite (118 tests) against PostgreSQL 15, 16, and 17
 - Tests run in parallel using a matrix strategy
 - Uses the existing Docker Compose infrastructure
 - Each PostgreSQL version gets its own job
 
 **Matrix:**
+
 ```yaml
 PostgreSQL 15: ✓ 118 tests
 PostgreSQL 16: ✓ 118 tests
 PostgreSQL 17: ✓ 118 tests
+
 ```
 
 **Failure handling:**
+
 - Shows PostgreSQL logs on failure
 - Fails the entire workflow if any version fails
 - Always cleans up Docker containers
@@ -32,6 +37,7 @@ PostgreSQL 17: ✓ 118 tests
 ### 2. Lint (`lint.yml`)
 
 **Triggers:**
+
 - Push to `main` branch
 - Pull requests to `main` branch
 - Manual dispatch via GitHub Actions UI
@@ -39,16 +45,19 @@ PostgreSQL 17: ✓ 118 tests
 **What it does:**
 
 **SQL Syntax Check:**
+
 - Validates `install.sql`, `uninstall.sql`, and `flight_recorder_test.sql`
 - Checks for unterminated strings and comments
 - Basic syntax error detection
 
 **Markdown Lint:**
+
 - Runs `markdownlint-cli2` on all `*.md` files
 - Configuration in `.markdownlint.json`
 - Enforces consistent documentation style
 
 **Shell Script Lint:**
+
 - Runs ShellCheck on all shell scripts
 - Catches common bash scripting errors
 - Severity level: warning
@@ -56,17 +65,20 @@ PostgreSQL 17: ✓ 118 tests
 ### 3. Release (`release.yml`)
 
 **Triggers:**
+
 - Push of version tags matching `v*.*.*` (e.g., `v1.0.0`)
 - Manual dispatch with version input
 
 **What it does:**
 
 **Validation:**
+
 - Validates version tag format (must be `v#.#.#`)
 - Runs the full test suite across all PostgreSQL versions
 - Fails if tests don't pass
 
 **Release Creation:**
+
 - Generates changelog from git commits since last tag
 - Creates release assets:
   - `pg-flight-recorder-v#.#.#.tar.gz`
@@ -78,6 +90,7 @@ PostgreSQL 17: ✓ 118 tests
   - Installation instructions
 
 **Announcement:**
+
 - Prints release information
 - Provides direct download links
 
@@ -97,11 +110,13 @@ The CI workflows use the same scripts you can run locally:
 
 # Test on all versions (same as CI)
 ./test.sh all
+
 ```
 
 ### Creating a Release
 
 **Option 1: Tag and Push**
+
 ```bash
 # Create and push a version tag
 git tag v1.0.0
@@ -111,9 +126,11 @@ git push origin v1.0.0
 # 1. Run all tests
 # 2. Create GitHub Release
 # 3. Attach release assets
+
 ```
 
 **Option 2: Manual Dispatch**
+
 1. Go to Actions → Release → Run workflow
 2. Enter version tag (e.g., `v1.0.1`)
 3. Click "Run workflow"
@@ -121,11 +138,13 @@ git push origin v1.0.0
 ### Checking CI Status
 
 **For Pull Requests:**
+
 - View the "Checks" tab on your PR
 - All workflows must pass before merging
 - Click on failed checks to see logs
 
 **For Main Branch:**
+
 - Go to Actions tab in GitHub repository
 - View recent workflow runs
 - Download logs or artifacts if needed
@@ -141,11 +160,13 @@ All workflows are located in `.github/workflows/`:
 │   ├── lint.yml      # SQL, Markdown, and Shell linting
 │   └── release.yml   # Version tagging and release creation
 └── CICD.md           # This file
+
 ```
 
 ## Configuration Files
 
 **`.markdownlint.json`**
+
 - Configures markdown linting rules
 - Disables line-length checks (MD013)
 - Allows inline HTML (MD033) and bare URLs (MD034)
@@ -153,12 +174,14 @@ All workflows are located in `.github/workflows/`:
 ## CI Environment
 
 **Test Environment:**
+
 - OS: Ubuntu Latest
 - PostgreSQL: 15, 16, 17 (from official Docker images)
 - Extensions: pg_cron, pgTAP
 - Test Framework: pg_prove (TAP protocol)
 
 **Resources:**
+
 - Standard GitHub Actions runners
 - Docker + Docker Compose available
 - ~2-4 minutes per test run (all versions in parallel)
@@ -203,18 +226,22 @@ All workflows are located in `.github/workflows/`:
 When PostgreSQL 18 is released and Docker volumes support it:
 
 1. Update `test.yml` matrix:
+
 ```yaml
 matrix:
   pg_version: [15, 16, 17, 18]
+
 ```
 
-2. Update `test.sh`:
+1. Update `test.sh`:
+
 ```bash
 if [ "$VERSION" = "all" ]; then
     for v in 15 16 17 18; do
+
 ```
 
-3. Test locally first: `./test.sh 18`
+1. Test locally first: `./test.sh 18`
 
 ### Adding New Workflows
 
@@ -226,12 +253,14 @@ if [ "$VERSION" = "all" ]; then
 ## Best Practices
 
 **For Contributors:**
+
 - Run tests locally before pushing: `./test.sh all`
 - Run linters before committing
 - Keep commit messages descriptive (used in changelog)
 - Don't push broken code to `main`
 
 **For Maintainers:**
+
 - Always create releases from clean `main` branch
 - Test release process on a branch first
 - Review automatically generated changelogs before publishing
@@ -240,11 +269,13 @@ if [ "$VERSION" = "all" ]; then
 ## Security
 
 **Token Permissions:**
+
 - `GITHUB_TOKEN` is auto-generated per workflow run
 - `contents: write` permission only for release workflow
 - No manual secrets required
 
 **Docker Security:**
+
 - Official PostgreSQL images only
 - Extensions built from source (pg_cron, pgTAP)
 - No external dependencies beyond official repositories

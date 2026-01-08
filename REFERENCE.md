@@ -5,16 +5,19 @@ Complete documentation for pg-flight-recorder.
 ## Table of Contents
 
 **Quick Start:**
+
 - [Configuration Profiles](#configuration-profiles) - **Start here** for easy configuration
 - [Functions](#functions) - Query and control functions
 - [Safety Features](#safety-features) - Built-in protections
 
 **Architecture:**
+
 - [How It Works](#how-it-works) - Overview
 - [Three-Tier Architecture](#three-tier-architecture) - Data storage model
 - [Collection Modes](#collection-modes) - Sampling frequencies
 
 **Advanced:**
+
 - [Configuration](#configuration) - Individual parameters (advanced users)
 - [Catalog Lock Contention](#catalog-lock-contention) - DDL interaction
 - [Diagnostic Patterns](#diagnostic-patterns) - Common troubleshooting scenarios
@@ -50,12 +53,14 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 **Purpose:** Low-overhead, adaptive-frequency sampling with 4-10 hour rolling window
 
 **Tables:**
+
 - `samples_ring` (master, 120 fixed slots, UNLOGGED)
 - `wait_samples_ring` (12,000 pre-populated rows: 120 slots × 100 rows)
 - `activity_samples_ring` (3,000 pre-populated rows: 120 slots × 25 rows)
 - `lock_samples_ring` (12,000 pre-populated rows: 120 slots × 100 rows)
 
 **Characteristics:**
+
 - **UNLOGGED tables** - No WAL overhead, don't survive crashes (intentional trade-off)
 - **Adaptive intervals** - Slot rotation: `(epoch / sample_interval_seconds) % 120`
   - Normal/Light mode: 180s intervals = 120 slots × 180s = 6 hours retention
@@ -67,11 +72,13 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 - **Zero autovacuum pressure** - No dead tuples generated, only HOT updates
 
 **Optimization:**
+
 - `fillfactor=70` on master (30% free space for HOT updates)
 - `fillfactor=90` on children (10% free space for HOT updates)
 - No aggressive autovacuum needed (UPDATE-only pattern eliminates dead tuples)
 
 **Query with:**
+
 - `recent_waits`, `recent_activity`, `recent_locks` views (static 10-hour window, covers all modes)
 - `recent_waits_current()`, `recent_activity_current()`, `recent_locks_current()` functions (dynamic retention based on current mode)
 - `activity_at(timestamp)` function (specific moment)
@@ -81,23 +88,27 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 **Purpose:** Flushed ring buffer data for longer retention and historical analysis
 
 **Tables:**
+
 - `wait_event_aggregates` (wait event patterns over 5-minute windows)
 - `lock_aggregates` (lock contention patterns)
 - `query_aggregates` (query execution patterns)
 
 **Characteristics:**
+
 - **Durable (LOGGED)** - Survives crashes
 - **Flushed every 5 minutes** - Ring buffer → aggregates
 - **7-day default retention** - Configurable via `aggregate_retention_days`
 - **Aggregated data** - Summarizes ring buffer samples (e.g., avg/max waiters, occurrence counts)
 
 **How flush works:**
+
 1. Find min/max timestamp in ring buffer (since last flush)
 2. Aggregate samples by dimensions (backend_type, wait_event, etc.)
 3. INSERT aggregated rows into durable tables
 4. Ring buffer continues (not cleared - provides 2-hour recent window)
 
 **Query with:**
+
 - `wait_summary(start, end)` function (aggregate wait events over time)
 - Direct SQL on aggregate tables for custom analysis
 
@@ -106,17 +117,20 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 **Purpose:** Point-in-time cumulative statistics for long-term trends
 
 **Tables:**
+
 - `snapshots` (pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O)
 - `replication_snapshots` (pg_stat_replication, replication slots)
 - `statement_snapshots` (pg_stat_statements top queries)
 
 **Characteristics:**
+
 - **Durable (LOGGED)** - Survives crashes
 - **Every 5 minutes** - Cumulative stats (counters since PostgreSQL start)
 - **30-day default retention** - Configurable via `retention_snapshots_days`
 - **Delta analysis** - Compare two snapshots to see changes over time
 
 **Query with:**
+
 - `compare(start, end)` function (snapshot-over-snapshot deltas)
 - `statement_compare(start, end)` function (query performance changes)
 - `deltas` view (recent snapshot changes)
@@ -187,6 +201,7 @@ Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 dat
 | `cleanup_aggregates()`         | Clean old aggregate data                     |
 
 **"Set and Forget" Workflow:**
+
 1. Before installation: `SELECT * FROM flight_recorder.preflight_check();`
 2. Every 3 months: `SELECT * FROM flight_recorder.quarterly_review();`
 3. Both functions provide clear GO/NO-GO status with actionable recommendations.
@@ -202,6 +217,7 @@ Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 dat
 | `deltas`             | Snapshot-over-snapshot changes              |
 
 **Dynamic Retention Functions** (use these for mode-aware retention):
+
 - `recent_waits_current()` - Returns waits with retention matching current mode (6-10 hours)
 - `recent_activity_current()` - Returns activity with mode-aware retention
 - `recent_locks_current()` - Returns locks with mode-aware retention
@@ -334,12 +350,14 @@ SELECT * FROM flight_recorder.validate_config();
 Flight recorder is designed to minimize impact on the database it monitors:
 
 **Load Shedding**
+
 - Automatically skips collection when active connections > 70% of max_connections
 - Proactive protection against observer effect during high load
 - Configurable threshold via `load_shedding_active_pct` config
 - Enabled by default (set `load_shedding_enabled = 'false'` to disable)
 
 **Load Throttling**
+
 - **Transaction rate monitoring**: Skips when commits+rollbacks > 1,000/sec
 - **I/O pressure detection**: Skips when block reads+writes > 10,000/sec  
 - Prevents observer effect amplification during sustained heavy workloads
@@ -348,6 +366,7 @@ Flight recorder is designed to minimize impact on the database it monitors:
 - Enabled by default (set `load_throttle_enabled = 'false'` to disable)
 
 **pg_stat_statements Overhead Protection**
+
 - Automatically skips collection when hash table utilization > 80%
 - Prevents statement evictions and hash table churn during collection
 - Monitors pg_stat_statements_info (PG14+) for dealloc count
@@ -355,21 +374,25 @@ Flight recorder is designed to minimize impact on the database it monitors:
 - Always enabled when pg_stat_statements extension is available
 
 **UNLOGGED Tables**
+
 - 9 telemetry tables use UNLOGGED to eliminate WAL overhead
 - Only `config` (small config data) uses WAL
 - Data lost on crash is acceptable for telemetry
 
 **Per-Section Timeouts**
+
 - Each collection section has independent 250ms timeout (configurable)
 - Total statement timeout: 1000ms (reduced from 2000ms for tighter safety)
 - Prevents any single query from monopolizing resources
 - Timeout resets between sections and at function end
 
 **O(n) Lock Detection**
+
 - Uses `pg_blocking_pids()` instead of O(n^2) self-join on `pg_locks`
 - Scales linearly with connection count
 
 **Result Limits**
+
 - Lock samples: 100 max
 - Active sessions: 25 max
 - Statement snapshots: 20 max (configurable)
@@ -415,6 +438,7 @@ Enabled by default (`auto_mode_enabled = 'true'`).
 ### Graceful Degradation
 
 Each collection section wrapped in exception handlers:
+
 - Wait events fail → activity samples still collected
 - Lock detection fails → progress tracking continues
 - Partial data better than no data during incidents
@@ -424,12 +448,14 @@ Each collection section wrapped in exception handlers:
 **NEW**: Prevents pg_cron job queue buildup during slow collections or outages.
 
 **Problem:**
+
 - If `sample()` or `snapshot()` takes longer than the scheduled interval, pg_cron queues up the next job
 - During recovery from outages, multiple jobs can pile up
 - Result: Amplified observer effect during stress periods
 
 **Solution:**
 Each collection checks for already-running jobs before starting:
+
 - Queries `pg_stat_activity` for active `flight_recorder.sample()` or `flight_recorder.snapshot()` calls
 - If duplicate detected, skips this cycle and logs to `collection_stats`
 - Prevents queue buildup with zero configuration required
@@ -446,6 +472,7 @@ ORDER BY started_at DESC;
 ```
 
 **Behavior:**
+
 - Automatic (no configuration needed)
 - Minimal overhead (~1ms per collection to check pg_stat_activity)
 - Logged as skipped collection with reason: "Job deduplication: N job(s) already running (PID: X)"
@@ -455,6 +482,7 @@ ORDER BY started_at DESC;
 **NEW**: Self-healing storage management with proactive cleanup.
 
 **Problem (previous behavior):**
+
 - At 10GB: Flight recorder disables collection
 - Requires manual intervention to re-enable
 - Monitoring stays offline indefinitely
@@ -516,6 +544,7 @@ SELECT flight_recorder.disable();
 **NEW**: Detects silent failures when pg_cron jobs are deleted, disabled, or broken.
 
 **Problem (previous behavior):**
+
 - If pg_cron jobs are manually deleted/disabled, flight recorder fails silently
 - No alerting when collection stops due to missing jobs
 - Manual investigation required to diagnose
@@ -523,6 +552,7 @@ SELECT flight_recorder.disable();
 **Solution (upgraded):**
 
 Automatic health checks for all 4 required pg_cron jobs:
+
 - `flight_recorder_sample` (adaptive frequency: 180s normal/light, 300s emergency - ring buffer)
 - `flight_recorder_snapshot` (every 5 minutes - system stats)
 - `flight_recorder_flush` (every 5 minutes - ring buffer → aggregates)
@@ -531,13 +561,15 @@ Automatic health checks for all 4 required pg_cron jobs:
 **Health Checks:**
 
 1. **Real-time:** `health_check()` function
+
 ```sql
 SELECT * FROM flight_recorder.health_check()
 WHERE component = 'pg_cron Jobs';
 -- Returns: OK, WARNING, or CRITICAL with specific missing/inactive jobs
 ```
 
-2. **Quarterly Review:** `quarterly_review()` function (run every 90 days)
+1. **Quarterly Review:** `quarterly_review()` function (run every 90 days)
+
 ```sql
 SELECT * FROM flight_recorder.quarterly_review()
 WHERE component LIKE '%pg_cron%';
@@ -545,6 +577,7 @@ WHERE component LIKE '%pg_cron%';
 ```
 
 **Status Levels:**
+
 - **OK**: All 4 jobs exist and are active
 - **CRITICAL**: Jobs missing or inactive (specific jobs listed)
 - **ERROR**: Failed to check pg_cron (extension issue)
@@ -596,9 +629,11 @@ SELECT * FROM flight_recorder.get_current_profile();
 ### Available Profiles
 
 #### `default` - Balanced Configuration
+
 **Use case:** General purpose monitoring for most environments
 
 **Key settings:**
+
 - Sample interval: 180s (every 3 minutes, 6h retention)
 - All safety features enabled (load shedding, throttling, circuit breaker)
 - Adaptive sampling enabled (skips when idle)
@@ -606,6 +641,7 @@ SELECT * FROM flight_recorder.get_current_profile();
 - Overhead: ~0.013% CPU sustained
 
 **When to use:**
+
 - First-time installation (this is the default)
 - Staging and development environments
 - General production monitoring
@@ -615,9 +651,11 @@ SELECT flight_recorder.apply_profile('default');
 ```
 
 #### `production_safe` - Ultra-Conservative for Production
+
 **Use case:** Production always-on monitoring with maximum safety margins
 
 **Key settings:**
+
 - Sample interval: 300s (every 5 minutes, 10h retention) - 40% less overhead
 - Aggressive load shedding (60% vs 70% connection threshold)
 - Stricter circuit breaker (800ms vs 1000ms)
@@ -626,6 +664,7 @@ SELECT flight_recorder.apply_profile('default');
 - Overhead: ~0.008% CPU sustained
 
 **When to use:**
+
 - Production databases with strict SLAs
 - Systems running near capacity
 - Risk-averse deployments
@@ -635,9 +674,11 @@ SELECT flight_recorder.apply_profile('production_safe');
 ```
 
 #### `development` - Balanced for Staging/Dev
+
 **Use case:** Active development and testing environments
 
 **Key settings:**
+
 - Sample interval: 180s (every 3 minutes, 6h retention)
 - Adaptive sampling **disabled** (always collect, even when idle)
 - All collectors enabled
@@ -645,6 +686,7 @@ SELECT flight_recorder.apply_profile('production_safe');
 - Overhead: ~0.013% CPU sustained
 
 **When to use:**
+
 - Development databases
 - Staging environments
 - Testing and QA systems
@@ -654,9 +696,11 @@ SELECT flight_recorder.apply_profile('development');
 ```
 
 #### `troubleshooting` - Aggressive Collection During Incidents
+
 **Use case:** Active incident response requiring detailed data
 
 **Key settings:**
+
 - Sample interval: 60s (every minute, 2h retention) - high frequency
 - Load shedding and throttling **disabled** (collect even under load)
 - All collectors enabled
@@ -665,6 +709,7 @@ SELECT flight_recorder.apply_profile('development');
 - Overhead: ~0.04% CPU sustained
 
 **When to use:**
+
 - Active performance incidents
 - Debugging intermittent issues
 - Root cause analysis
@@ -681,9 +726,11 @@ SELECT flight_recorder.apply_profile('default');
 ```
 
 #### `minimal_overhead` - Absolute Minimum Footprint
+
 **Use case:** Resource-constrained systems, replicas, or minimal monitoring needs
 
 **Key settings:**
+
 - Sample interval: 300s (every 5 minutes, 10h retention)
 - Very aggressive load shedding (50% connection threshold)
 - Higher idle threshold (10 vs 5 connections)
@@ -692,6 +739,7 @@ SELECT flight_recorder.apply_profile('default');
 - Overhead: ~0.008% CPU sustained
 
 **When to use:**
+
 - Replicas (monitoring followers)
 - Resource-constrained systems (< 4 CPU cores, < 8GB RAM)
 - Cost-sensitive deployments
@@ -702,9 +750,11 @@ SELECT flight_recorder.apply_profile('minimal_overhead');
 ```
 
 #### `high_ddl` - Optimized for Frequent Schema Changes
+
 **Use case:** Multi-tenant SaaS or systems with high DDL frequency
 
 **Key settings:**
+
 - Sample interval: 180s (every 3 minutes, 6h retention)
 - Snapshot-based collection (critical for DDL safety)
 - Lock timeout strategy: `skip_if_locked` (pre-checks for DDL locks)
@@ -714,6 +764,7 @@ SELECT flight_recorder.apply_profile('minimal_overhead');
 - Overhead: ~0.013% CPU sustained
 
 **When to use:**
+
 - Multi-tenant SaaS with per-tenant schemas
 - Systems with >10 DDL operations per hour
 - Migration-heavy workloads
@@ -737,6 +788,7 @@ SELECT flight_recorder.apply_profile('high_ddl');
 ### Advanced Usage
 
 **Check current configuration match:**
+
 ```sql
 -- See which profile you're closest to
 SELECT * FROM flight_recorder.get_current_profile();
@@ -748,6 +800,7 @@ SELECT * FROM flight_recorder.get_current_profile();
 ```
 
 **Preview changes before applying:**
+
 ```sql
 -- See exactly what will change
 SELECT * FROM flight_recorder.explain_profile('production_safe')
@@ -763,6 +816,7 @@ ORDER BY setting_key;
 ```
 
 **Combine profiles with manual overrides:**
+
 ```sql
 -- Apply profile as base
 SELECT flight_recorder.apply_profile('production_safe');
@@ -779,24 +833,28 @@ SELECT * FROM flight_recorder.get_current_profile();
 ### Recommended Workflow
 
 **Initial deployment:**
+
 1. Install with defaults: `psql -f install.sql`
 2. Optionally apply environment-specific profile
 3. Monitor for 24-48 hours
 4. Adjust if needed
 
 **Production rollout:**
+
 1. Test in staging with `development` profile
 2. Deploy to production with `production_safe` profile
 3. Monitor collection stats: `SELECT * FROM flight_recorder.health_check();`
 4. After 1 week, consider upgrading to `default` if overhead is acceptable
 
 **Incident response:**
+
 1. Switch to `troubleshooting` profile during active incident
 2. Collect detailed data for 10-15 minutes
 3. Switch back to previous profile after incident
 4. Analyze collected data at leisure
 
 **Cost optimization:**
+
 1. Start with `default` profile
 2. If overhead is concern, try `production_safe`
 3. If still too much, use `minimal_overhead`
@@ -848,6 +906,7 @@ Key settings:
 Every collection acquires AccessShareLock on system catalogs (pg_stat_activity, pg_locks, etc.). This is generally harmless.
 
 **Catalog Lock Minimization:**
+
 - **Snapshot-based collection** (enabled by default): Creates temp table copy of `pg_stat_activity` once, then all sections query the temp table instead of the catalog. Reduces catalog locks from 3 to 1 per sample (67% reduction).
 - **OID storage**: Stores relation OIDs instead of names in `lock_samples_ring.locked_relation_oid`, avoiding `pg_class` joins during collection. Name resolution happens at query time in views using `::regclass` cast.
 
@@ -874,6 +933,7 @@ Default `lock_timeout` = 100ms:
 **✓ VALIDATED: DDL blocking is negligible with snapshot-based collection**
 
 **Test Results** (Supabase Micro, PostgreSQL 17.6, 180s intervals):
+
 - 202 DDL operations (ALTER TABLE, CREATE INDEX, DROP, VACUUM)
 - **0% blocking rate** - No DDL operations delayed
 - Mean DDL duration: 1.61ms (unchanged whether concurrent with collection or not)
@@ -884,11 +944,13 @@ Default `lock_timeout` = 100ms:
 **If You Experience DDL Issues:**
 
 Multi-tenant SaaS with *extremely* high DDL rates may see symptoms:
+
 - `collection_stats` shows frequent `lock_timeout` errors
 - Circuit breaker trips repeatedly
 - Auto-mode switches to emergency mode
 
 **Mitigations:**
+
 ```sql
 -- Option 1: Reduce lock_timeout further (fail even faster)
 UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
@@ -901,6 +963,7 @@ SELECT flight_recorder.disable();
 ```
 
 **Check for lock failures:**
+
 ```sql
 SELECT
     collection_type,
@@ -913,6 +976,7 @@ GROUP BY collection_type;
 ```
 
 **Run DDL Impact Test:**
+
 ```bash
 cd benchmark
 ./measure_ddl_impact.sh 300 180  # 5 min test
@@ -931,11 +995,13 @@ Flight recorder includes advanced features to reduce overhead and catalog lock c
 **Status:** ✓ Enabled by default
 
 **Impact:**
+
 - Catalog locks: 3 → 1 per sample (67% reduction)
 - Overhead: Negligible (temp table is ~100KB for 100 connections)
 - Consistency: All sections see same snapshot (more accurate)
 
 **To disable (not recommended):**
+
 ```sql
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'snapshot_based_collection';
 ```
@@ -949,21 +1015,25 @@ UPDATE flight_recorder.config SET value = 'false' WHERE key = 'snapshot_based_co
 **Status:** ✓ Enabled by default
 
 **Impact:**
+
 - Overhead during idle: ~0% (skips collection)
 - Overhead during busy: 0.013-0.018% (unchanged)
 - Average overhead: Reduced 40-60% for workloads with idle periods
 
 **Trade-offs:**
+
 - May miss the *start* of an incident (first sample after idle period)
 - Non-uniform sampling (gaps in data during idle periods)
 - For 24/7 high-load systems, this provides no benefit (rarely idle)
 
 **To disable (if you need uniform sampling):**
+
 ```sql
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'adaptive_sampling';
 ```
 
 **Adjust threshold:**
+
 ```sql
 -- Skip if < N active connections (default: 5)
 UPDATE flight_recorder.config SET value = '10' WHERE key = 'adaptive_sampling_idle_threshold';
@@ -980,6 +1050,7 @@ To reduce overhead further, use `set_mode('emergency')` to disable lock collecti
 **Purpose:** Reduce memory pressure on pg_stat_statements hash table
 
 **Configure:**
+
 ```sql
 -- Collection interval (default: every 15 minutes)
 UPDATE flight_recorder.config SET value = '15' WHERE key = 'statements_interval_minutes';
@@ -989,12 +1060,14 @@ UPDATE flight_recorder.config SET value = '20' WHERE key = 'statements_top_n';
 ```
 
 **Impact:**
+
 - Default: 20 queries × 96 snapshots/day = 1,920 rows/day
 - Old default: 50 queries × 288 snapshots/day = 14,400 rows/day (87% reduction)
 
 ## Diagnostic Patterns
 
 ### Lock Contention
+
 ```sql
 -- Symptoms: batch 10x slower than expected
 SELECT * FROM flight_recorder.recent_locks
@@ -1005,6 +1078,7 @@ WHERE wait_event_type = 'Lock';
 ```
 
 ### Buffer Pressure
+
 ```sql
 -- Symptoms: compare() shows bgw_buffers_backend_delta > 0
 SELECT * FROM flight_recorder.compare('...', '...');
@@ -1012,6 +1086,7 @@ SELECT * FROM flight_recorder.compare('...', '...');
 ```
 
 ### Checkpoint Issues
+
 ```sql
 -- Symptoms: I/O spikes, slow commits
 SELECT * FROM flight_recorder.compare('...', '...');
@@ -1019,6 +1094,7 @@ SELECT * FROM flight_recorder.compare('...', '...');
 ```
 
 ### Work_mem Exhaustion
+
 ```sql
 -- Symptoms: slow sorts/joins
 SELECT * FROM flight_recorder.compare('...', '...');
@@ -1068,6 +1144,7 @@ Traditional benchmarking asks: "Does this feature reduce TPS by 2%?"
 We ask instead: **"Does your system have X milliseconds of CPU headroom every 180 seconds?"**
 
 This reframes the question correctly:
+
 - ✓ Measure: Collection takes 150ms of CPU time
 - ✓ Calculate: At 180s intervals = 0.08% sustained CPU
 - ✓ Assess: Do you have 150ms spare capacity every 3 minutes?
@@ -1078,6 +1155,7 @@ This reframes the question correctly:
 **The Math:**
 
 If one collection = 150ms:
+
 - At 180s intervals = 150ms / 180,000ms = **0.083% sustained CPU**
 - At 120s intervals = 150ms / 120,000ms = **0.125% sustained CPU**
 - At 60s intervals = 150ms / 60,000ms = **0.250% sustained CPU**
@@ -1087,11 +1165,13 @@ This is **constant** regardless of your workload.
 **It's About Headroom:**
 
 The question isn't "will this slow down my database?" but rather:
+
 - On a tiny system (1 vCPU): Is 150ms every 180s too much?
 - On a loaded system (95% CPU): Will brief 150ms spikes cause problems?
 - On a large idle system: Obviously fine (plenty of headroom)
 
 **Two regimes matter:**
+
 1. **Tiny systems** - Constrained headroom even at idle
 2. **Heavily loaded systems** - Constrained headroom despite size
 
@@ -1105,6 +1185,7 @@ cd benchmark
 ```
 
 **Measures:**
+
 - CPU time per collection (mean, p50, p95, p99)
 - I/O operations per collection
 - Memory usage during collection
@@ -1140,6 +1221,7 @@ Result: SAFE even on smallest Supabase tier
 ```
 
 **No need for:**
+
 - ✗ Expensive cloud hardware
 - ✗ Complex workload simulation
 - ✗ Hours of runtime
@@ -1150,11 +1232,13 @@ Just measure the actual cost directly.
 ### Validation Workflow
 
 **1. Measure on laptop (5 minutes):**
+
 ```bash
 ./benchmark/measure_absolute.sh
 ```
 
 **2. Test in staging:**
+
 ```sql
 -- Install and monitor
 \i install.sql
@@ -1162,6 +1246,7 @@ SELECT * FROM flight_recorder.preflight_check();
 ```
 
 Watch for:
+
 - Collections timing out (check logs)
 - CPU spikes correlating with collections
 - Load shedding/throttling messages (normal under load)
@@ -1169,6 +1254,7 @@ Watch for:
 **3. Production rollout (gradual):**
 
 Start conservative, then relax if comfortable:
+
 ```sql
 -- Start with emergency mode (300s intervals)
 SELECT flight_recorder.apply_profile('production_safe');
@@ -1221,6 +1307,7 @@ DROP SCHEMA flight_recorder CASCADE;
 ```
 
 Or use `uninstall.sql`:
+
 ```bash
 psql -f uninstall.sql
 ```
