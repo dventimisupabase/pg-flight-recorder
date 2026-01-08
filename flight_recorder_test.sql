@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(140);  -- Ring buffer + Profiles: 139 assertions + finish()
+SELECT plan(145);  -- Ring buffer + Profiles: 125 base + 15 profile + 5 extra
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -826,12 +826,14 @@ SELECT lives_ok(
 -- Test explain_profile rejects invalid profile
 SELECT throws_ok(
     $$SELECT * FROM flight_recorder.explain_profile('invalid_profile')$$,
+    'Unknown profile: invalid_profile. Run flight_recorder.list_profiles() to see available profiles.',
     'Profiles: explain_profile should reject invalid profile name'
 );
 
 -- Test apply_profile rejects invalid profile
 SELECT throws_ok(
     $$SELECT * FROM flight_recorder.apply_profile('invalid_profile')$$,
+    'Unknown profile: invalid_profile. Run flight_recorder.list_profiles() to see available profiles.',
     'Profiles: apply_profile should reject invalid profile name'
 );
 

@@ -3940,7 +3940,7 @@ BEGIN
             
             -- Profile: development (balanced for staging/dev)
             ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
-            ('development', 'adaptive_sampling', 'false', 'Always collect (don\'t skip when idle)'),
+            ('development', 'adaptive_sampling', 'false', 'Always collect (never skip when idle)'),
             ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
             ('development', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
             ('development', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
@@ -3956,7 +3956,7 @@ BEGIN
             ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
             ('troubleshooting', 'load_throttle_enabled', 'false', 'Collect even during I/O pressure'),
             ('troubleshooting', 'circuit_breaker_enabled', 'true', 'Keep circuit breaker enabled'),
-            ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold (2s)'),
+            ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold - 2 seconds'),
             ('troubleshooting', 'enable_locks', 'true', 'Collect all lock data'),
             ('troubleshooting', 'enable_progress', 'true', 'Collect all progress data'),
             ('troubleshooting', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
@@ -3994,7 +3994,7 @@ BEGIN
             ('high_ddl', 'check_ddl_before_collection', 'true', 'Pre-check for DDL locks'),
             ('high_ddl', 'retention_snapshots_days', '30', 'Keep 30 days'),
             ('high_ddl', 'aggregate_retention_days', '7', 'Keep 7 days')
-        ) AS t(profile, key, value, desc)
+        ) AS t(profile, key, value, description)
         WHERE profile = p_profile_name
     )
     SELECT
@@ -4002,7 +4002,7 @@ BEGIN
         c.value::text AS current_value,
         ps.value::text AS profile_value,
         (c.value IS DISTINCT FROM ps.value)::boolean AS will_change,
-        ps.desc::text AS description
+        ps.description::text AS description
     FROM profile_settings ps
     LEFT JOIN flight_recorder.config c ON c.key = ps.key
     ORDER BY will_change DESC, ps.key;
@@ -4182,14 +4182,14 @@ BEGIN
     -- Check each profile and find best match
     FOR v_profile IN SELECT profile_name FROM flight_recorder.list_profiles() LOOP
         WITH profile_settings AS (
-            SELECT key, profile_value
+            SELECT setting_key, profile_value
             FROM flight_recorder.explain_profile(v_profile.profile_name)
         ),
         matches AS (
             SELECT
                 count(*) FILTER (WHERE NOT will_change) AS matched,
                 count(*) AS total,
-                array_agg(key) FILTER (WHERE will_change) AS diff_keys
+                array_agg(setting_key) FILTER (WHERE will_change) AS diff_keys
             FROM flight_recorder.explain_profile(v_profile.profile_name)
         )
         SELECT
@@ -4209,7 +4209,7 @@ BEGIN
     SELECT
         COALESCE(v_best_match, 'custom')::text,
         COALESCE(v_best_pct, 0)::numeric,
-        (SELECT array_agg(key) FROM flight_recorder.explain_profile(v_best_match) WHERE will_change)::text[],
+        (SELECT array_agg(setting_key) FROM flight_recorder.explain_profile(v_best_match) WHERE will_change)::text[],
         CASE
             WHEN v_best_pct = 100 THEN 'Configuration matches "' || v_best_match || '" profile perfectly'
             WHEN v_best_pct >= 80 THEN 'Configuration is close to "' || v_best_match || '" profile'
