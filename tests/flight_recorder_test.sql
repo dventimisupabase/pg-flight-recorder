@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(118);  -- Total number of tests (removed 13 per-table tracking tests)
+SELECT plan(128);  -- Updated for ring buffer architecture (added aggregate tables + new functions)
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -15,58 +15,52 @@ SELECT plan(118);  -- Total number of tests (removed 13 per-table tracking tests
 -- Test schema exists
 SELECT has_schema('flight_recorder', 'Schema flight_recorder should exist');
 
--- Test all 10 tables exist (9 original + 1 collection_stats)
+-- Test all 14 tables exist (snapshots + ring buffers + aggregates + config + collection_stats)
 SELECT has_table('flight_recorder', 'snapshots', 'Table flight_recorder.snapshots should exist');
 SELECT has_table('flight_recorder', 'replication_snapshots', 'Table flight_recorder.replication_snapshots should exist');
 SELECT has_table('flight_recorder', 'statement_snapshots', 'Table flight_recorder.statement_snapshots should exist');
-SELECT has_table('flight_recorder', 'samples', 'Table flight_recorder.samples should exist');
-SELECT has_table('flight_recorder', 'wait_samples', 'Table flight_recorder.wait_samples should exist');
-SELECT has_table('flight_recorder', 'activity_samples', 'Table flight_recorder.activity_samples should exist');
-SELECT has_table('flight_recorder', 'progress_samples', 'Table flight_recorder.progress_samples should exist');
-SELECT has_table('flight_recorder', 'lock_samples', 'Table flight_recorder.lock_samples should exist');
+-- TIER 1: Ring buffers (UNLOGGED)
+SELECT has_table('flight_recorder', 'samples_ring', 'TIER 1: Table flight_recorder.samples_ring should exist');
+SELECT has_table('flight_recorder', 'wait_samples_ring', 'TIER 1: Table flight_recorder.wait_samples_ring should exist');
+SELECT has_table('flight_recorder', 'activity_samples_ring', 'TIER 1: Table flight_recorder.activity_samples_ring should exist');
+SELECT has_table('flight_recorder', 'lock_samples_ring', 'TIER 1: Table flight_recorder.lock_samples_ring should exist');
+-- TIER 2: Aggregates (REGULAR/durable)
+SELECT has_table('flight_recorder', 'wait_event_aggregates', 'TIER 2: Table flight_recorder.wait_event_aggregates should exist');
+SELECT has_table('flight_recorder', 'lock_aggregates', 'TIER 2: Table flight_recorder.lock_aggregates should exist');
+SELECT has_table('flight_recorder', 'query_aggregates', 'TIER 2: Table flight_recorder.query_aggregates should exist');
+-- Config and monitoring
 SELECT has_table('flight_recorder', 'config', 'Table flight_recorder.config should exist');
 SELECT has_table('flight_recorder', 'collection_stats', 'P0 Safety: Table flight_recorder.collection_stats should exist');
 
--- Test Foreign Keys (Ensure partitioning support)
--- Using manual catalog check because pgTAP's fk_ok has issues with partitioned tables in this env
+-- Test Foreign Keys (Ring buffer child tables reference master samples_ring)
 SELECT ok(
     EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flight_recorder.wait_samples'::regclass
-          AND confrelid = 'flight_recorder.samples'::regclass
+        WHERE conrelid = 'flight_recorder.wait_samples_ring'::regclass
+          AND confrelid = 'flight_recorder.samples_ring'::regclass
           AND contype = 'f'
     ),
-    'wait_samples should have FK to samples'
+    'wait_samples_ring should have FK to samples_ring'
 );
 
 SELECT ok(
     EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flight_recorder.activity_samples'::regclass
-          AND confrelid = 'flight_recorder.samples'::regclass
+        WHERE conrelid = 'flight_recorder.activity_samples_ring'::regclass
+          AND confrelid = 'flight_recorder.samples_ring'::regclass
           AND contype = 'f'
     ),
-    'activity_samples should have FK to samples'
+    'activity_samples_ring should have FK to samples_ring'
 );
 
 SELECT ok(
     EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flight_recorder.progress_samples'::regclass
-          AND confrelid = 'flight_recorder.samples'::regclass
+        WHERE conrelid = 'flight_recorder.lock_samples_ring'::regclass
+          AND confrelid = 'flight_recorder.samples_ring'::regclass
           AND contype = 'f'
     ),
-    'progress_samples should have FK to samples'
-);
-
-SELECT ok(
-    EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flight_recorder.lock_samples'::regclass
-          AND confrelid = 'flight_recorder.samples'::regclass
-          AND contype = 'f'
-    ),
-    'lock_samples should have FK to samples'
+    'lock_samples_ring should have FK to samples_ring'
 );
 
 -- Test all 6 views exist
@@ -97,6 +91,9 @@ SELECT has_function('flight_recorder', 'summary_report', 'Function flight_record
 SELECT has_function('flight_recorder', 'get_mode', 'Function flight_recorder.get_mode should exist');
 SELECT has_function('flight_recorder', 'set_mode', 'Function flight_recorder.set_mode should exist');
 SELECT has_function('flight_recorder', 'cleanup', 'Function flight_recorder.cleanup should exist');
+-- Ring buffer functions
+SELECT has_function('flight_recorder', 'flush_ring_to_aggregates', 'TIER 2: Function flight_recorder.flush_ring_to_aggregates should exist');
+SELECT has_function('flight_recorder', 'cleanup_aggregates', 'TIER 2: Function flight_recorder.cleanup_aggregates should exist');
 
 -- =============================================================================
 -- 3. CORE FUNCTIONALITY (10 tests)
@@ -120,21 +117,21 @@ SELECT lives_ok(
     'sample() function should execute without error'
 );
 
--- Verify sample was captured
+-- Verify sample was captured in ring buffer
 SELECT ok(
-    (SELECT count(*) FROM flight_recorder.samples) >= 1,
-    'At least one sample should be captured'
+    (SELECT count(*) FROM flight_recorder.samples_ring WHERE captured_at > '2020-01-01') >= 1,
+    'At least one sample should be captured in ring buffer'
 );
 
--- Test wait_samples captured
+-- Test wait_samples_ring captured
 SELECT ok(
-    (SELECT count(*) FROM flight_recorder.wait_samples) >= 1,
+    (SELECT count(*) FROM flight_recorder.wait_samples_ring) >= 1,
     'Wait samples should be captured'
 );
 
--- Test activity_samples captured
+-- Test activity_samples_ring captured
 SELECT ok(
-    (SELECT count(*) FROM flight_recorder.activity_samples) >= 0,
+    (SELECT count(*) FROM flight_recorder.activity_samples_ring) >= 0,
     'Activity samples table should be queryable (may be empty)'
 );
 
@@ -165,6 +162,75 @@ SELECT is(
 );
 
 -- =============================================================================
+-- 3A. RING BUFFER ARCHITECTURE (10 tests)
+-- =============================================================================
+
+-- Test ring buffer slot initialization (120 slots, 0-119)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.samples_ring) = 120,
+    'Ring buffer should have exactly 120 slots initialized'
+);
+
+SELECT ok(
+    (SELECT min(slot_id) FROM flight_recorder.samples_ring) = 0,
+    'Ring buffer min slot_id should be 0'
+);
+
+SELECT ok(
+    (SELECT max(slot_id) FROM flight_recorder.samples_ring) = 119,
+    'Ring buffer max slot_id should be 119'
+);
+
+-- Test flush_ring_to_aggregates() function
+SELECT lives_ok(
+    $$SELECT flight_recorder.flush_ring_to_aggregates()$$,
+    'flush_ring_to_aggregates() should execute without error'
+);
+
+-- Verify aggregates were created
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.wait_event_aggregates) >= 1,
+    'At least one wait event aggregate should be created after flush'
+);
+
+-- Test cleanup_aggregates() function
+SELECT lives_ok(
+    $$SELECT flight_recorder.cleanup_aggregates()$$,
+    'cleanup_aggregates() should execute without error'
+);
+
+-- Test cleanup_aggregates() with old data
+DO $$
+BEGIN
+    -- Insert old test data (10 days ago)
+    INSERT INTO flight_recorder.wait_event_aggregates
+    (start_time, end_time, backend_type, wait_event_type, wait_event, state, sample_count, total_waiters, avg_waiters, max_waiters, pct_of_samples)
+    VALUES
+    (now() - interval '10 days', now() - interval '10 days', 'client backend', 'Running', 'CPU', 'active', 1, 1, 1, 1, 100);
+END $$;
+
+-- Verify old data exists before cleanup
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.wait_event_aggregates WHERE start_time < now() - interval '7 days') >= 1,
+    'Old test aggregate should exist before cleanup'
+);
+
+-- Run cleanup
+SELECT flight_recorder.cleanup_aggregates();
+
+-- Verify old data was deleted (default 7 day retention)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.wait_event_aggregates WHERE start_time < now() - interval '7 days') = 0,
+    'Old aggregates should be deleted by cleanup_aggregates() with 7 day retention'
+);
+
+-- Verify recent data was NOT deleted
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.wait_event_aggregates WHERE start_time >= now() - interval '1 day') >= 0,
+    'Recent aggregates should be preserved by cleanup_aggregates()'
+);
+
+-- =============================================================================
 -- 4. ANALYSIS FUNCTIONS (8 tests)
 -- =============================================================================
 
@@ -179,8 +245,8 @@ DECLARE
     v_start_time TIMESTAMPTZ;
     v_end_time TIMESTAMPTZ;
 BEGIN
-    SELECT min(captured_at) INTO v_start_time FROM flight_recorder.samples;
-    SELECT max(captured_at) INTO v_end_time FROM flight_recorder.samples;
+    SELECT min(captured_at) INTO v_start_time FROM flight_recorder.samples_ring;
+    SELECT max(captured_at) INTO v_end_time FROM flight_recorder.samples_ring;
 
     -- Store for later tests
     CREATE TEMP TABLE test_times (start_time TIMESTAMPTZ, end_time TIMESTAMPTZ);
