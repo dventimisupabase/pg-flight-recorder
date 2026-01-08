@@ -233,6 +233,26 @@ Stability: EXCELLENT
   - 99% of collections complete within 86ms
 ```
 
+**Supabase Micro Instance** (t4g.nano, 2 core ARM, 1GB RAM, PostgreSQL 17.6):
+
+Validated over 59 collections across 10 minutes:
+
+```
+Collection execution time: 32ms (median/P50)
+Mean: 36.6ms ± 23.3ms (stddev)
+P95: 46ms (95% complete within this time)
+P99: 118ms (99% complete within this time)
+I/O per collection: ~5,381 blocks (mostly cached reads)
+
+At 180s intervals:
+  Sustained CPU: 0.018% (32ms / 180,000ms)
+  Peak impact: Brief 32ms spike every 3 minutes
+
+Headroom Assessment:
+  ✓ Supabase free tier: SAFE - only 32ms every 3 minutes
+  ✓ Resource-constrained systems: VALIDATED - works great even on 2 core/1GB
+```
+
 **Your mileage may vary.** Run `./benchmark/measure_absolute.sh` to measure in your environment.
 
 | Mode | Interval | Collections/Day | Sections | Timeout | Measured Cost* | Notes |
