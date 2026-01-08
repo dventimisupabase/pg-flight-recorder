@@ -3230,44 +3230,6 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
--- Partition Management Functions
--- -----------------------------------------------------------------------------
-
--- Create future partitions for samples table (daily partitions)
--- Partition management is no longer needed - ring buffers are self-managing
-CREATE OR REPLACE FUNCTION flight_recorder.create_partitions(p_days_ahead INTEGER DEFAULT 3)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-BEGIN
-    RETURN 'This function is deprecated. Ring buffer architecture (v2.0+) does not use partitions. Ring buffers are self-managing with fixed memory footprint.';
-END;
-$$;
-
--- Drop old partitions (more efficient than DELETE for partitioned tables)
-CREATE OR REPLACE FUNCTION flight_recorder.drop_old_partitions(p_retention_days INTEGER DEFAULT NULL)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-BEGIN
-    RETURN 'This function is deprecated. Ring buffer architecture (v2.0+) does not use partitions. Ring buffers self-clean automatically using modular arithmetic. Use cleanup_aggregates() for TIER 2 aggregate cleanup.';
-END;
-$$;
-
--- List all partitions with sizes
-CREATE OR REPLACE FUNCTION flight_recorder.list_partitions()
-RETURNS TABLE(
-    partition_name TEXT,
-    partition_date DATE,
-    size_pretty TEXT,
-    row_count BIGINT
-)
-LANGUAGE plpgsql AS $$
-BEGIN
-    RAISE NOTICE 'This function is deprecated. Ring buffer architecture (v2.0+) does not use partitions. Use: SELECT * FROM flight_recorder.samples_ring to view ring buffer slots.';
-    RETURN;
-END;
-$$;
-
--- -----------------------------------------------------------------------------
 -- flight_recorder.disable() - Emergency kill switch: stop all collection
 -- -----------------------------------------------------------------------------
 
@@ -3291,9 +3253,8 @@ BEGIN
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_cleanup');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
 
-        -- Unschedule partition creation
-        PERFORM cron.unschedule('flight_recorder_partition')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_partition');
+        PERFORM cron.unschedule('flight_recorder_flush')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_flush');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
 
         -- Mark as disabled in config
@@ -3413,10 +3374,10 @@ BEGIN
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_snapshot');
         PERFORM cron.unschedule('flight_recorder_sample')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_sample');
+        PERFORM cron.unschedule('flight_recorder_flush')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_flush');
         PERFORM cron.unschedule('flight_recorder_cleanup')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_cleanup');
-        PERFORM cron.unschedule('flight_recorder_partition')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_partition');
     EXCEPTION
         WHEN undefined_table THEN NULL;
         WHEN undefined_function THEN NULL;
@@ -3484,140 +3445,6 @@ EXCEPTION
         RAISE NOTICE 'pg_cron extension not found. Automatic scheduling disabled. Run flight_recorder.snapshot() and flight_recorder.sample() manually or via external scheduler.';
     WHEN undefined_function THEN
         RAISE NOTICE 'pg_cron extension not found. Automatic scheduling disabled. Run flight_recorder.snapshot() and flight_recorder.sample() manually or via external scheduler.';
-END;
-$$;
-
--- -----------------------------------------------------------------------------
--- P2: Partition Management Helpers (Optional)
--- -----------------------------------------------------------------------------
--- These functions help set up time-based partitioning for samples and snapshots
--- tables. Partitioning improves performance and makes cleanup faster (DROP vs DELETE).
---
--- WARNING: Converting existing tables to partitioned tables requires data migration.
--- Only use these functions on NEW installs or follow proper migration procedure.
--- -----------------------------------------------------------------------------
-
--- P2: Create next time-based partition for samples or snapshots
-CREATE OR REPLACE FUNCTION flight_recorder.create_next_partition(
-    p_table_name TEXT,  -- 'samples' or 'snapshots'
-    p_partition_interval TEXT DEFAULT 'day'  -- 'day' or 'week'
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_next_date DATE;
-    v_partition_name TEXT;
-    v_from_date DATE;
-    v_to_date DATE;
-BEGIN
-    -- Validate table name
-    IF p_table_name NOT IN ('samples', 'snapshots') THEN
-        RAISE EXCEPTION 'Invalid table name: %. Must be ''samples'' or ''snapshots''', p_table_name;
-    END IF;
-
-    -- Validate interval
-    IF p_partition_interval NOT IN ('day', 'week') THEN
-        RAISE EXCEPTION 'Invalid partition interval: %. Must be ''day'' or ''week''', p_partition_interval;
-    END IF;
-
-    -- Calculate next partition dates
-    v_next_date := CURRENT_DATE + interval '1 day';
-
-    IF p_partition_interval = 'day' THEN
-        v_from_date := v_next_date;
-        v_to_date := v_next_date + interval '1 day';
-        v_partition_name := format('flight_recorder.%s_%s', p_table_name, to_char(v_from_date, 'YYYYMMDD'));
-    ELSE  -- week
-        v_from_date := date_trunc('week', v_next_date + interval '1 week')::date;
-        v_to_date := v_from_date + interval '1 week';
-        v_partition_name := format('flight_recorder.%s_%s', p_table_name, to_char(v_from_date, 'YYYYMMDD'));
-    END IF;
-
-    -- Create partition
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %s PARTITION OF flight_recorder.%I FOR VALUES FROM (%L) TO (%L)',
-        v_partition_name, p_table_name, v_from_date, v_to_date
-    );
-
-    RETURN format('Created partition %s for dates %s to %s', v_partition_name, v_from_date, v_to_date);
-END;
-$$;
-
--- P2: Drop old partitions (faster than DELETE for cleanup)
-CREATE OR REPLACE FUNCTION flight_recorder.drop_old_partitions(
-    p_table_name TEXT,  -- 'samples' or 'snapshots'
-    p_retain_interval INTERVAL DEFAULT '7 days'
-)
-RETURNS TABLE(
-    partition_name TEXT,
-    dropped BOOLEAN
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_cutoff_date DATE;
-    v_partition_record RECORD;
-    v_partition_date DATE;
-BEGIN
-    -- Validate table name
-    IF p_table_name NOT IN ('samples', 'snapshots') THEN
-        RAISE EXCEPTION 'Invalid table name: %. Must be ''samples'' or ''snapshots''', p_table_name;
-    END IF;
-
-    v_cutoff_date := (now() - p_retain_interval)::date;
-
-    -- Find and drop old partitions
-    FOR v_partition_record IN
-        SELECT
-            c.relname,
-            pg_get_expr(c.relpartbound, c.oid) as partition_bound
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_inherits i ON i.inhrelid = c.oid
-        JOIN pg_class p ON p.oid = i.inhparent
-        WHERE n.nspname = 'flight_recorder'
-          AND p.relname = p_table_name
-          AND c.relkind = 'r'
-    LOOP
-        -- Extract date from partition name (format: tablename_YYYYMMDD)
-        BEGIN
-            v_partition_date := to_date(
-                substring(v_partition_record.relname from '[0-9]{8}$'),
-                'YYYYMMDD'
-            );
-
-            IF v_partition_date < v_cutoff_date THEN
-                EXECUTE format('DROP TABLE IF EXISTS flight_recorder.%I', v_partition_record.relname);
-                RETURN QUERY SELECT v_partition_record.relname::text, true;
-            END IF;
-        EXCEPTION WHEN OTHERS THEN
-            -- Skip partitions that don't match naming convention
-            CONTINUE;
-        END;
-    END LOOP;
-END;
-$$;
-
--- P2: Check partition status and provide recommendations
-CREATE OR REPLACE FUNCTION flight_recorder.partition_status()
-RETURNS TABLE(
-    table_name TEXT,
-    is_partitioned BOOLEAN,
-    partition_count INTEGER,
-    oldest_partition TEXT,
-    newest_partition TEXT,
-    recommendation TEXT
-)
-LANGUAGE plpgsql AS $$
-BEGIN
-    -- Ring buffer architecture (v2.0+): samples table replaced with samples_ring (120 fixed slots)
-    RETURN QUERY
-    SELECT
-        'samples_ring'::text,
-        false,
-        120,
-        'Ring buffer: 120 slots (fixed)'::text,
-        'Self-cleaning via modular arithmetic'::text,
-        'Ring buffer architecture active. Fixed 120KB memory footprint, 2-hour retention at 60s intervals.'::text;
 END;
 $$;
 
@@ -4267,15 +4094,6 @@ BEGIN
             'UPDATE flight_recorder.config SET value = ''true'' WHERE key = ''auto_mode_enabled'';'::text;
     END IF;
 
-    -- Recommendation 5: Consider partitioning
-    IF v_sample_count > 100000 THEN
-        RETURN QUERY SELECT
-            'Scalability'::text,
-            'Consider implementing table partitioning'::text,
-            format('Very high sample count (%s) - partitioning improves cleanup performance', v_sample_count),
-            'See documentation for partition_status() and create_next_partition() functions.'::text;
-    END IF;
-
     -- If no recommendations, return success message
     IF NOT FOUND THEN
         RETURN QUERY SELECT
@@ -4402,8 +4220,8 @@ BEGIN
         RETURN QUERY SELECT
             'Storage Overhead'::text,
             'GO'::text,
-            'Flight recorder uses 2-3 GB per week (default 7-day retention)',
-            'UNLOGGED tables minimize WAL overhead. Daily partition cleanup prevents unbounded growth.'::text;
+            'Ring buffer uses fixed 120KB memory. Aggregates: ~2-3 GB per week (7-day retention).',
+            'UNLOGGED ring buffers minimize WAL overhead. Ring buffers self-clean automatically. Daily aggregate cleanup prevents unbounded growth.'::text;
     END;
 
     -- Check 5: pg_cron availability
