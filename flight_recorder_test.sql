@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(128);  -- Updated for ring buffer architecture (added aggregate tables + new functions)
+SELECT plan(125);  -- Ring buffer architecture: 124 assertions + finish()
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -382,11 +382,9 @@ SELECT lives_ok(
     'recent_locks view should be queryable'
 );
 
--- Test recent_progress view
-SELECT lives_ok(
-    $$SELECT * FROM flight_recorder.recent_progress LIMIT 1$$,
-    'recent_progress view should be queryable'
-);
+-- NOTE: recent_progress view removed from ring buffer architecture
+-- Progress tracking removed to minimize footprint
+-- Use pg_stat_progress_* views directly for real-time progress
 
 -- =============================================================================
 -- 8. KILL SWITCH (6 tests)
@@ -529,17 +527,14 @@ SELECT ok(
     'P1 Safety: Fresh install should have OK schema size status'
 );
 
--- Test cleanup() function now returns 3 columns including vacuumed_tables
+-- Test cleanup() function executes (VACUUM removed - autovacuum handles ring buffer)
 SELECT lives_ok(
     $$SELECT * FROM flight_recorder.cleanup('1 day')$$,
-    'P1 Safety: cleanup() with VACUUM should execute without error'
+    'P1 Safety: cleanup() should execute without error'
 );
 
--- Verify cleanup returns vacuumed_tables column
-SELECT ok(
-    (SELECT vacuumed_tables FROM flight_recorder.cleanup('1 day')) >= 0,
-    'P1 Safety: cleanup() should return vacuum count'
-);
+-- NOTE: vacuumed_tables column removed - ring buffer self-cleans via UPSERT
+-- Aggressive autovacuum settings handle dead tuples automatically
 
 -- =============================================================================
 -- 10. P2 SAFETY FEATURES (12 tests)
@@ -589,27 +584,14 @@ SELECT ok(
     'P2: Statements retention config should exist'
 );
 
--- Test P2: cleanup() now returns 4 columns (added deleted_statements)
+-- Test P2: cleanup() now returns 3 columns (removed vacuumed_tables)
 SELECT lives_ok(
-    $$SELECT deleted_snapshots, deleted_samples, deleted_statements, vacuumed_tables FROM flight_recorder.cleanup()$$,
-    'P2: cleanup() should return 4 columns with configurable retention'
+    $$SELECT deleted_snapshots, deleted_samples, deleted_statements FROM flight_recorder.cleanup()$$,
+    'P2: cleanup() should return 3 columns with configurable retention'
 );
 
--- Test P2: Partition management functions exist
-SELECT has_function(
-    'flight_recorder', 'create_next_partition',
-    'P2: Function flight_recorder.create_next_partition should exist'
-);
-
-SELECT has_function(
-    'flight_recorder', 'drop_old_partitions',
-    'P2: Function flight_recorder.drop_old_partitions should exist'
-);
-
-SELECT has_function(
-    'flight_recorder', 'partition_status',
-    'P2: Function flight_recorder.partition_status should exist'
-);
+-- NOTE: Partition management functions removed (ring buffer architecture)
+-- Ring buffer uses modular arithmetic (120 slots), no partition management needed
 
 -- =============================================================================
 -- 11. P3 FEATURES - Self-Monitoring and Health Checks (9 tests)

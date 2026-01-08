@@ -1655,10 +1655,15 @@ BEGIN
     -- P0 Safety: Record successful completion
     PERFORM flight_recorder._record_collection_end(v_stat_id, true, NULL);
 
+    -- Reset statement_timeout to avoid affecting subsequent queries in the session
+    PERFORM set_config('statement_timeout', '0', true);
+
     RETURN v_captured_at;
 EXCEPTION
     WHEN OTHERS THEN
         PERFORM flight_recorder._record_collection_end(v_stat_id, false, SQLERRM);
+        -- Reset statement_timeout even on failure
+        PERFORM set_config('statement_timeout', '0', true);
         RAISE WARNING 'pg-flight-recorder: Sample collection failed: %', SQLERRM;
         RETURN v_captured_at;
 END;
