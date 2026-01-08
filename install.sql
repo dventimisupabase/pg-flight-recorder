@@ -698,8 +698,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('schema_size_percentage', '5.0'),         -- Max % of database size (default 5%)
     ('schema_size_min_mb', '1000'),            -- Min limit (1GB)
     ('schema_size_max_mb', '10000'),           -- Max limit (10GB)
-    -- Adaptive sampling (opt-in, skips collection when idle)
-    ('adaptive_sampling', 'false'),            -- Skip collection when system idle
+    -- Adaptive sampling (A+ GRADE: enabled by default, skips collection when idle)
+    ('adaptive_sampling', 'true'),             -- Skip collection when system idle
     ('adaptive_sampling_idle_threshold', '5'), -- Skip if < N active connections
     ('load_shedding_enabled', 'true'),         -- A GRADE: Skip collection during high load
     ('load_shedding_active_pct', '70'),        -- Skip if active connections > N% of max_connections

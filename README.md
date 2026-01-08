@@ -68,7 +68,7 @@ SELECT flight_recorder.disable();  -- Stop immediately
 ```
 
 **Built-in protection:**
-- Skips collection when system is under load
+- Skips collection when system is idle or under load
 - Automatic circuit breaker if collections run slow
 - Fast lock timeout (100ms) - fails fast, doesn't block
 
