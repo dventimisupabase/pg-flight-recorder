@@ -83,7 +83,7 @@ for i in $(seq 1 $ITERATIONS); do
     " > /tmp/before_stats.txt
 
     # Run collection with timing
-    TIMING=$(psql -t -c "\timing on" -c "SELECT flight_recorder.sample()" 2>&1 | grep "Time:" | sed 's/Time: \([0-9.]*\) ms/\1/')
+    TIMING=$(psql -t -c "\timing on" -c "SELECT flight_recorder.sample()" 2>&1 | grep "Time:" | sed 's/Time: \([0-9.]*\).*/\1/')
 
     # Capture after stats
     psql -t -c "
