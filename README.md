@@ -45,7 +45,19 @@ Modes automatically adjust sampling frequency:
 
 ## Is It Safe?
 
-**A+ grade safety design.** Collections take ~50-200ms and run every 3 minutes by default (480x/day). Overhead claims require rigorous benchmarking - see REFERENCE.md for methodology (work in progress).
+**A+ grade safety design.** Measured overhead (PostgreSQL 17.6, 23MB database, 79 tables):
+
+**Actual Collection Costs:**
+- CPU time per collection: **52.5ms** ± 3.0ms (mean ± stddev)
+- P95 latency: 59.6ms
+- At 180s intervals: **0.029% sustained CPU** + brief 52ms spike every 3 min
+
+**Headroom Assessment:**
+- ✓ Systems with ≥2 vCPU: Negligible impact
+- ✓ Systems with 1 vCPU: Acceptable (test in staging first)
+- ⚠ Tiny systems (<1 vCPU): May cause brief spikes, monitor closely
+
+Run `./benchmark/measure_absolute.sh` to measure in your environment.
 
 **✓ Recommended for:**
 - Staging and development (always-on monitoring)

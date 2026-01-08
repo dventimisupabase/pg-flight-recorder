@@ -58,17 +58,30 @@ The question isn't "will this slow down my database?" but rather:
 - Memory usage during collection
 - Sustained CPU % at different intervals (60s, 120s, 180s)
 
-**Output:**
+**Output** (PostgreSQL 17.6, 23MB database, 79 tables, Darwin arm64):
 ```
 Collection Timing:
-  Mean:   127.3 ms ± 23.1 ms
-  P95:    168.2 ms
+  Mean:   52.5 ms ± 3.0 ms
+  Median: 51.6 ms
+  P95:    59.6 ms
+  Range:  49.3 - 59.6 ms
+
+I/O Operations:
+  Mean:   4,084 blocks
+  Median: 3,956 blocks
+  P95:    6,377 blocks
 
 Sustained CPU Impact:
-  At 180s intervals: 0.071%
+  At 60s intervals:  0.088%
+  At 120s intervals: 0.044%
+  At 180s intervals: 0.029%
 
 Peak Impact:
-  Brief 127ms CPU spike every 180 seconds
+  Brief 52.5ms CPU spike every N seconds
+
+Headroom Assessment:
+  ✓ 1 vCPU system: ACCEPTABLE - test in staging first
+  ✓ 2+ vCPU system: SAFE - negligible impact
 ```
 
 This is **reproducible** and **constant** - doesn't require expensive hardware or complex workload simulation.
@@ -89,10 +102,10 @@ These tests confirm the safety features work, not "what's the TPS impact?"
 > "Uses less than 0.1% of your CPU"
 
 ### Good (Honest):
-> **Absolute Costs** (measured on PostgreSQL 16, 100GB database, MacBook Pro M1):
-> - CPU time per collection: 127ms ± 23ms (mean ± stddev)
-> - I/O per collection: ~45 blocks
-> - At 180s intervals: 0.071% sustained CPU + brief 127ms spike every 3 min
+> **Absolute Costs** (measured on PostgreSQL 17.6, 23MB database, Darwin arm64):
+> - CPU time per collection: 52.5ms ± 3.0ms (mean ± stddev)
+> - I/O per collection: ~4,084 blocks (mostly cached reads)
+> - At 180s intervals: 0.029% sustained CPU + brief 52ms spike every 3 min
 >
 > **Headroom Assessment:**
 > - ✓ Systems with ≥2 idle CPU cores: Negligible impact
@@ -191,24 +204,24 @@ After running `measure_absolute.sh` on various systems:
 ## Overhead Measurements
 
 **Test Environment:**
-- PostgreSQL: 16.1
-- Database size: 250GB
-- Table count: 450
-- Hardware: MacBook Pro M1 (8 cores)
-- Date: 2024-01-16
+- PostgreSQL: 17.6
+- Database size: 23MB
+- Table count: 79
+- Hardware: Darwin arm64
+- Date: 2026-01-08
 
-**Absolute Costs** (100 iterations):
-- CPU time per collection: 134ms ± 18ms (mean ± stddev)
-- P95 latency: 172ms
-- I/O per collection: 52 blocks
+**Absolute Costs** (20 iterations):
+- CPU time per collection: 52.5ms ± 3.0ms (mean ± stddev)
+- P95 latency: 59.6ms
+- I/O per collection: ~4,084 blocks
 
 **Sustained Impact at 180s intervals:**
-- 0.074% sustained CPU
-- Brief 134ms spike every 3 minutes
+- 0.029% sustained CPU
+- Brief 52.5ms spike every 3 minutes
 
 **Headroom Assessment:**
-- ✓ This system: Safe for always-on use (plenty of headroom)
-- ⚠ 1 vCPU systems: Test in staging first
+- ✓ This system: Safe for always-on use (negligible impact)
+- ✓ 1 vCPU systems: Acceptable (test in staging first)
 ```
 
 ### Share Results
