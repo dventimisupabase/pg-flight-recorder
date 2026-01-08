@@ -62,7 +62,12 @@ Safe for staging (always-on), production troubleshooting, and production always-
 
 ## Health Checks
 
-Optional: `SELECT * FROM flight_recorder.preflight_check();` before you start, `quarterly_review()` every 3 months.
+Optional but recommended:
+
+```sql
+SELECT * FROM flight_recorder.preflight_check();  -- Before you start
+SELECT * FROM flight_recorder.quarterly_review(); -- Every 3 months
+```
 
 ## Uninstall
 
