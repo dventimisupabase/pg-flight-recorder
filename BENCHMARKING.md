@@ -58,7 +58,7 @@ The question isn't "will this slow down my database?" but rather:
 - Memory usage during collection
 - Sustained CPU % at different intervals (60s, 120s, 180s)
 
-**Output** (PostgreSQL 17.6, 23MB database, 79 tables, Darwin arm64):
+**Output Example 1** (MacBook Pro M-series, PostgreSQL 17.6, 23MB database, 79 tables):
 
 *Note: psql `\timing` measures end-to-end (including client overhead). Use `collection_stats` table for actual server-side execution time.*
 
@@ -92,7 +92,33 @@ Headroom Assessment:
   ✓ 2+ vCPU system: SAFE - negligible impact
 ```
 
-This is **reproducible** and **constant** - doesn't require expensive hardware or complex workload simulation.
+**Output Example 2** (Supabase Micro - t4g.nano, 2 core ARM, 1GB RAM, PostgreSQL 17.6):
+
+```
+Actual Collection Execution (from 59 real collections over 10 minutes):
+  Median: 32.0 ms (P50)
+  Mean:   36.6 ms ± 23.3 ms (stddev)
+  P95:    46.1 ms (95% complete within this time)
+  P99:    118.4 ms (99% complete within this time)
+  Range:  31 - 210 ms
+
+I/O Operations:
+  Mean:   ~5,381 blocks (mostly cached reads)
+
+Sustained CPU Impact:
+  At 60s intervals:  0.061% (32ms / 60,000ms)
+  At 120s intervals: 0.031% (32ms / 120,000ms)
+  At 180s intervals: 0.018% (32ms / 180,000ms)
+
+Peak Impact:
+  Brief 32ms CPU spike every N seconds
+
+Headroom Assessment:
+  ✓ Supabase free tier: SAFE - only 32ms every 3 minutes
+  ✓ Resource-constrained systems: VALIDATED - works great even on 2 core/1GB
+```
+
+This is **reproducible** and **constant** - doesn't require expensive hardware or complex workload simulation. The Supabase micro instance validates that it works well even on resource-constrained environments.
 
 ### Secondary Testing: Safety Feature Validation
 
@@ -210,6 +236,8 @@ After running `measure_absolute.sh` on various systems:
 
 ### Report Template
 
+**Example 1: MacBook Pro**
+
 ```markdown
 ## Overhead Measurements
 
@@ -217,7 +245,7 @@ After running `measure_absolute.sh` on various systems:
 - PostgreSQL: 17.6
 - Database size: 23MB
 - Table count: 79
-- Hardware: Darwin arm64
+- Hardware: MacBook Pro M-series (Darwin arm64)
 - Date: 2026-01-08
 
 **Absolute Costs** (315 collections over 30 minutes):
@@ -238,6 +266,34 @@ After running `measure_absolute.sh` on various systems:
 **Headroom Assessment:**
 - ✓ This system: Safe for always-on use (negligible impact)
 - ✓ 1 vCPU systems: Safe - only 23ms every 3 minutes
+```
+
+**Example 2: Supabase Micro Instance**
+
+```markdown
+## Overhead Measurements
+
+**Test Environment:**
+- PostgreSQL: 17.6
+- Database size: 23MB
+- Table count: 79
+- Hardware: Supabase Micro (t4g.nano, 2 core ARM, 1GB RAM)
+- Date: 2026-01-08
+
+**Absolute Costs** (59 collections over 10 minutes):
+- Collection execution: 32ms median (P50)
+- Mean: 36.6ms ± 23.3ms (stddev)
+- P95: 46ms, P99: 118ms
+- I/O per collection: ~5,381 blocks
+
+**Sustained Impact at 180s intervals:**
+- 0.018% sustained CPU
+- Brief 32ms spike every 3 minutes
+
+**Headroom Assessment:**
+- ✓ Supabase free tier: Safe for always-on use
+- ✓ Resource-constrained systems (2 core/1GB): VALIDATED - negligible impact
+- ✓ Production ready: Even on smallest Supabase tier, overhead is minimal
 ```
 
 ### Share Results

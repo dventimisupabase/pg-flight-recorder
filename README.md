@@ -45,19 +45,28 @@ Modes automatically adjust sampling frequency:
 
 ## Is It Safe?
 
-**A+ grade safety design.** Measured overhead (PostgreSQL 17.6, 23MB database, 79 tables):
+**A+ grade safety design.** Measured overhead across different environments:
 
-**Actual Collection Costs** (315 collections over 30 minutes):
+**MacBook Pro (M-series, PostgreSQL 17.6, 23MB database, 79 tables)**:
 - Collection execution time: **23ms** median (P50)
 - Mean: 24.9ms ± 11.5ms (stddev)
 - P95: 31ms, P99: 86ms
 - At 180s intervals: **0.013% sustained CPU** + brief 23ms spike every 3 min
+- Validated over 315 collections (30 minutes)
+
+**Supabase Micro (t4g.nano, 2 core ARM, 1GB RAM, PostgreSQL 17.6)**:
+- Collection execution time: **32ms** median (P50)
+- Mean: 36.6ms ± 23.3ms (stddev)
+- P95: 46ms, P99: 118ms
+- At 180s intervals: **0.018% sustained CPU** + brief 32ms spike every 3 min
+- Validated over 59 collections (10 minutes)
 
 **Headroom Assessment:**
-- ✓ Systems with ≥1 vCPU: Negligible impact (safe for production)
-- ✓ Tiny systems (<1 vCPU): 23ms every 3 min is minimal
+- ✓ Supabase free tier (2 core): **32ms every 3 min - negligible!**
+- ✓ Systems with ≥1 vCPU: Minimal impact (safe for production)
+- ✓ Tiny systems (<1 vCPU): 23-32ms every 3 min is acceptable
 
-**Stability:** 95% of collections complete within 31ms. No drift or degradation over time.
+**Stability:** 95% of collections complete within 31-46ms depending on hardware. No drift or degradation over time.
 
 Run `./benchmark/measure_absolute.sh` to measure in your environment.
 
