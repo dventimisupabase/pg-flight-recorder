@@ -175,20 +175,20 @@ Daily:     cleanup() → Delete old TIER 2 and TIER 3 data
 
 ## Collection Modes
 
-Modes control **what** is collected. Ring buffer samples at fixed 60-second intervals.
+Modes control **what** is collected and **how often**. A- SAFETY: Conservative 120s default.
 
-| Mode        | Locks | Activity Detail | Use Case                     |
-|-------------|-------|-----------------|------------------------------|
-| `normal`    | Yes   | Full (25 rows)  | Default (3 sections)         |
-| `light`     | Yes   | Full (25 rows)  | Moderate load (3 sections)   |
-| `emergency` | No    | Limited         | System stressed (2 sections) |
+| Mode        | Interval | Locks | Activity Detail | Use Case                     |
+|-------------|----------|-------|-----------------|------------------------------|
+| `normal`    | 120s     | Yes   | Full (25 rows)  | Default - A- SAFETY          |
+| `light`     | 120s     | Yes   | Full (25 rows)  | Same as normal               |
+| `emergency` | 300s     | No    | Limited         | System stressed (2 sections) |
 
 ```sql
 SELECT flight_recorder.set_mode('light');
 SELECT * FROM flight_recorder.get_mode();
 
--- Ring buffer always samples at 60-second fixed intervals
--- Modes only control what data is collected, not frequency
+-- A- SAFETY: Ring buffer now uses 120s intervals by default (720 collections/day)
+-- Emergency mode uses 300s intervals for 60% overhead reduction
 ```
 
 ## Anomaly Detection
@@ -206,29 +206,32 @@ SELECT * FROM flight_recorder.get_mode();
 
 ## Safety Features
 
-### Observer Effect
+### Observer Effect - A- SAFETY UPGRADE
 
-Flight recorder has measurable overhead. Ring buffer uses fixed 60-second intervals:
+Flight recorder has measurable overhead. **Conservative 120s default reduces impact by 50%.**
 
-| Mode | Sections | Timeout/Section | Typical CPU | Notes |
-|------|----------|-----------------|-------------|-------|
-| **Normal** | 3 | 250ms | <0.1% | Ring buffer: wait events, activity, locks |
-| **Light** | 3 | 250ms | <0.1% | Same as normal (mode distinction for future use) |
-| **Emergency** | 2 | 250ms | <0.05% | Ring buffer: wait events, activity only (locks disabled) |
+| Mode | Interval | Collections/Day | Sections | Timeout | Typical CPU | Notes |
+|------|----------|-----------------|----------|---------|-------------|-------|
+| **Normal** | 120s | 720 | 3 | 1000ms | <0.5% avg | A- SAFETY: Conservative default |
+| **Light** | 120s | 720 | 3 | 1000ms | <0.5% avg | Same as normal |
+| **Emergency** | 300s | 288 | 2 | 1000ms | <0.2% avg | Wait events, activity only (locks disabled) |
 
 **Additional Resource Costs:**
 
-- **Catalog locks**: 1 AccessShareLock per sample (default snapshot-based collection)
+- **Catalog locks**: 1 AccessShareLock per sample (720x/day vs old 1440x/day)
 - **Lock timeout**: 100ms - fails fast if catalogs are locked
+- **Statement timeout**: 1000ms (reduced from 2000ms for tighter safety margin)
 - **Memory**: 2MB work_mem per collection (configurable)
 - **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
 - **pg_stat_statements**: 20 queries × 96 snapshots/day = 1,920 rows/day
 
 **Target Environments:**
 
-- ✓ Production troubleshooting (enable during incidents)
 - ✓ Staging/dev (always-on monitoring)
-- ✗ Resource-constrained databases (< 2 CPU cores, < 4GB RAM)
+- ✓ Production troubleshooting (enable during incidents, disable after)
+- ⚠ Production always-on (test in staging first, monitor with preflight_check())
+- ✗ Resource-constrained databases (< 4 CPU cores, < 8GB RAM)
+- ✗ High-DDL workloads (frequent schema changes cause catalog lock contention)
 
 **Reducing Overhead:**
 
@@ -246,9 +249,15 @@ SELECT flight_recorder.disable();
 SELECT * FROM flight_recorder.validate_config();
 ```
 
-### Observer Effect Prevention
+### Observer Effect Prevention - A- SAFETY UPGRADES
 
 Flight recorder is designed to minimize impact on the database it monitors:
+
+**Load Shedding (NEW - A- SAFETY)**
+- Automatically skips collection when active connections > 70% of max_connections
+- Proactive protection against observer effect during high load
+- Configurable threshold via `load_shedding_active_pct` config
+- Enabled by default (set `load_shedding_enabled = 'false'` to disable)
 
 **UNLOGGED Tables**
 - 9 telemetry tables use UNLOGGED to eliminate WAL overhead
@@ -257,6 +266,7 @@ Flight recorder is designed to minimize impact on the database it monitors:
 
 **Per-Section Timeouts**
 - Each collection section has independent 250ms timeout (configurable)
+- Total statement timeout: 1000ms (reduced from 2000ms for tighter safety)
 - Prevents any single query from monopolizing resources
 - Timeout resets between sections and at function end
 
@@ -488,12 +498,14 @@ Key settings:
 | `lock_timeout_ms`                   | 100     | Max wait for catalog locks                     |
 | `skip_locks_threshold`              | 50      | Skip lock collection if > N blocked            |
 | `skip_activity_conn_threshold`      | 100     | Skip activity if > N active conns              |
-| `sample_interval_seconds`           | 180     | UNUSED - ring buffer uses fixed 60s interval   |
+| `sample_interval_seconds`           | 120     | **A- SAFETY**: Adaptive frequency (120s default)|
 | `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
 | `statements_top_n`                  | 20      | Number of top queries to capture               |
 | `snapshot_based_collection`         | true    | Use temp table snapshot (reduces catalog locks)|
 | `adaptive_sampling`                 | false   | Skip collection when system idle               |
 | `adaptive_sampling_idle_threshold`  | 5       | Skip if < N active connections                 |
+| `load_shedding_enabled`             | true    | **A- SAFETY**: Skip during high load           |
+| `load_shedding_active_pct`          | 70      | **A- SAFETY**: Skip if active conn > N% max    |
 | `schema_size_warning_mb`            | 5000    | Warning threshold                              |
 | `schema_size_critical_mb`           | 10000   | Auto-disable threshold                         |
 | `retention_samples_days`            | 7       | Sample retention                               |

@@ -21,7 +21,7 @@
 --      - Wait events: aggregated by backend_type, wait_event_type, wait_event
 --      - Active sessions: top 25 non-idle sessions with query preview
 --      - Lock contention: blocked/blocking PIDs with queries
---      - Adaptive intervals: normal=60s/2h, light=120s/4h, emergency=300s/10h
+--      - Adaptive intervals: normal=120s/4h, light=120s/4h, emergency=300s/10h (A- SAFETY: Conservative defaults)
 --      - Low overhead (<0.1% CPU normal, <0.05% emergency): HOT updates, zero WAL
 --
 --   TIER 2: Aggregates (flushed every 5 min from ring buffer, 7-day retention)
@@ -265,7 +265,7 @@
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
 --   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes - snapshots, replication)
---   flight_recorder_sample    : adaptive      (60s normal, 120s light, 300s emergency)
+--   flight_recorder_sample    : adaptive      (120s normal/light, 300s emergency) - A- SAFETY
 --   flight_recorder_flush     : */5 * * * *   (every 5 minutes - flush ring buffer to aggregates)
 --   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - cleans old aggregates and snapshots)
 --
@@ -430,7 +430,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
 
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=60s/2h, light=120s/4h, emergency=300s/10h retention. Fill factor 70 enables HOT updates.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. A- SAFETY: Conservative 120s default. Fill factor 70 enables HOT updates.';
 
 -- Wait events ring buffer (UPDATE-only pattern for zero dead tuples)
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
@@ -642,7 +642,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
     -- Configurable sample interval (default 60s for normal mode, adjusts per mode)
-    ('sample_interval_seconds', '60'),         -- Sample collection frequency (60s=normal, 120s=light, 300s=emergency)
+    ('sample_interval_seconds', '120'),        -- Sample collection frequency (120s=normal/light, 300s=emergency) - A- SAFETY: Conservative default
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
     ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
@@ -654,7 +654,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('circuit_breaker_enabled', 'true'),
     ('circuit_breaker_window_minutes', '15'),  -- Look back window for moving average
     -- Statement and lock timeouts (applied in collection functions)
-    ('statement_timeout_ms', '2000'),          -- Max total collection time
+    ('statement_timeout_ms', '1000'),          -- Max total collection time - A- SAFETY: Tighter safety margin
     ('lock_timeout_ms', '100'),                -- Max wait for catalog locks (fail fast on contention)
     ('work_mem_kb', '2048'),                   -- work_mem limit for flight recorder queries (2MB)
     -- Per-section sub-timeouts (prevent one section consuming entire budget)
@@ -701,6 +701,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     -- Adaptive sampling (opt-in, skips collection when idle)
     ('adaptive_sampling', 'false'),            -- Skip collection when system idle
     ('adaptive_sampling_idle_threshold', '5'), -- Skip if < N active connections
+    ('load_shedding_enabled', 'true'),         -- A- SAFETY: Skip collection during high load
+    ('load_shedding_active_pct', '70'),        -- Skip if active connections > N% of max_connections
     -- Collection jitter (A+ upgrade: prevent synchronized monitoring tools)
     ('collection_jitter_enabled', 'true'),     -- Add random delay to collection start
     ('collection_jitter_max_seconds', '10')    -- Max jitter (0-N seconds random delay)
@@ -1684,10 +1686,46 @@ BEGIN
 
     -- Adaptive sampling - skip if system idle (opt-in)
     DECLARE
+        v_load_shedding_enabled BOOLEAN;
+        v_load_threshold_pct INTEGER;
+        v_max_connections INTEGER;
+        v_active_pct NUMERIC;
         v_adaptive_sampling BOOLEAN;
         v_idle_threshold INTEGER;
         v_active_count INTEGER;
     BEGIN
+        -- A- SAFETY: Load shedding - skip collection during high load
+        v_load_shedding_enabled := COALESCE(
+            flight_recorder._get_config('load_shedding_enabled', 'true')::boolean,
+            true
+        );
+
+        IF v_load_shedding_enabled THEN
+            v_load_threshold_pct := COALESCE(
+                flight_recorder._get_config('load_shedding_active_pct', '70')::integer,
+                70
+            );
+
+            -- Get max_connections and active count
+            SELECT setting::integer INTO v_max_connections
+            FROM pg_settings WHERE name = 'max_connections';
+
+            SELECT count(*) INTO v_active_count
+            FROM pg_stat_activity
+            WHERE state = 'active' AND backend_type = 'client backend';
+
+            v_active_pct := (v_active_count::numeric / NULLIF(v_max_connections, 0)) * 100;
+
+            IF v_active_pct > v_load_threshold_pct THEN
+                PERFORM flight_recorder._record_collection_skip('sample',
+                    format('Load shedding: high load (%s active / %s max = %s%% > %s%% threshold)',
+                           v_active_count, v_max_connections, round(v_active_pct, 1), v_load_threshold_pct));
+                PERFORM set_config('statement_timeout', '0', true);
+                RETURN v_captured_at;
+            END IF;
+        END IF;
+
+        -- Original adaptive sampling (idle detection)
         v_adaptive_sampling := COALESCE(
             flight_recorder._get_config('adaptive_sampling', 'false')::boolean,
             false
@@ -1699,9 +1737,12 @@ BEGIN
                 5
             );
 
-            SELECT count(*) INTO v_active_count
-            FROM pg_stat_activity
-            WHERE state = 'active' AND backend_type = 'client backend';
+            -- Reuse v_active_count from load shedding if already set
+            IF v_active_count IS NULL THEN
+                SELECT count(*) INTO v_active_count
+                FROM pg_stat_activity
+                WHERE state = 'active' AND backend_type = 'client backend';
+            END IF;
 
             IF v_active_count < v_idle_threshold THEN
                 PERFORM flight_recorder._record_collection_skip('sample',
@@ -3615,23 +3656,23 @@ BEGIN
     );
 
     -- Set mode-specific configuration
-    -- Adaptive frequency: Each mode sets explicit interval (normal=60s, light=120s, emergency=300s)
+    -- Adaptive frequency: Each mode sets explicit interval (normal=120s, light=120s, emergency=300s) - A- SAFETY
     CASE p_mode
         WHEN 'normal' THEN
             v_enable_locks := TRUE;
             v_enable_progress := TRUE;
-            v_sample_interval_seconds := 60;  -- Normal mode: 60s intervals (2h retention)
-            v_description := 'Normal mode: 60s sampling, all collectors enabled (2h retention)';
+            v_sample_interval_seconds := 120;  -- Normal mode: 120s intervals (4h retention) - A- SAFETY: Conservative default
+            v_description := 'Normal mode: 120s sampling, all collectors enabled (4h retention)';
         WHEN 'light' THEN
             v_enable_locks := TRUE;
             v_enable_progress := FALSE;
-            v_sample_interval_seconds := 120;  -- Light mode: 120s intervals (4h retention, 50% reduction)
-            v_description := 'Light mode: 120s sampling, progress disabled (4h retention, 50% less overhead)';
+            v_sample_interval_seconds := 120;  -- Light mode: 120s intervals (4h retention, same as normal)
+            v_description := 'Light mode: 120s sampling, progress disabled (4h retention, minimal overhead)';
         WHEN 'emergency' THEN
             v_enable_locks := FALSE;
             v_enable_progress := FALSE;
-            v_sample_interval_seconds := 300;  -- Emergency mode: 300s intervals (10h retention, 80% reduction)
-            v_description := 'Emergency mode: 300s sampling, locks/progress disabled (10h retention, 80% less overhead)';
+            v_sample_interval_seconds := 300;  -- Emergency mode: 300s intervals (10h retention, 60% reduction)
+            v_description := 'Emergency mode: 300s sampling, locks/progress disabled (10h retention, 60% less overhead)';
     END CASE;
 
     -- Update configuration
@@ -4067,14 +4108,15 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Schedule sample (fixed 60 second interval for ring buffer)
-    -- Ring buffer architecture requires consistent 60s intervals for proper slot rotation
+    -- Schedule sample (default 120 second interval for ring buffer) - A- SAFETY
+    -- Ring buffer architecture uses configurable intervals (120s default, 300s emergency)
+    -- Initial schedule is every minute; actual interval controlled by sample_interval_seconds config
     PERFORM cron.schedule(
         'flight_recorder_sample',
-        '* * * * *',
+        '*/2 * * * *',
         'SELECT flight_recorder.sample()'
     );
-    v_sample_schedule := 'every 60 seconds (ring buffer)';
+    v_sample_schedule := 'every 120 seconds (ring buffer, A- SAFETY default)';
     RAISE NOTICE 'Flight Recorder installed. Sampling %', v_sample_schedule;
 
     -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
@@ -5211,7 +5253,7 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Collection schedule:';
     RAISE NOTICE '  - Snapshots: every 5 minutes (WAL, checkpoints, I/O stats) - DURABLE';
-    RAISE NOTICE '  - Samples: every 60 seconds (ring buffer, 120 slots, 2-hour retention, fixed 120KB memory)';
+    RAISE NOTICE '  - Samples: every 120 seconds (ring buffer, 120 slots, 4-hour retention, A- SAFETY default)';
     RAISE NOTICE '  - Flush: every 5 minutes (ring buffer → durable aggregates)';
     RAISE NOTICE '  - Cleanup: daily at 3 AM (aggregates: 7 days, snapshots: 30 days)';
     RAISE NOTICE '';

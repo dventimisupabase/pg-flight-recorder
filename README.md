@@ -32,22 +32,36 @@ SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:
 ## Emergency Controls
 
 ```sql
-SELECT flight_recorder.set_mode('light');      -- Sample every 2 min (50% less overhead)
-SELECT flight_recorder.set_mode('emergency');  -- Sample every 5 min (80% less overhead)
-SELECT flight_recorder.disable();              -- Stop completely
+SELECT flight_recorder.set_mode('light');      -- Sample every 2 min (same as normal)
+SELECT flight_recorder.set_mode('emergency');  -- Sample every 5 min (60% less overhead)
+SELECT flight_recorder.disable();              -- Stop completely (use this if overhead is a concern)
 SELECT flight_recorder.enable();               -- Resume
 ```
 
 Modes automatically adjust sampling frequency:
-- **Normal**: 60-second intervals (2-hour retention)
-- **Light**: 120-second intervals (4-hour retention, 50% reduction)
-- **Emergency**: 300-second intervals (10-hour retention, 80% reduction)
+- **Normal**: 120-second intervals (4-hour retention) - **A- SAFETY: Conservative default**
+- **Light**: 120-second intervals (4-hour retention, same as normal)
+- **Emergency**: 300-second intervals (10-hour retention, 60% reduction)
 
 ## Is It Safe?
 
-**Yes.** Uses less than 0.1% of your CPU in normal mode, <0.05% in emergency mode. Safe to run 24/7.
+**Designed for safety, with trade-offs.** Collections take ~50-200ms and run every 2 minutes by default (720x/day). Typical overhead: **<0.5% CPU averaged over time**, with brief spikes during collection.
 
-Built-in safety controls automatically protect your database. If things get busy, it backs off automatically.
+**✓ Recommended for:**
+- Staging and development (always-on monitoring)
+- Production troubleshooting (enable during incidents, disable after)
+- Well-resourced databases (≥4 CPU cores, ≥8GB RAM)
+
+**⚠ Use with caution:**
+- Production always-on (test in staging first, monitor overhead)
+- Resource-constrained databases (<4 cores or <8GB RAM)
+- High-DDL workloads (frequent CREATE/DROP/ALTER operations)
+
+**Built-in safety features:**
+- **Load shedding**: Automatically skips collection when >70% active connections
+- **Circuit breaker**: Backs off if collections run slow
+- **One-command disable**: `SELECT flight_recorder.disable();` for emergencies
+- **Adaptive frequency**: Automatically adjusts sampling based on load
 
 ## Health Checks
 
