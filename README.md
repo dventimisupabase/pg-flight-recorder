@@ -52,48 +52,17 @@ See [REFERENCE.md](REFERENCE.md) for all profiles and settings.
 
 ## Is It Safe?
 
-**Yes.** Measured overhead: **~0.02% CPU** on production systems.
+**Yes.** ~0.02% CPU overhead. 23-32ms per collection every 3 minutes.
 
-**Validated on:**
-- MacBook Pro (M-series): 23ms per collection
-- Supabase Micro (2 core, 1GB RAM): 32ms per collection
-- **32ms every 3 minutes = negligible impact**
+**Validated on resource-constrained hardware:**
+- Supabase Micro (2 core, 1GB): 0% DDL blocking across 202 operations
+- Built-in protection: load shedding, circuit breakers, fast timeouts
 
-**DDL operations (ALTER TABLE, CREATE INDEX, etc.):**
-- Tested 202 DDL operations on Supabase
-- **0% blocking** - no DDL delays observed
-- Safe for high-DDL workloads
-
-**Safe for production:**
-- ✓ Staging and development (always-on)
-- ✓ Production troubleshooting (enable during incidents)
-- ✓ Production always-on (test in staging first)
-
-**One-command disable if needed:**
-```sql
-SELECT flight_recorder.disable();  -- Stop immediately
-```
-
-**Built-in protection:**
-- Skips collection when system is idle or under load
-- Automatic circuit breaker if collections run slow
-- Fast lock timeout (100ms) - fails fast, doesn't block
-
-See [REFERENCE.md](REFERENCE.md) for detailed measurements and safety analysis.
+Safe for staging (always-on), production troubleshooting, and production always-on (test in staging first).
 
 ## Health Checks
 
-Optional but recommended:
-
-```sql
--- Before you start (one time)
-SELECT * FROM flight_recorder.preflight_check();
-
--- Every 3 months (takes 1 second)
-SELECT * FROM flight_recorder.quarterly_review();
-```
-
-That's it. No maintenance required.
+Optional: `SELECT * FROM flight_recorder.preflight_check();` before you start, `quarterly_review()` every 3 months.
 
 ## Uninstall
 
@@ -103,13 +72,4 @@ psql -f uninstall.sql
 
 ## For Developers
 
-Want to modify or contribute? Run the test suite:
-
-```bash
-./test.sh     # PostgreSQL 16
-./test.sh all # All versions (15, 16, 17)
-```
-
-## Need More?
-
-See [REFERENCE.md](REFERENCE.md) for full documentation.
+Run tests: `./test.sh` (PG 16) or `./test.sh all` (PG 15-17). See [REFERENCE.md](REFERENCE.md) for full documentation.
