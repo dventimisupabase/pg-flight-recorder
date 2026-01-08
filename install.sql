@@ -5697,30 +5697,51 @@ BEGIN
             'Verify pg_cron extension is installed and accessible.'::text;
     END;
 
-    -- Summary and next steps
-    DECLARE
-        v_issues_count INTEGER;
-    BEGIN
-        SELECT count(*) INTO v_issues_count
-        FROM flight_recorder.quarterly_review()
-        WHERE status IN ('ERROR', 'REVIEW NEEDED');
-
-        IF v_issues_count = 0 THEN
-            RETURN QUERY SELECT
-                '=== QUARTERLY REVIEW SUMMARY ==='::text,
-                'HEALTHY'::text,
-                'All metrics within acceptable parameters',
-                'Flight recorder is operating as expected. Schedule next review in 3 months. No action required.'::text;
-        ELSE
-            RETURN QUERY SELECT
-                '=== QUARTERLY REVIEW SUMMARY ==='::text,
-                'ACTION REQUIRED'::text,
-                format('%s items need review', v_issues_count),
-                'Address items marked ERROR or REVIEW NEEDED above. Run config_recommendations() for specific tuning suggestions.'::text;
-        END IF;
-    END;
 END;
 $$;
+
+COMMENT ON FUNCTION flight_recorder.quarterly_review() IS
+'Quarterly health check for flight recorder. Returns component metrics (EXCELLENT/GOOD/REVIEW NEEDED/ERROR). For summary, use quarterly_review_with_summary().';
+
+-- Helper function: quarterly_review with summary
+CREATE OR REPLACE FUNCTION flight_recorder.quarterly_review_with_summary()
+RETURNS TABLE(
+    component TEXT,
+    status TEXT,
+    metric TEXT,
+    assessment TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_issues_count INTEGER;
+BEGIN
+    -- Return all quarterly review results
+    RETURN QUERY SELECT * FROM flight_recorder.quarterly_review();
+
+    -- Count status results (calls function again to count)
+    SELECT count(*) INTO v_issues_count
+    FROM flight_recorder.quarterly_review() qr
+    WHERE qr.status IN ('ERROR', 'REVIEW NEEDED');
+
+    -- Add summary based on counts
+    IF v_issues_count = 0 THEN
+        RETURN QUERY SELECT
+            '=== QUARTERLY REVIEW SUMMARY ==='::text,
+            'HEALTHY'::text,
+            'All metrics within acceptable parameters',
+            'Flight recorder is operating as expected. Schedule next review in 3 months. No action required.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '=== QUARTERLY REVIEW SUMMARY ==='::text,
+            'ACTION REQUIRED'::text,
+            format('%s items need review', v_issues_count),
+            'Address items marked ERROR or REVIEW NEEDED above. Run config_recommendations() for specific tuning suggestions.'::text;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.quarterly_review_with_summary() IS
+'Quarterly health check with summary. Calls quarterly_review() twice - once for results, once to count. More expensive but includes summary row.';
 
 -- Capture initial snapshot and sample
 SELECT flight_recorder.snapshot();
