@@ -52,6 +52,12 @@ info ""
 psql -c "SELECT flight_recorder.enable()" &> /dev/null
 psql -c "SELECT flight_recorder.set_mode('normal')" &> /dev/null
 
+# Disable collection jitter for accurate timing measurement
+# (Jitter adds 0-10s random sleep to avoid thundering herd in SaaS environments)
+log "Disabling collection jitter for accurate measurement..."
+ORIGINAL_JITTER=$(psql -t -c "SELECT value FROM flight_recorder.config WHERE key = 'collection_jitter_enabled'" | xargs)
+psql -c "UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collection_jitter_enabled'" &> /dev/null
+
 log "Warming up (5 collections)..."
 for i in {1..5}; do
     psql -c "SELECT flight_recorder.sample()" &> /dev/null
@@ -299,6 +305,12 @@ print("  - Load shedding: skips if >70% connections active")
 print("  - Load throttling: skips if >1000 txn/sec or >10K blocks/sec")
 print("  - These protect against observer effect amplification")
 PYTHON
+
+# Restore original jitter setting
+if [[ -n "$ORIGINAL_JITTER" ]]; then
+    psql -c "UPDATE flight_recorder.config SET value = '$ORIGINAL_JITTER' WHERE key = 'collection_jitter_enabled'" &> /dev/null
+    log "Restored collection jitter setting: $ORIGINAL_JITTER"
+fi
 
 log ""
 log "Full report saved to: $OUTPUT_FILE"

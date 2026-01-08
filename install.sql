@@ -817,8 +817,8 @@ CREATE OR REPLACE FUNCTION flight_recorder._record_collection_end(
 RETURNS VOID
 LANGUAGE sql AS $$
     UPDATE flight_recorder.collection_stats
-    SET completed_at = now(),
-        duration_ms = EXTRACT(EPOCH FROM (now() - started_at)) * 1000,
+    SET completed_at = clock_timestamp(),
+        duration_ms = EXTRACT(EPOCH FROM (clock_timestamp() - started_at)) * 1000,
         success = p_success,
         error_message = p_error_message
     WHERE id = p_stat_id
