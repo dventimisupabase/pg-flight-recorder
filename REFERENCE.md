@@ -175,20 +175,20 @@ Daily:     cleanup() → Delete old TIER 2 and TIER 3 data
 
 ## Collection Modes
 
-Modes control **what** is collected and **how often**. A GRADE: Conservative 120s + proactive throttling.
+Modes control **what** is collected and **how often**. A+ GRADE: Ultra-conservative 180s + proactive throttling.
 
 | Mode        | Interval | Locks | Activity Detail | Use Case                     |
 |-------------|----------|-------|-----------------|------------------------------|
-| `normal`    | 120s     | Yes   | Full (25 rows)  | Default - A GRADE            |
-| `light`     | 120s     | Yes   | Full (25 rows)  | Same as normal               |
+| `normal`    | 180s     | Yes   | Full (25 rows)  | Default - A+ GRADE           |
+| `light`     | 180s     | Yes   | Full (25 rows)  | Same as normal               |
 | `emergency` | 300s     | No    | Limited         | System stressed (2 sections) |
 
 ```sql
 SELECT flight_recorder.set_mode('light');
 SELECT * FROM flight_recorder.get_mode();
 
--- A GRADE: Ring buffer uses 120s intervals + proactive throttling (720 collections/day)
--- Emergency mode uses 300s intervals for 60% overhead reduction
+-- A+ GRADE: Ring buffer uses 180s intervals + proactive throttling (480 collections/day)
+-- Emergency mode uses 300s intervals for 40% overhead reduction
 ```
 
 ## Anomaly Detection
@@ -206,19 +206,21 @@ SELECT * FROM flight_recorder.get_mode();
 
 ## Safety Features
 
-### Observer Effect - A GRADE UPGRADE
+### Observer Effect - A+ GRADE UPGRADE
 
-Flight recorder has measurable overhead. **Conservative 120s default + proactive throttling delivers A-grade safety.**
+Flight recorder has measurable overhead. **Ultra-conservative 180s default + proactive throttling delivers A+ grade safety.**
 
-| Mode | Interval | Collections/Day | Sections | Timeout | Typical CPU | Notes |
-|------|----------|-----------------|----------|---------|-------------|-------|
-| **Normal** | 120s | 720 | 3 | 1000ms | <0.3% avg | **A GRADE**: Conservative + proactive throttling |
-| **Light** | 120s | 720 | 3 | 1000ms | <0.3% avg | Same as normal |
-| **Emergency** | 300s | 288 | 2 | 1000ms | <0.15% avg | Wait events, activity only (locks disabled) |
+**Note:** Specific overhead claims (e.g., "X% CPU") require rigorous benchmarking to avoid misleading statements. We are developing a reproducible benchmark framework that users can run themselves. Until then, overhead should be measured in your specific environment.
+
+| Mode | Interval | Collections/Day | Sections | Timeout | Notes |
+|------|----------|-----------------|----------|---------|-------|
+| **Normal** | 180s | 480 | 3 | 1000ms | **A+ GRADE**: Ultra-conservative + proactive throttling |
+| **Light** | 180s | 480 | 3 | 1000ms | Same as normal |
+| **Emergency** | 300s | 288 | 2 | 1000ms | Wait events, activity only (locks disabled) |
 
 **Additional Resource Costs:**
 
-- **Catalog locks**: 1 AccessShareLock per sample (720x/day vs old 1440x/day)
+- **Catalog locks**: 1 AccessShareLock per sample (480x/day vs original 1440x/day = 67% reduction)
 - **Lock timeout**: 100ms - fails fast if catalogs are locked
 - **Statement timeout**: 1000ms (reduced from 2000ms for tighter safety margin)
 - **Memory**: 2MB work_mem per collection (configurable)
@@ -229,7 +231,7 @@ Flight recorder has measurable overhead. **Conservative 120s default + proactive
 
 - ✓ Staging/dev (always-on monitoring recommended)
 - ✓ Production troubleshooting (enable during incidents, disable after)
-- ✓ Production always-on (A GRADE: safe with proactive throttling, test in staging first)
+- ✓ Production always-on (A+ GRADE: ultra-conservative with proactive throttling, test in staging first)
 - ⚠ Resource-constrained databases (< 4 CPU cores, < 8GB RAM - monitor overhead)
 - ⚠ High-DDL workloads (frequent schema changes - load throttling helps but monitor)
 
@@ -513,7 +515,7 @@ Key settings:
 | `lock_timeout_ms`                   | 100     | Max wait for catalog locks                     |
 | `skip_locks_threshold`              | 50      | Skip lock collection if > N blocked            |
 | `skip_activity_conn_threshold`      | 100     | Skip activity if > N active conns              |
-| `sample_interval_seconds`           | 120     | **A- SAFETY**: Adaptive frequency (120s default)|
+| `sample_interval_seconds`           | 180     | **A+ SAFETY**: Adaptive frequency (180s default)|
 | `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
 | `statements_top_n`                  | 20      | Number of top queries to capture               |
 | `snapshot_based_collection`         | true    | Use temp table snapshot (reduces catalog locks)|

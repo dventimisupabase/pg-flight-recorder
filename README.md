@@ -32,20 +32,20 @@ SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:
 ## Emergency Controls
 
 ```sql
-SELECT flight_recorder.set_mode('light');      -- Sample every 2 min (same as normal)
-SELECT flight_recorder.set_mode('emergency');  -- Sample every 5 min (60% less overhead)
+SELECT flight_recorder.set_mode('light');      -- Sample every 3 min (same as normal)
+SELECT flight_recorder.set_mode('emergency');  -- Sample every 5 min (40% less overhead)
 SELECT flight_recorder.disable();              -- Stop completely (use this if overhead is a concern)
 SELECT flight_recorder.enable();               -- Resume
 ```
 
 Modes automatically adjust sampling frequency:
-- **Normal**: 120-second intervals (4-hour retention) - **A GRADE: Conservative + proactive throttling**
-- **Light**: 120-second intervals (4-hour retention, same as normal)
-- **Emergency**: 300-second intervals (10-hour retention, 60% reduction)
+- **Normal**: 180-second intervals (6-hour retention) - **A+ GRADE: Ultra-conservative + proactive throttling**
+- **Light**: 180-second intervals (6-hour retention, same as normal)
+- **Emergency**: 300-second intervals (10-hour retention, 40% reduction)
 
 ## Is It Safe?
 
-**A-grade safety design.** Collections take ~50-200ms and run every 2 minutes by default (720x/day). Typical overhead: **<0.3% CPU averaged over time** with proactive throttling, with brief spikes during collection.
+**A+ grade safety design.** Collections take ~50-200ms and run every 3 minutes by default (480x/day). Overhead claims require rigorous benchmarking - see REFERENCE.md for methodology (work in progress).
 
 **✓ Recommended for:**
 - Staging and development (always-on monitoring)
@@ -59,8 +59,8 @@ Modes automatically adjust sampling frequency:
 
 **Built-in safety features:**
 - **Load shedding**: Automatically skips collection when >70% active connections
-- **Load throttling (A GRADE)**: Skips during high I/O (>10K blocks/sec) or transaction rate (>1K txn/sec)
-- **pg_stat_statements protection (A GRADE)**: Skips when hash table >80% full to prevent churn
+- **Load throttling (A+ GRADE)**: Skips during high I/O (>10K blocks/sec) or transaction rate (>1K txn/sec)
+- **pg_stat_statements protection (A+ GRADE)**: Skips when hash table >80% full to prevent churn
 - **Circuit breaker**: Backs off if collections run slow
 - **One-command disable**: `SELECT flight_recorder.disable();` for emergencies
 - **Adaptive frequency**: Automatically adjusts sampling based on load

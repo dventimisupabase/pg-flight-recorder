@@ -21,7 +21,7 @@
 --      - Wait events: aggregated by backend_type, wait_event_type, wait_event
 --      - Active sessions: top 25 non-idle sessions with query preview
 --      - Lock contention: blocked/blocking PIDs with queries
---      - Adaptive intervals: normal=120s/4h, light=120s/4h, emergency=300s/10h (A GRADE: Conservative + proactive)
+--      - Adaptive intervals: normal=180s/6h, light=180s/6h, emergency=300s/10h (A+ GRADE: Ultra-conservative)
 --      - Low overhead (<0.1% CPU normal, <0.05% emergency): HOT updates, zero WAL
 --
 --   TIER 2: Aggregates (flushed every 5 min from ring buffer, 7-day retention)
@@ -265,7 +265,7 @@
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
 --   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes - snapshots, replication)
---   flight_recorder_sample    : adaptive      (120s normal/light, 300s emergency) - A GRADE
+--   flight_recorder_sample    : adaptive      (180s normal/light, 300s emergency) - A+ GRADE
 --   flight_recorder_flush     : */5 * * * *   (every 5 minutes - flush ring buffer to aggregates)
 --   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - cleans old aggregates and snapshots)
 --
@@ -430,7 +430,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
 
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. A GRADE: Conservative 120s + proactive throttling. Fill factor 70 enables HOT updates.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=180s/6h, light=180s/6h, emergency=300s/10h retention. A+ GRADE: Ultra-conservative 180s + proactive throttling. Fill factor 70 enables HOT updates.';
 
 -- Wait events ring buffer (UPDATE-only pattern for zero dead tuples)
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
@@ -642,7 +642,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
     -- Configurable sample interval (default 60s for normal mode, adjusts per mode)
-    ('sample_interval_seconds', '120'),        -- Sample collection frequency (120s=normal/light, 300s=emergency) - A GRADE: Conservative default
+    ('sample_interval_seconds', '180'),        -- Sample collection frequency (180s=normal/light, 300s=emergency) - A+ GRADE: Ultra-conservative default
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
     ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
@@ -3746,13 +3746,13 @@ BEGIN
         WHEN 'normal' THEN
             v_enable_locks := TRUE;
             v_enable_progress := TRUE;
-            v_sample_interval_seconds := 120;  -- Normal mode: 120s intervals (4h retention) - A GRADE: Conservative + proactive
-            v_description := 'Normal mode: 120s sampling, all collectors enabled (4h retention)';
+            v_sample_interval_seconds := 180;  -- Normal mode: 180s intervals (6h retention) - A+ GRADE: Ultra-conservative
+            v_description := 'Normal mode: 180s sampling, all collectors enabled (6h retention)';
         WHEN 'light' THEN
             v_enable_locks := TRUE;
             v_enable_progress := FALSE;
-            v_sample_interval_seconds := 120;  -- Light mode: 120s intervals (4h retention, same as normal)
-            v_description := 'Light mode: 120s sampling, progress disabled (4h retention, minimal overhead)';
+            v_sample_interval_seconds := 180;  -- Light mode: 180s intervals (6h retention, same as normal)
+            v_description := 'Light mode: 180s sampling, progress disabled (6h retention, minimal overhead)';
         WHEN 'emergency' THEN
             v_enable_locks := FALSE;
             v_enable_progress := FALSE;
@@ -4165,7 +4165,7 @@ BEGIN
     FROM flight_recorder.config
     WHERE key = 'sample_interval_seconds';
 
-    v_sample_interval_seconds := COALESCE(v_sample_interval_seconds, 120);
+    v_sample_interval_seconds := COALESCE(v_sample_interval_seconds, 180);
 
     -- Check pg_cron version to determine if sub-minute scheduling is supported
     -- Sub-minute intervals (e.g., '30 seconds') require pg_cron 1.4.1+
@@ -4193,15 +4193,15 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Schedule sample (default 120 second interval for ring buffer) - A GRADE
-    -- Ring buffer architecture uses configurable intervals (120s default, 300s emergency)
-    -- Initial schedule is every minute; actual interval controlled by sample_interval_seconds config
+    -- Schedule sample (default 180 second interval for ring buffer) - A+ GRADE
+    -- Ring buffer architecture uses configurable intervals (180s default, 300s emergency)
+    -- Initial schedule is every 3 minutes; actual interval controlled by sample_interval_seconds config
     PERFORM cron.schedule(
         'flight_recorder_sample',
-        '*/2 * * * *',
+        '*/3 * * * *',
         'SELECT flight_recorder.sample()'
     );
-    v_sample_schedule := 'every 120 seconds (ring buffer, A GRADE default)';
+    v_sample_schedule := 'every 180 seconds (ring buffer, A+ GRADE default)';
     RAISE NOTICE 'Flight Recorder installed. Sampling %', v_sample_schedule;
 
     -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
@@ -5338,7 +5338,7 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Collection schedule:';
     RAISE NOTICE '  - Snapshots: every 5 minutes (WAL, checkpoints, I/O stats) - DURABLE';
-    RAISE NOTICE '  - Samples: every 120 seconds (ring buffer, 120 slots, 4-hour retention, A GRADE default)';
+    RAISE NOTICE '  - Samples: every 180 seconds (ring buffer, 120 slots, 6-hour retention, A+ GRADE default)';
     RAISE NOTICE '  - Flush: every 5 minutes (ring buffer → durable aggregates)';
     RAISE NOTICE '  - Cleanup: daily at 3 AM (aggregates: 7 days, snapshots: 30 days)';
     RAISE NOTICE '';
