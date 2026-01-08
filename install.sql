@@ -21,7 +21,7 @@
 --      - Wait events: aggregated by backend_type, wait_event_type, wait_event
 --      - Active sessions: top 25 non-idle sessions with query preview
 --      - Lock contention: blocked/blocking PIDs with queries
---      - Adaptive intervals: normal=180s/6h, light=180s/6h, emergency=300s/10h (A+ GRADE: Ultra-conservative)
+--      - Adaptive intervals: normal=180s/6h, light=180s/6h, emergency=300s/10h (Ultra-conservative)
 --      - Low overhead (<0.1% CPU normal, <0.05% emergency): HOT updates, zero WAL
 --
 --   TIER 2: Aggregates (flushed every 5 min from ring buffer, 7-day retention)
@@ -265,7 +265,7 @@
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
 --   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes - snapshots, replication)
---   flight_recorder_sample    : adaptive      (180s normal/light, 300s emergency) - A+ GRADE
+--   flight_recorder_sample    : adaptive      (180s normal/light, 300s emergency)
 --   flight_recorder_flush     : */5 * * * *   (every 5 minutes - flush ring buffer to aggregates)
 --   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - cleans old aggregates and snapshots)
 --
@@ -430,7 +430,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
 
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=180s/6h, light=180s/6h, emergency=300s/10h retention. A+ GRADE: Ultra-conservative 180s + proactive throttling. Fill factor 70 enables HOT updates.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=180s/6h, light=180s/6h, emergency=300s/10h retention. Ultra-conservative 180s + proactive throttling. Fill factor 70 enables HOT updates.';
 
 -- Wait events ring buffer (UPDATE-only pattern for zero dead tuples)
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
@@ -642,7 +642,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('mode', 'normal'),
     -- Configurable sample interval (default 60s for normal mode, adjusts per mode)
-    ('sample_interval_seconds', '180'),        -- Sample collection frequency (180s=normal/light, 300s=emergency) - A+ GRADE: Ultra-conservative default
+    ('sample_interval_seconds', '180'),        -- Sample collection frequency (180s=normal/light, 300s=emergency) - Ultra-conservative default
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),                -- Reduced from 50 to reduce pg_stat_statements pressure
     ('statements_interval_minutes', '15'),     -- Collect statements every 15 min instead of 5 min
@@ -654,7 +654,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('circuit_breaker_enabled', 'true'),
     ('circuit_breaker_window_minutes', '15'),  -- Look back window for moving average
     -- Statement and lock timeouts (applied in collection functions)
-    ('statement_timeout_ms', '1000'),          -- Max total collection time - A GRADE: Tighter safety margin
+    ('statement_timeout_ms', '1000'),          -- Max total collection time - Tighter safety margin
     ('lock_timeout_ms', '100'),                -- Max wait for catalog locks (fail fast on contention)
     ('work_mem_kb', '2048'),                   -- work_mem limit for flight recorder queries (2MB)
     -- Per-section sub-timeouts (prevent one section consuming entire budget)
@@ -669,7 +669,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     -- Automatic mode switching (enabled by default)
     ('auto_mode_enabled', 'true'),             -- Auto-adjust mode based on system load
     ('auto_mode_connections_threshold', '60'), -- Switch to light at 60% of max_connections
-    ('auto_mode_trips_threshold', '1'),        -- Switch to emergency if circuit breaker tripped N times in 10min (A+ upgrade: immediate response)
+    ('auto_mode_trips_threshold', '1'),        -- Switch to emergency if circuit breaker tripped N times in 10min (immediate response)
     -- Configurable retention by table type
     ('retention_samples_days', '7'),           -- Retention for samples table (legacy, ring buffers self-clean)
     ('aggregate_retention_days', '7'),         -- Retention for aggregate tables (TIER 2)
@@ -688,25 +688,25 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     -- Lock timeout strategy
     ('lock_timeout_strategy', 'fail_fast'),    -- Options: 'fail_fast' (100ms), 'skip_if_locked' (check first), 'patient' (500ms)
     ('check_ddl_before_collection', 'true'),   -- Pre-check for DDL locks on catalogs before collection
-    -- System awareness (A+ upgrade: skip during risky operations)
+    -- System awareness (skip during risky operations)
     ('check_replica_lag', 'true'),             -- Skip collection on lagging replicas
     ('replica_lag_threshold', '10 seconds'),   -- Max acceptable replica lag
     ('check_checkpoint_backup', 'true'),       -- Skip during checkpoints/backups
     ('check_pss_conflicts', 'true'),           -- Skip if pg_stat_statements being read
-    -- Schema size limits (A+ upgrade: percentage-based)
+    -- Schema size limits (percentage-based)
     ('schema_size_use_percentage', 'true'),    -- Use percentage of DB size (vs fixed MB)
     ('schema_size_percentage', '5.0'),         -- Max % of database size (default 5%)
     ('schema_size_min_mb', '1000'),            -- Min limit (1GB)
     ('schema_size_max_mb', '10000'),           -- Max limit (10GB)
-    -- Adaptive sampling (A+ GRADE: enabled by default, skips collection when idle)
+    -- Adaptive sampling (enabled by default, skips collection when idle)
     ('adaptive_sampling', 'true'),             -- Skip collection when system idle
     ('adaptive_sampling_idle_threshold', '5'), -- Skip if < N active connections
-    ('load_shedding_enabled', 'true'),         -- A GRADE: Skip collection during high load
+    ('load_shedding_enabled', 'true'),         -- Skip collection during high load
     ('load_shedding_active_pct', '70'),        -- Skip if active connections > N% of max_connections
-    ('load_throttle_enabled', 'true'),         -- A GRADE: Advanced load throttling (I/O, txn rate)
+    ('load_throttle_enabled', 'true'),         -- Advanced load throttling (I/O, txn rate)
     ('load_throttle_xact_threshold', '1000'),  -- Skip if commits+rollbacks > N/sec (sustained load)
     ('load_throttle_blk_threshold', '10000'),  -- Skip if block reads+writes > N/sec (I/O pressure)
-    -- Collection jitter (A+ upgrade: prevent synchronized monitoring tools)
+    -- Collection jitter (prevent synchronized monitoring tools)
     ('collection_jitter_enabled', 'true'),     -- Add random delay to collection start
     ('collection_jitter_max_seconds', '10')    -- Max jitter (0-N seconds random delay)
 ON CONFLICT (key) DO NOTHING;
@@ -1225,7 +1225,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Get thresholds from config (A+ UPGRADE: percentage-based with min/max bounds)
+    -- Get thresholds from config (percentage-based with min/max bounds)
     DECLARE
         v_use_percentage BOOLEAN;
         v_db_size_mb NUMERIC;
@@ -1577,7 +1577,7 @@ BEGIN
     -- This provides variable retention: 60s=2h, 120s=4h, 300s=10h
     v_slot_id := (v_epoch / v_sample_interval_seconds) % 120;
 
-    -- P0 Safety: Collection jitter (A+ upgrade: prevent synchronized monitoring)
+    -- P0 Safety: Collection jitter (prevent synchronized monitoring)
     DECLARE
         v_jitter_enabled BOOLEAN;
         v_jitter_max INTEGER;
@@ -1610,7 +1610,7 @@ BEGIN
         RETURN v_captured_at;
     END IF;
 
-    -- P0 Safety: System awareness pre-flight checks (A+ upgrade)
+    -- P0 Safety: System awareness pre-flight checks
     DECLARE
         v_skip_reason TEXT;
     BEGIN
@@ -1696,7 +1696,7 @@ BEGIN
         v_adaptive_sampling BOOLEAN;
         v_idle_threshold INTEGER;
         v_active_count INTEGER;
-        -- A GRADE: Advanced load throttling variables
+        -- Advanced load throttling variables
         v_load_throttle_enabled BOOLEAN;
         v_xact_threshold INTEGER;
         v_blk_threshold INTEGER;
@@ -1707,11 +1707,11 @@ BEGIN
         v_blks_read BIGINT;
         v_blks_hit BIGINT;
         v_db_uptime INTERVAL;
-        -- A GRADE: pg_stat_statements overhead protection variables
+        -- pg_stat_statements overhead protection variables
         v_stmt_utilization NUMERIC;
         v_stmt_status TEXT;
     BEGIN
-        -- A GRADE: Load shedding - skip collection during high load
+        -- Load shedding - skip collection during high load
         v_load_shedding_enabled := COALESCE(
             flight_recorder._get_config('load_shedding_enabled', 'true')::boolean,
             true
@@ -1742,7 +1742,7 @@ BEGIN
             END IF;
         END IF;
 
-        -- A GRADE: Advanced load throttling - I/O and transaction rate monitoring
+        -- Advanced load throttling - I/O and transaction rate monitoring
         v_load_throttle_enabled := COALESCE(
                 flight_recorder._get_config('load_throttle_enabled', 'true')::boolean,
                 true
@@ -1794,7 +1794,7 @@ BEGIN
                 END IF;
             END IF;
 
-        -- A GRADE: pg_stat_statements overhead protection
+        -- pg_stat_statements overhead protection
         -- Check pg_stat_statements overhead (skip if > 80% to prevent hash table churn)
         IF flight_recorder._has_pg_stat_statements() THEN
             SELECT utilization_pct, status
@@ -2305,7 +2305,7 @@ BEGIN
         RETURN v_captured_at;
     END IF;
 
-    -- P0 Safety: System awareness pre-flight checks (A+ upgrade)
+    -- P0 Safety: System awareness pre-flight checks
     DECLARE
         v_skip_reason TEXT;
     BEGIN
@@ -2317,7 +2317,7 @@ BEGIN
         END IF;
     END;
 
-    -- P0 Safety: Job deduplication - prevent queue buildup (A+ UPGRADE)
+    -- P0 Safety: Job deduplication - prevent queue buildup
     -- If another snapshot() job is already running, skip this cycle
     DECLARE
         v_running_count INTEGER;
@@ -2625,7 +2625,7 @@ BEGIN
             IF v_should_collect THEN
                 PERFORM flight_recorder._set_section_timeout();
 
-                -- A+ UPGRADE: Check for concurrent pg_stat_statements readers
+                -- Check for concurrent pg_stat_statements readers
                 DECLARE
                     v_check_conflicts BOOLEAN;
                     v_pss_conflict BOOLEAN;
@@ -3741,12 +3741,12 @@ BEGIN
     );
 
     -- Set mode-specific configuration
-    -- Adaptive frequency: Each mode sets explicit interval (normal=120s, light=120s, emergency=300s) - A GRADE
+    -- Adaptive frequency: Each mode sets explicit interval (normal=120s, light=120s, emergency=300s)
     CASE p_mode
         WHEN 'normal' THEN
             v_enable_locks := TRUE;
             v_enable_progress := TRUE;
-            v_sample_interval_seconds := 180;  -- Normal mode: 180s intervals (6h retention) - A+ GRADE: Ultra-conservative
+            v_sample_interval_seconds := 180;  -- Normal mode: 180s intervals (6h retention) - Ultra-conservative
             v_description := 'Normal mode: 180s sampling, all collectors enabled (6h retention)';
         WHEN 'light' THEN
             v_enable_locks := TRUE;
@@ -4193,7 +4193,7 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Schedule sample (default 180 second interval for ring buffer) - A+ GRADE
+    -- Schedule sample (default 180 second interval for ring buffer)
     -- Ring buffer architecture uses configurable intervals (180s default, 300s emergency)
     -- Initial schedule is every 3 minutes; actual interval controlled by sample_interval_seconds config
     PERFORM cron.schedule(
@@ -4201,7 +4201,7 @@ BEGIN
         '*/3 * * * *',
         'SELECT flight_recorder.sample()'
     );
-    v_sample_schedule := 'every 180 seconds (ring buffer, A+ GRADE default)';
+    v_sample_schedule := 'every 180 seconds (ring buffer, default)';
     RAISE NOTICE 'Flight Recorder installed. Sampling %', v_sample_schedule;
 
     -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
@@ -4380,7 +4380,7 @@ BEGIN
         END::text
     FROM flight_recorder._check_statements_health() h;
 
-    -- Component 7: pg_cron Job Health (A+ UPGRADE)
+    -- Component 7: pg_cron Job Health
     -- Verify all 4 required jobs exist and are active
     DECLARE
         v_job_count INTEGER;
@@ -5240,7 +5240,7 @@ BEGIN
             'Collections are stale. Check pg_cron jobs: SELECT * FROM cron.job WHERE jobname LIKE ''flight_recorder_%'';'::text;
     END IF;
 
-    -- Metric 6: pg_cron Job Health (A+ UPGRADE)
+    -- Metric 6: pg_cron Job Health
     -- Verify all 4 required jobs exist and are active
     DECLARE
         v_missing_count INTEGER;
@@ -5338,7 +5338,7 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Collection schedule:';
     RAISE NOTICE '  - Snapshots: every 5 minutes (WAL, checkpoints, I/O stats) - DURABLE';
-    RAISE NOTICE '  - Samples: every 180 seconds (ring buffer, 120 slots, 6-hour retention, A+ GRADE default)';
+    RAISE NOTICE '  - Samples: every 180 seconds (ring buffer, 120 slots, 6-hour retention, default)';
     RAISE NOTICE '  - Flush: every 5 minutes (ring buffer → durable aggregates)';
     RAISE NOTICE '  - Cleanup: daily at 3 AM (aggregates: 7 days, snapshots: 30 days)';
     RAISE NOTICE '';

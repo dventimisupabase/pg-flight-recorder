@@ -175,11 +175,11 @@ Daily:     cleanup() → Delete old TIER 2 and TIER 3 data
 
 ## Collection Modes
 
-Modes control **what** is collected and **how often**. A+ GRADE: Ultra-conservative 180s + proactive throttling.
+Modes control **what** is collected and **how often**. Ultra-conservative 180s intervals with proactive throttling.
 
 | Mode        | Interval | Locks | Activity Detail | Use Case                     |
 |-------------|----------|-------|-----------------|------------------------------|
-| `normal`    | 180s     | Yes   | Full (25 rows)  | Default - A+ GRADE           |
+| `normal`    | 180s     | Yes   | Full (25 rows)  | Default (recommended)        |
 | `light`     | 180s     | Yes   | Full (25 rows)  | Same as normal               |
 | `emergency` | 300s     | No    | Limited         | System stressed (2 sections) |
 
@@ -187,7 +187,7 @@ Modes control **what** is collected and **how often**. A+ GRADE: Ultra-conservat
 SELECT flight_recorder.set_mode('light');
 SELECT * FROM flight_recorder.get_mode();
 
--- A+ GRADE: Ring buffer uses 180s intervals + proactive throttling (480 collections/day)
+-- Ring buffer uses 180s intervals + proactive throttling (480 collections/day)
 -- Emergency mode uses 300s intervals for 40% overhead reduction
 ```
 
@@ -206,9 +206,9 @@ SELECT * FROM flight_recorder.get_mode();
 
 ## Safety Features
 
-### Observer Effect - A+ GRADE UPGRADE
+### Observer Effect
 
-Flight recorder has measurable overhead. **Ultra-conservative 180s default + proactive throttling delivers A+ grade safety.**
+Flight recorder has measurable overhead. **Ultra-conservative 180s default + proactive throttling minimizes impact.**
 
 **Measured Overhead** (PostgreSQL 17.6, 23MB database, 79 tables, Darwin arm64):
 
@@ -257,7 +257,7 @@ Headroom Assessment:
 
 | Mode | Interval | Collections/Day | Sections | Timeout | Measured Cost* | Notes |
 |------|----------|-----------------|----------|---------|----------------|-------|
-| **Normal** | 180s | 480 | 3 | 1000ms | 0.013% CPU | **A+ GRADE**: Ultra-conservative + proactive throttling |
+| **Normal** | 180s | 480 | 3 | 1000ms | 0.013% CPU | Ultra-conservative + proactive throttling |
 | **Light** | 180s | 480 | 3 | 1000ms | 0.013% CPU | Same as normal |
 | **Emergency** | 300s | 288 | 2 | 1000ms | 0.008% CPU | Wait events, activity only (locks disabled) |
 
@@ -276,7 +276,7 @@ Headroom Assessment:
 
 - ✓ Staging/dev (always-on monitoring recommended)
 - ✓ Production troubleshooting (enable during incidents, disable after)
-- ✓ Production always-on (A+ GRADE: ultra-conservative with proactive throttling, test in staging first)
+- ✓ Production always-on (ultra-conservative with proactive throttling, test in staging first)
 - ⚠ Resource-constrained databases (< 4 CPU cores, < 8GB RAM - monitor overhead)
 - ⚠ High-DDL workloads (frequent schema changes - load throttling helps but monitor)
 
@@ -296,17 +296,17 @@ SELECT flight_recorder.disable();
 SELECT * FROM flight_recorder.validate_config();
 ```
 
-### Observer Effect Prevention - A GRADE UPGRADES
+### Observer Effect Prevention
 
 Flight recorder is designed to minimize impact on the database it monitors:
 
-**Load Shedding (A GRADE)**
+**Load Shedding**
 - Automatically skips collection when active connections > 70% of max_connections
 - Proactive protection against observer effect during high load
 - Configurable threshold via `load_shedding_active_pct` config
 - Enabled by default (set `load_shedding_enabled = 'false'` to disable)
 
-**Load Throttling (NEW - A GRADE)**
+**Load Throttling**
 - **Transaction rate monitoring**: Skips when commits+rollbacks > 1,000/sec
 - **I/O pressure detection**: Skips when block reads+writes > 10,000/sec  
 - Prevents observer effect amplification during sustained heavy workloads
@@ -314,7 +314,7 @@ Flight recorder is designed to minimize impact on the database it monitors:
 - Configurable via `load_throttle_xact_threshold` and `load_throttle_blk_threshold`
 - Enabled by default (set `load_throttle_enabled = 'false'` to disable)
 
-**pg_stat_statements Overhead Protection (NEW - A GRADE)**
+**pg_stat_statements Overhead Protection**
 - Automatically skips collection when hash table utilization > 80%
 - Prevents statement evictions and hash table churn during collection
 - Monitors pg_stat_statements_info (PG14+) for dealloc count
@@ -560,17 +560,17 @@ Key settings:
 | `lock_timeout_ms`                   | 100     | Max wait for catalog locks                     |
 | `skip_locks_threshold`              | 50      | Skip lock collection if > N blocked            |
 | `skip_activity_conn_threshold`      | 100     | Skip activity if > N active conns              |
-| `sample_interval_seconds`           | 180     | **A+ SAFETY**: Adaptive frequency (180s default)|
+| `sample_interval_seconds`           | 180     | Adaptive frequency (180s default)              |
 | `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
 | `statements_top_n`                  | 20      | Number of top queries to capture               |
 | `snapshot_based_collection`         | true    | Use temp table snapshot (reduces catalog locks)|
 | `adaptive_sampling`                 | false   | Skip collection when system idle               |
 | `adaptive_sampling_idle_threshold`  | 5       | Skip if < N active connections                 |
-| `load_shedding_enabled`             | true    | **A- SAFETY**: Skip during high load           |
-| `load_shedding_active_pct`          | 70      | **A- SAFETY**: Skip if active conn > N% max    |
-| `load_throttle_enabled`             | true    | **A GRADE**: Skip during I/O/txn pressure      |
-| `load_throttle_xact_threshold`      | 1000    | **A GRADE**: Skip if commits+rollbacks > N/sec |
-| `load_throttle_blk_threshold`       | 10000   | **A GRADE**: Skip if block I/O > N/sec         |
+| `load_shedding_enabled`             | true    | Skip during high load                          |
+| `load_shedding_active_pct`          | 70      | Skip if active conn > N% max                   |
+| `load_throttle_enabled`             | true    | Skip during I/O/txn pressure                   |
+| `load_throttle_xact_threshold`      | 1000    | Skip if commits+rollbacks > N/sec              |
+| `load_throttle_blk_threshold`       | 10000   | Skip if block I/O > N/sec                      |
 | `schema_size_warning_mb`            | 5000    | Warning threshold                              |
 | `schema_size_critical_mb`           | 10000   | Auto-disable threshold                         |
 | `retention_samples_days`            | 7       | Sample retention                               |
@@ -669,13 +669,13 @@ Flight recorder includes advanced features to reduce overhead and catalog lock c
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'snapshot_based_collection';
 ```
 
-### Adaptive Sampling (A+ GRADE)
+### Adaptive Sampling
 
 **Purpose:** Reduce average overhead by skipping collection when system is idle
 
 **How it works:** Before each sample, checks active connection count. If fewer than threshold (default: 5), skips collection entirely.
 
-**Status:** ✓ Enabled by default (A+ GRADE optimization)
+**Status:** ✓ Enabled by default
 
 **Impact:**
 - Overhead during idle: ~0% (skips collection)
