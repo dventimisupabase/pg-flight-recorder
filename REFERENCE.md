@@ -57,13 +57,13 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 - **Fixed 60-second intervals** - Consistent slot rotation (slot = epoch / 60 % 120)
 - **2-hour retention** - 120 slots × 60 seconds = 7,200 seconds
 - **UPSERT pattern** - samples_ring uses HOT updates (90%+ ratio, minimal bloat)
-- **DELETE+INSERT pattern** - Child tables cleared per slot (aggressive autovacuum handles dead tuples)
+- **UPDATE-only pattern** - Child tables pre-populated (27K rows), cleared via UPDATE to NULL, then UPSERT (zero DELETEs, 100% HOT updates, eliminates dead tuples)
 - **Ring buffer self-cleans** - New data overwrites old slots automatically
 
 **Optimization:**
 - `fillfactor=70` on master (30% free space for HOT updates)
 - `fillfactor=80` on children (reduce page splits)
-- Aggressive autovacuum settings (scale_factor=0.02-0.05, threshold=10-20, cost_delay=0)
+- Autovacuum settings tuned for HOT updates (scale_factor=0.02-0.05, threshold=10-20, cost_delay=0)
 
 **Query with:**
 - `recent_waits`, `recent_activity`, `recent_locks` views (last 2 hours)
