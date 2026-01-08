@@ -58,6 +58,123 @@ Headroom Assessment:
 
 **That's it.** No complex workload simulation needed.
 
+## DDL Blocking Impact Measurement (NEW)
+
+### Purpose
+
+Measure how often and how long flight recorder blocks DDL operations (ALTER TABLE, CREATE INDEX, etc.) due to AccessShareLock contention on system catalogs.
+
+**Key Questions Answered:**
+- What % of DDL operations encounter blocking from flight recorder?
+- How long do blocked DDL operations wait?
+- What's the expected collision rate at different workload levels?
+
+### Run DDL Impact Test
+
+```bash
+cd benchmark
+
+# Run 5-minute test (default: 180s interval, normal mode)
+./measure_ddl_impact.sh
+
+# Custom duration and interval
+./measure_ddl_impact.sh 600 300  # 10 min test, 300s interval (emergency mode)
+
+# Output:
+# - DDL collision rate (% of operations blocked by flight recorder)
+# - Wait time distribution (P50, P95, P99)
+# - Risk assessment and recommendations
+# - Report: results/ddl_impact_YYYYMMDD_HHMMSS/ddl_impact_report.md
+```
+
+### Example Output
+
+```
+DDL Blocking Impact Report
+
+Total DDL Operations: 1,247
+Operations Blocked by Flight Recorder: 28 (2.24%)
+
+All DDL Operations (Duration):
+  Median: 12.3 ms
+  P95:    45.7 ms
+  P99:    78.2 ms
+
+Blocked Operations Only:
+  Median: 18.9 ms
+  P95:    67.3 ms
+  P99:    95.1 ms
+
+Average Delay from Blocking: 6.6 ms
+
+Impact Assessment (180s intervals):
+  Flight recorder runs: 480 collections/day
+  Expected DDL collisions: ~26.8 per day
+  If you run 100 DDL ops/hour: ~2.2 will encounter blocking
+
+Risk Level: LOW - Minimal DDL impact
+Recommendation: Safe for production use with high DDL workloads
+```
+
+### Interpreting Results
+
+**Collision Rate:**
+- **<1%**: Negligible impact - safe for DDL-heavy workloads
+- **1-3%**: Low impact - acceptable for most workloads
+- **3-5%**: Moderate impact - monitor if >50 DDL ops/hour
+- **>5%**: High impact - consider emergency mode (300s) during DDL-heavy periods
+
+**Average Delay:**
+- **<10ms**: Minimal impact
+- **10-50ms**: Acceptable for most applications
+- **50-100ms**: May be noticeable for latency-sensitive DDL
+- **>100ms**: Consider scheduling DDL during maintenance windows
+
+### What This Measures
+
+The test:
+1. Runs flight recorder at specified interval (default: 180s)
+2. Continuously executes DDL operations (ALTER, CREATE INDEX, DROP, VACUUM)
+3. Detects when DDL waits for locks via pg_locks
+4. Identifies if flight recorder's catalog queries are the blocker
+
+**AccessShareLock Contention:**
+- Flight recorder queries: pg_stat_activity, pg_locks, pg_class, etc.
+- These acquire AccessShareLock on system catalogs
+- DDL operations need AccessExclusiveLock
+- When flight recorder holds AccessShareLock, DDL must wait
+
+### Reducing DDL Impact
+
+If collision rate is concerning:
+
+```sql
+-- Option 1: Use emergency mode (300s intervals = 40% fewer collections)
+SELECT flight_recorder.set_mode('emergency');
+
+-- Option 2: Increase lock_timeout (fail faster, less DDL delay)
+UPDATE flight_recorder.config
+SET value = '50'
+WHERE key = 'lock_timeout_ms';
+
+-- Option 3: Disable during DDL-heavy maintenance
+SELECT flight_recorder.disable();
+-- ... run DDL operations ...
+SELECT flight_recorder.enable();
+```
+
+### When to Run This Test
+
+**Required for:**
+- High-DDL workloads (multi-tenant SaaS with frequent schema changes)
+- Latency-sensitive applications where DDL timing matters
+- Before enabling always-on production monitoring
+
+**Less critical for:**
+- Low-DDL workloads (<10 DDL ops/hour)
+- Troubleshooting/staging use (not always-on)
+- Maintenance-window-only DDL
+
 ## Integration Testing (Optional)
 
 The scenario-based tests validate **safety features work**, not performance impact.
