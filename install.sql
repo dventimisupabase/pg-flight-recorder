@@ -260,10 +260,10 @@
 --
 -- SCHEDULED JOBS (pg_cron)
 -- ------------------------
---   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes)
---   flight_recorder_sample    : 180 seconds   (default 3-minute sampling - configurable via sample_interval_seconds)
---   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - drops old partitions and cleans snapshots)
---   flight_recorder_partition : 0 2 * * *     (daily at 2 AM - creates future partitions proactively)
+--   flight_recorder_snapshot  : */5 * * * *   (every 5 minutes - snapshots, replication)
+--   flight_recorder_sample    : 60 seconds    (fixed 60s - ring buffer requires consistent intervals)
+--   flight_recorder_flush     : */5 * * * *   (every 5 minutes - flush ring buffer to aggregates)
+--   flight_recorder_cleanup   : 0 3 * * *     (daily at 3 AM - cleans old aggregates and snapshots)
 --
 --   NOTE: The installer auto-detects pg_cron version. If < 1.4.1 (e.g., "1.4-1"),
 --   it falls back to minute-level sampling and logs a notice.
@@ -623,7 +623,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('auto_mode_connections_threshold', '60'), -- Switch to light at 60% of max_connections
     ('auto_mode_trips_threshold', '3'),        -- Switch to emergency if circuit breaker tripped N times in 10min
     -- Configurable retention by table type
-    ('retention_samples_days', '7'),           -- Retention for samples table
+    ('retention_samples_days', '7'),           -- Retention for samples table (legacy, ring buffers self-clean)
+    ('aggregate_retention_days', '7'),         -- Retention for aggregate tables (TIER 2)
     ('retention_snapshots_days', '30'),        -- Retention for snapshots table
     ('retention_statements_days', '30'),       -- Retention for pg_stat_statements snapshots
     ('retention_collection_stats_days', '30'), -- Retention for collection_stats table
@@ -1709,6 +1710,49 @@ END;
 $$;
 
 COMMENT ON FUNCTION flight_recorder.flush_ring_to_aggregates() IS 'TIER 2: Flush ring buffer to durable aggregates every 5 minutes';
+
+-- -----------------------------------------------------------------------------
+-- flight_recorder.cleanup_aggregates() - Clean up old aggregates
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_aggregate_retention interval;
+    v_deleted_waits INTEGER;
+    v_deleted_locks INTEGER;
+    v_deleted_queries INTEGER;
+BEGIN
+    -- Get retention period (default 7 days)
+    v_aggregate_retention := COALESCE(
+        (SELECT value FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
+        '7 days'::interval
+    );
+
+    -- Delete old wait event aggregates
+    DELETE FROM flight_recorder.wait_event_aggregates
+    WHERE start_time < now() - v_aggregate_retention;
+    GET DIAGNOSTICS v_deleted_waits = ROW_COUNT;
+
+    -- Delete old lock aggregates
+    DELETE FROM flight_recorder.lock_aggregates
+    WHERE start_time < now() - v_aggregate_retention;
+    GET DIAGNOSTICS v_deleted_locks = ROW_COUNT;
+
+    -- Delete old query aggregates
+    DELETE FROM flight_recorder.query_aggregates
+    WHERE start_time < now() - v_aggregate_retention;
+    GET DIAGNOSTICS v_deleted_queries = ROW_COUNT;
+
+    IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'TIER 2: Clean up old aggregate data based on retention period';
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.snapshot() - Capture current state
@@ -3191,36 +3235,12 @@ $$;
 -- -----------------------------------------------------------------------------
 
 -- Create future partitions for samples table (daily partitions)
+-- Partition management is no longer needed - ring buffers are self-managing
 CREATE OR REPLACE FUNCTION flight_recorder.create_partitions(p_days_ahead INTEGER DEFAULT 3)
 RETURNS TEXT
 LANGUAGE plpgsql AS $$
-DECLARE
-    v_partition_date DATE;
-    v_partition_name TEXT;
-    v_start_date TEXT;
-    v_end_date TEXT;
-    v_created INTEGER := 0;
 BEGIN
-    FOR i IN 0..p_days_ahead LOOP
-        v_partition_date := CURRENT_DATE + (i || ' days')::interval;
-        v_partition_name := 'samples_' || TO_CHAR(v_partition_date, 'YYYYMMDD');
-        v_start_date := v_partition_date::TEXT;
-        v_end_date := (v_partition_date + 1)::TEXT;
-
-        -- Check if partition exists
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_tables
-            WHERE schemaname = 'flight_recorder' AND tablename = v_partition_name
-        ) THEN
-            EXECUTE format(
-                'CREATE TABLE flight_recorder.%I PARTITION OF flight_recorder.samples FOR VALUES FROM (%L) TO (%L)',
-                v_partition_name, v_start_date, v_end_date
-            );
-            v_created := v_created + 1;
-        END IF;
-    END LOOP;
-
-    RETURN format('Created %s future partition(s) for samples table', v_created);
+    RETURN 'This function is deprecated. Ring buffer architecture (v2.0+) does not use partitions. Ring buffers are self-managing with fixed memory footprint.';
 END;
 $$;
 
@@ -3228,46 +3248,8 @@ $$;
 CREATE OR REPLACE FUNCTION flight_recorder.drop_old_partitions(p_retention_days INTEGER DEFAULT NULL)
 RETURNS TEXT
 LANGUAGE plpgsql AS $$
-DECLARE
-    v_retention_days INTEGER;
-    v_cutoff_date DATE;
-    v_partition_name TEXT;
-    v_partition_date DATE;
-    v_dropped INTEGER := 0;
 BEGIN
-    -- Get retention from config
-    v_retention_days := COALESCE(
-        p_retention_days,
-        flight_recorder._get_config('retention_samples_days', '7')::integer,
-        7
-    );
-
-    v_cutoff_date := CURRENT_DATE - v_retention_days;
-
-    -- Find and drop old partitions
-    FOR v_partition_name IN
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname = 'flight_recorder'
-          AND tablename LIKE 'samples_%'
-          AND tablename ~ 'samples_\d{8}$'
-        ORDER BY tablename
-    LOOP
-        -- Extract date from partition name (format: samples_YYYYMMDD)
-        BEGIN
-            v_partition_date := TO_DATE(substring(v_partition_name from 9), 'YYYYMMDD');
-
-            IF v_partition_date < v_cutoff_date THEN
-                EXECUTE format('DROP TABLE IF EXISTS flight_recorder.%I', v_partition_name);
-                v_dropped := v_dropped + 1;
-                RAISE NOTICE 'Dropped old partition: %', v_partition_name;
-            END IF;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'Failed to process partition %: %', v_partition_name, SQLERRM;
-        END;
-    END LOOP;
-
-    RETURN format('Dropped %s old partition(s) older than % days', v_dropped, v_retention_days);
+    RETURN 'This function is deprecated. Ring buffer architecture (v2.0+) does not use partitions. Ring buffers self-clean automatically using modular arithmetic. Use cleanup_aggregates() for TIER 2 aggregate cleanup.';
 END;
 $$;
 
@@ -3281,19 +3263,8 @@ RETURNS TABLE(
 )
 LANGUAGE plpgsql AS $$
 BEGIN
-    RETURN QUERY
-    SELECT
-        t.tablename::TEXT,
-        TO_DATE(substring(t.tablename from 9), 'YYYYMMDD'),
-        pg_size_pretty(pg_total_relation_size('flight_recorder.' || t.tablename)),
-        (SELECT count(*) FROM pg_class c
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = 'flight_recorder' AND c.relname = t.tablename)::BIGINT
-    FROM pg_tables t
-    WHERE t.schemaname = 'flight_recorder'
-      AND t.tablename LIKE 'samples_%'
-      AND t.tablename ~ 'samples_\d{8}$'
-    ORDER BY t.tablename;
+    RAISE NOTICE 'This function is deprecated. Ring buffer architecture (v2.0+) does not use partitions. Use: SELECT * FROM flight_recorder.samples_ring to view ring buffer slots.';
+    RETURN;
 END;
 $$;
 
@@ -3389,38 +3360,19 @@ BEGIN
         PERFORM cron.schedule('flight_recorder_snapshot', '*/5 * * * *', 'SELECT flight_recorder.snapshot()');
         v_scheduled := v_scheduled + 1;
 
-        -- Schedule sample based on configurable interval
-        -- Convert seconds to minutes for cron format (only supports minute granularity)
-        IF v_sample_interval_seconds < 60 THEN
-            -- Sub-minute intervals not supported reliably, default to 60s
-            v_cron_expression := '* * * * *';
-            v_sample_schedule := 'every minute (60s)';
-        ELSIF v_sample_interval_seconds = 60 THEN
-            v_cron_expression := '* * * * *';
-            v_sample_schedule := 'every minute (60s)';
-        ELSE
-            -- Convert to minutes (round up)
-            v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
-            v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
-            v_sample_schedule := format('every %s minutes (%ss)', v_sample_interval_minutes, v_sample_interval_seconds);
-        END IF;
-
-        -- Emergency mode overrides with 2-minute minimum interval
-        IF v_mode = 'emergency' AND v_sample_interval_minutes < 2 THEN
-            v_cron_expression := '*/2 * * * *';
-            v_sample_schedule := 'every 2 minutes (emergency mode override)';
-        END IF;
-
-        PERFORM cron.schedule('flight_recorder_sample', v_cron_expression, 'SELECT flight_recorder.sample()');
+        -- Schedule sample (fixed 60 second interval for ring buffer)
+        -- Ring buffer architecture requires consistent 60s intervals for proper slot rotation
+        PERFORM cron.schedule('flight_recorder_sample', '60 seconds', 'SELECT flight_recorder.sample()');
+        v_sample_schedule := 'every 60 seconds (ring buffer)';
         v_scheduled := v_scheduled + 1;
 
-        -- Schedule cleanup (daily at 3 AM) - now uses drop_old_partitions for samples table
+        -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
+        PERFORM cron.schedule('flight_recorder_flush', '*/5 * * * *', 'SELECT flight_recorder.flush_ring_to_aggregates()');
+        v_scheduled := v_scheduled + 1;
+
+        -- Schedule cleanup (daily at 3 AM) - clean old aggregates and snapshots
         PERFORM cron.schedule('flight_recorder_cleanup', '0 3 * * *',
-            'SELECT flight_recorder.drop_old_partitions(); SELECT * FROM flight_recorder.cleanup(''7 days''::interval);');
-        v_scheduled := v_scheduled + 1;
-
-        -- Schedule partition creation (daily at 2 AM) - create future partitions proactively
-        PERFORM cron.schedule('flight_recorder_partition', '0 2 * * *', 'SELECT flight_recorder.create_partitions(3)');
+            'SELECT flight_recorder.cleanup_aggregates(); SELECT * FROM flight_recorder.cleanup(''30 days''::interval);');
         v_scheduled := v_scheduled + 1;
 
         -- Mark as enabled in config
@@ -3504,40 +3456,28 @@ BEGIN
         'SELECT flight_recorder.snapshot()'
     );
 
-    -- Schedule sample collection based on configured interval
-    IF v_sample_interval_seconds < 60 THEN
-        -- Sub-minute intervals - round up to 60s (not reliably supported)
-        v_cron_expression := '* * * * *';
-        v_sample_schedule := 'every minute (60s, rounded from ' || v_sample_interval_seconds || 's config)';
-    ELSIF v_sample_interval_seconds = 60 THEN
-        v_cron_expression := '* * * * *';
-        v_sample_schedule := 'every minute (60s)';
-    ELSE
-        -- Multi-minute intervals - convert to minutes
-        v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
-        v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
-        v_sample_schedule := format('every %s minutes (%ss)', v_sample_interval_minutes, v_sample_interval_seconds);
-    END IF;
-
+    -- Schedule sample (fixed 60 second interval for ring buffer)
+    -- Ring buffer architecture requires consistent 60s intervals for proper slot rotation
     PERFORM cron.schedule(
         'flight_recorder_sample',
-        v_cron_expression,
+        '60 seconds',
         'SELECT flight_recorder.sample()'
     );
+    v_sample_schedule := 'every 60 seconds (ring buffer)';
     RAISE NOTICE 'Flight Recorder installed. Sampling %', v_sample_schedule;
 
-    -- Schedule cleanup (daily at 3 AM) - uses drop_old_partitions
+    -- Schedule flush (every 5 minutes) - flush ring buffer to durable aggregates
+    PERFORM cron.schedule(
+        'flight_recorder_flush',
+        '*/5 * * * *',
+        'SELECT flight_recorder.flush_ring_to_aggregates()'
+    );
+
+    -- Schedule cleanup (daily at 3 AM) - clean old aggregates and snapshots
     PERFORM cron.schedule(
         'flight_recorder_cleanup',
         '0 3 * * *',
-        'SELECT flight_recorder.drop_old_partitions(); SELECT * FROM flight_recorder.cleanup(''7 days''::interval);'
-    );
-
-    -- Schedule partition creation (daily at 2 AM) - create future partitions proactively
-    PERFORM cron.schedule(
-        'flight_recorder_partition',
-        '0 2 * * *',
-        'SELECT flight_recorder.create_partitions(3)'
+        'SELECT flight_recorder.cleanup_aggregates(); SELECT * FROM flight_recorder.cleanup(''30 days''::interval);'
     );
 
 EXCEPTION
@@ -3670,51 +3610,15 @@ RETURNS TABLE(
 )
 LANGUAGE plpgsql AS $$
 BEGIN
+    -- Ring buffer architecture (v2.0+): samples table replaced with samples_ring (120 fixed slots)
     RETURN QUERY
-    WITH partition_info AS (
-        SELECT
-            p.relname as parent_table,
-            c.relname as partition_name,
-            pg_get_expr(c.relpartbound, c.oid) as partition_bound
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_inherits i ON i.inhrelid = c.oid
-        JOIN pg_class p ON p.oid = i.inhparent
-        WHERE n.nspname = 'flight_recorder'
-          AND p.relname IN ('samples', 'snapshots')
-          AND c.relkind = 'r'
-    )
     SELECT
-        t.table_name::text,
-        (EXISTS (
-            SELECT 1 FROM pg_partitioned_table pt
-            JOIN pg_class c ON c.oid = pt.partrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'flight_recorder' AND c.relname = t.table_name
-        )) as is_partitioned,
-        COALESCE(pi.cnt, 0)::integer as partition_count,
-        pi.oldest::text,
-        pi.newest::text,
-        CASE
-            WHEN NOT (EXISTS (
-                SELECT 1 FROM pg_partitioned_table pt
-                JOIN pg_class c ON c.oid = pt.partrelid
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = 'flight_recorder' AND c.relname = t.table_name
-            )) THEN 'Table not partitioned. See documentation for migration procedure.'
-            WHEN pi.cnt = 0 THEN 'No partitions found. Run create_next_partition().'
-            WHEN pi.cnt < 2 THEN 'Low partition count. Consider running create_next_partition().'
-            ELSE 'OK'
-        END::text as recommendation
-    FROM (VALUES ('samples'), ('snapshots')) AS t(table_name)
-    LEFT JOIN LATERAL (
-        SELECT
-            count(*) as cnt,
-            min(partition_name) as oldest,
-            max(partition_name) as newest
-        FROM partition_info
-        WHERE parent_table = t.table_name
-    ) pi ON true;
+        'samples_ring'::text,
+        false,
+        120,
+        'Ring buffer: 120 slots (fixed)'::text,
+        'Self-cleaning via modular arithmetic'::text,
+        'Ring buffer architecture active. Fixed 120KB memory footprint, 2-hour retention at 60s intervals.'::text;
 END;
 $$;
 
@@ -3885,8 +3789,8 @@ BEGIN
             SELECT unnest(ARRAY[
                 'flight_recorder_sample',
                 'flight_recorder_snapshot',
-                'flight_recorder_cleanup',
-                'flight_recorder_partition'
+                'flight_recorder_flush',
+                'flight_recorder_cleanup'
             ]) AS job_name
         )
         SELECT
@@ -4753,8 +4657,8 @@ BEGIN
             SELECT unnest(ARRAY[
                 'flight_recorder_sample',
                 'flight_recorder_snapshot',
-                'flight_recorder_cleanup',
-                'flight_recorder_partition'
+                'flight_recorder_flush',
+                'flight_recorder_cleanup'
             ]) AS job_name
         )
         SELECT
@@ -4770,7 +4674,7 @@ BEGIN
             RETURN QUERY SELECT
                 '6. pg_cron Job Health'::text,
                 'EXCELLENT'::text,
-                '4/4 jobs active (sample, snapshot, cleanup, partition)',
+                '4/4 jobs active (sample, snapshot, flush, cleanup)',
                 'All pg_cron jobs are running correctly.'::text;
         ELSIF v_missing_count > 0 THEN
             RETURN QUERY SELECT
@@ -4839,8 +4743,9 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Collection schedule:';
     RAISE NOTICE '  - Snapshots: every 5 minutes (WAL, checkpoints, I/O stats) - DURABLE';
-    RAISE NOTICE '  - Samples: % (wait events, activity, progress, locks)', COALESCE(v_sample_schedule, 'not scheduled');
-    RAISE NOTICE '  - Cleanup: daily at 3 AM (samples: 7 days, snapshots: 30 days)';
+    RAISE NOTICE '  - Samples: every 60 seconds (ring buffer, 120 slots, 2-hour retention, fixed 120KB memory)';
+    RAISE NOTICE '  - Flush: every 5 minutes (ring buffer → durable aggregates)';
+    RAISE NOTICE '  - Cleanup: daily at 3 AM (aggregates: 7 days, snapshots: 30 days)';
     RAISE NOTICE '';
     RAISE NOTICE 'Quick start:';
     RAISE NOTICE '  1. Flight Recorder collects automatically in the background';
@@ -4851,10 +4756,9 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Views for recent activity:';
     RAISE NOTICE '  - flight_recorder.deltas            (snapshot deltas incl. temp files)';
-    RAISE NOTICE '  - flight_recorder.recent_waits      (wait events, last 2 hours)';
-    RAISE NOTICE '  - flight_recorder.recent_activity   (active sessions, last 2 hours)';
-    RAISE NOTICE '  - flight_recorder.recent_locks      (lock contention, last 2 hours)';
-    RAISE NOTICE '  - flight_recorder.recent_progress   (vacuum/copy/analyze progress, last 2 hours)';
+    RAISE NOTICE '  - flight_recorder.recent_waits      (wait events, last 2 hours from ring buffer)';
+    RAISE NOTICE '  - flight_recorder.recent_activity   (active sessions, last 2 hours from ring buffer)';
+    RAISE NOTICE '  - flight_recorder.recent_locks      (lock contention, last 2 hours from ring buffer)';
     RAISE NOTICE '  - flight_recorder.recent_replication (replication lag, last 2 hours)';
     RAISE NOTICE '';
 EXCEPTION
