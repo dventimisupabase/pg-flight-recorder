@@ -588,7 +588,7 @@ Or against your own PostgreSQL 15+ instance:
 ```bash
 psql -f install.sql
 psql -c "CREATE EXTENSION pgtap;"
-pg_prove -U postgres -d postgres tests/flight_recorder_test.sql
+pg_prove -U postgres -d postgres flight_recorder_test.sql
 ```
 
 **Note:** VACUUM warnings during tests are expected (tests run in transactions).
@@ -611,10 +611,9 @@ psql -f uninstall.sql
 pg-flight-recorder/
 ├── install.sql                  # Installation script
 ├── uninstall.sql                # Uninstall script
+├── flight_recorder_test.sql     # pgTAP tests (118 tests)
 ├── docker-compose.yml           # PostgreSQL + pg_cron for testing
 ├── test.sh                      # Test runner script
-├── tests/
-│   └── flight_recorder_test.sql # pgTAP tests (118 tests)
 ├── README.md                    # Quick start
 └── REFERENCE.md                 # This file (full documentation)
 ```

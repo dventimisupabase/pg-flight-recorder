@@ -50,7 +50,7 @@ run_tests() {
     docker-compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
 
     echo "Running tests..."
-    docker-compose exec -T postgres pg_prove -U postgres -d postgres /tests/flight_recorder_test.sql
+    docker-compose exec -T postgres pg_prove -U postgres -d postgres /flight_recorder_test.sql
 
     echo "PostgreSQL $pg_version: PASS"
 }

@@ -88,7 +88,7 @@ Or test against your own PostgreSQL 15+ instance with pg_cron and pgTAP installe
 ```bash
 psql -f install.sql
 psql -c "CREATE EXTENSION pgtap;"
-pg_prove -U postgres -d postgres tests/flight_recorder_test.sql
+pg_prove -U postgres -d postgres flight_recorder_test.sql
 ```
 
 ## Documentation
