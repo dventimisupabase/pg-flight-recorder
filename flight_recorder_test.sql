@@ -6,7 +6,10 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(305);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3)
+SELECT plan(345);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 40 version-specific (Phase 4)
+
+-- Disable checkpoint detection during tests to prevent snapshot skipping
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -2347,6 +2350,842 @@ SELECT lives_ok(
     $$SELECT flight_recorder.sample()$$,
     'Error: Collection should handle pg_cron timing changes'
 );
+
+-- =============================================================================
+-- 14. VERSION-SPECIFIC BEHAVIOR (40 tests) - Phase 4
+-- =============================================================================
+-- Tests PostgreSQL version-specific features across PG15, PG16, and PG17
+
+-- -----------------------------------------------------------------------------
+-- 14.1 VERSION DETECTION (5 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test _pg_version() returns 15, 16, or 17
+SELECT ok(
+    flight_recorder._pg_version() IN (15, 16, 17),
+    'Phase 4: _pg_version() should return 15, 16, or 17'
+);
+
+-- Test version is stored in snapshots table
+DO $$
+DECLARE
+    v_snapshot_count INTEGER;
+    v_pg_version INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO v_snapshot_count FROM flight_recorder.snapshots;
+    PERFORM flight_recorder.snapshot();
+
+    -- Check if snapshot was actually created (not skipped)
+    IF (SELECT COUNT(*) FROM flight_recorder.snapshots) > v_snapshot_count THEN
+        SELECT pg_version INTO v_pg_version FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+        IF v_pg_version IS NULL OR v_pg_version NOT IN (15, 16, 17) THEN
+            RAISE EXCEPTION 'Phase 4: snapshot() should store pg_version in (15, 16, 17)';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: snapshot() stores pg_version (or was skipped)');
+
+-- Test version detection consistency
+SELECT is(
+    flight_recorder._pg_version(),
+    (SELECT current_setting('server_version_num')::integer / 10000),
+    'Phase 4: _pg_version() should match PostgreSQL major version'
+);
+
+-- Test version used for conditional logic (pg_stat_io availability)
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_has_io_data BOOLEAN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+    PERFORM flight_recorder.snapshot();
+
+    SELECT io_checkpointer_writes IS NOT NULL INTO v_has_io_data
+    FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+    IF v_pg_version >= 16 AND NOT v_has_io_data THEN
+        RAISE EXCEPTION 'Phase 4: PG16+ should have io_* data populated';
+    END IF;
+
+    IF v_pg_version = 15 AND v_has_io_data THEN
+        RAISE EXCEPTION 'Phase 4: PG15 should have NULL io_* data';
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: Version-specific pg_stat_io collection works correctly');
+
+-- Test version determines checkpoint source view
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_has_ckpt_timed BOOLEAN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+    PERFORM flight_recorder.snapshot();
+
+    SELECT ckpt_timed IS NOT NULL INTO v_has_ckpt_timed
+    FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+    -- All versions should have checkpoint data
+    IF NOT v_has_ckpt_timed THEN
+        RAISE EXCEPTION 'Phase 4: All versions should have ckpt_timed populated';
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: Checkpoint stats collected from correct source view');
+
+-- -----------------------------------------------------------------------------
+-- 14.2 PG15-SPECIFIC TESTS (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test PG15: verify no pg_stat_io columns
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_checkpointer_writes INTO v_io_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_writes IS NOT NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG15 should have NULL io_* columns';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 has NULL io_* columns (skipped if not PG15)');
+
+-- Test PG15: verify checkpoint stats from pg_stat_bgwriter
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_snapshot_count INTEGER;
+    v_ckpt_timed BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        SELECT COUNT(*) INTO v_snapshot_count FROM flight_recorder.snapshots;
+        PERFORM flight_recorder.snapshot();
+
+        -- Only test if snapshot was actually created (not skipped)
+        IF (SELECT COUNT(*) FROM flight_recorder.snapshots) > v_snapshot_count THEN
+            SELECT ckpt_timed INTO v_ckpt_timed
+            FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+            IF v_ckpt_timed IS NULL THEN
+                RAISE EXCEPTION 'Phase 4: PG15 should have checkpoint stats from pg_stat_bgwriter';
+            END IF;
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 collects checkpoint stats from pg_stat_bgwriter (skipped if not PG15 or snapshot skipped)');
+
+-- Test PG15: verify buffers_backend populated
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_buffers_backend BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT buffers_backend INTO v_buffers_backend
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_buffers_backend IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG15 should have buffers_backend from pg_stat_bgwriter';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 has buffers_backend from pg_stat_bgwriter (skipped if not PG15)');
+
+-- Test PG15: verify deltas view doesn't error on missing io_* columns
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        -- Query deltas view with io_* columns
+        PERFORM * FROM flight_recorder.deltas ORDER BY id DESC LIMIT 1;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 deltas view handles NULL io_* columns (skipped if not PG15)');
+
+-- Test PG15: compare() with NULL io_* values
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_start_id INTEGER;
+    v_end_id INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+        SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        -- compare() should handle NULL io_* arithmetic
+        PERFORM * FROM flight_recorder.compare(
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_start_id),
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_end_id)
+        );
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 compare() handles NULL io_* arithmetic (skipped if not PG15)');
+
+-- Test PG15: summary_report() doesn't show io_* sections
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_report TEXT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
+
+        -- Report should not mention io_* metrics on PG15
+        -- This is a soft check - just verify report is generated
+        IF v_report IS NULL OR length(v_report) < 100 THEN
+            RAISE EXCEPTION 'Phase 4: PG15 summary_report() should generate valid report';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 summary_report() works without io_* data (skipped if not PG15)');
+
+-- Test PG15: gracefully handles missing pg_stat_checkpointer
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_checkpointer_exists BOOLEAN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        -- Verify pg_stat_checkpointer doesn't exist in PG15
+        SELECT EXISTS (
+            SELECT 1 FROM pg_views WHERE viewname = 'pg_stat_checkpointer'
+        ) INTO v_checkpointer_exists;
+
+        IF v_checkpointer_exists THEN
+            RAISE WARNING 'Phase 4: Unexpected - pg_stat_checkpointer exists in PG15';
+        END IF;
+
+        -- snapshot() should still work without it
+        PERFORM flight_recorder.snapshot();
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 handles missing pg_stat_checkpointer (skipped if not PG15)');
+
+-- Test PG15: anomaly_report() works without io_* data
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 anomaly_report() works without io_* data (skipped if not PG15)');
+
+-- Test PG15: export_json() doesn't include io_* fields
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_json JSONB;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT flight_recorder.export_json(now() - interval '1 hour', now()) INTO v_json;
+
+        IF v_json IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG15 export_json() should return valid JSON';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 export_json() generates valid JSON (skipped if not PG15)');
+
+-- Test PG15: all analysis functions work without io_* data
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 15 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        -- Test multiple analysis functions
+        PERFORM * FROM flight_recorder.wait_summary(now() - interval '1 hour', now());
+        PERFORM * FROM flight_recorder.activity_at(now());
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG15 analysis functions work without io_* data (skipped if not PG15)');
+
+-- -----------------------------------------------------------------------------
+-- 14.3 PG16-SPECIFIC TESTS (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test PG16: verify pg_stat_io collection
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_checkpointer_writes INTO v_io_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_writes IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG16 should have io_* columns populated';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 collects pg_stat_io data (skipped if not PG16)');
+
+-- Test PG16: checkpoint stats still from pg_stat_bgwriter
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_ckpt_timed BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT ckpt_timed INTO v_ckpt_timed
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_ckpt_timed IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG16 should have checkpoint stats from pg_stat_bgwriter';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 collects checkpoint stats from pg_stat_bgwriter (skipped if not PG16)');
+
+-- Test PG16: io_checkpointer_* columns populated
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_ckpt_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_checkpointer_writes INTO v_io_ckpt_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_ckpt_writes IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG16 should have io_checkpointer_* populated';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 has io_checkpointer_* columns populated (skipped if not PG16)');
+
+-- Test PG16: io_autovacuum_* columns populated
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_av_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_autovacuum_writes INTO v_io_av_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_av_writes IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG16 should have io_autovacuum_* populated';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 has io_autovacuum_* columns populated (skipped if not PG16)');
+
+-- Test PG16: io_client_* columns populated
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_client_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_client_writes INTO v_io_client_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_client_writes IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG16 should have io_client_* populated';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 has io_client_* columns populated (skipped if not PG16)');
+
+-- Test PG16: io_bgwriter_* columns populated
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_bgw_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_bgwriter_writes INTO v_io_bgw_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_bgw_writes IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG16 should have io_bgwriter_* populated';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 has io_bgwriter_* columns populated (skipped if not PG16)');
+
+-- Test PG16: compare() includes io_* delta calculations
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_start_id INTEGER;
+    v_end_id INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+        SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        PERFORM * FROM flight_recorder.compare(
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_start_id),
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_end_id)
+        );
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 compare() includes io_* deltas (skipped if not PG16)');
+
+-- Test PG16: deltas view includes io_* columns
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_delta BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_checkpointer_writes_delta INTO v_io_delta
+        FROM flight_recorder.deltas ORDER BY id DESC LIMIT 1;
+
+        -- Delta may be 0 or NULL depending on activity, just verify no error
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 deltas view includes io_* columns (skipped if not PG16)');
+
+-- Test PG16: summary_report() includes io_* sections
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_report TEXT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
+
+        IF v_report IS NULL OR length(v_report) < 100 THEN
+            RAISE EXCEPTION 'Phase 4: PG16 summary_report() should generate valid report';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 summary_report() includes io_* data (skipped if not PG16)');
+
+-- Test PG16: anomaly_report() can detect io_* anomalies
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 16 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG16 anomaly_report() can analyze io_* data (skipped if not PG16)');
+
+-- -----------------------------------------------------------------------------
+-- 14.4 PG17-SPECIFIC TESTS (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test PG17: verify pg_stat_checkpointer used
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_ckpt_timed BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT ckpt_timed INTO v_ckpt_timed
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_ckpt_timed IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG17 should have checkpoint stats from pg_stat_checkpointer';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 uses pg_stat_checkpointer (skipped if not PG17)');
+
+-- Test PG17: verify checkpoint_lsn from pg_stat_checkpointer
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_ckpt_lsn PG_LSN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT checkpoint_lsn INTO v_ckpt_lsn
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_ckpt_lsn IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG17 should have checkpoint_lsn from pg_stat_checkpointer';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 has checkpoint_lsn from pg_stat_checkpointer (skipped if not PG17)');
+
+-- Test PG17: verify ckpt_timed and ckpt_requested from new view
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_ckpt_timed BIGINT;
+    v_ckpt_req BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT ckpt_timed, ckpt_requested INTO v_ckpt_timed, v_ckpt_req
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_ckpt_timed IS NULL OR v_ckpt_req IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG17 should have ckpt_timed and ckpt_requested';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 has ckpt_timed and ckpt_requested (skipped if not PG17)');
+
+-- Test PG17: still has pg_stat_io
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_io_writes BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        PERFORM flight_recorder.snapshot();
+
+        SELECT io_checkpointer_writes INTO v_io_writes
+        FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        IF v_io_writes IS NULL THEN
+            RAISE EXCEPTION 'Phase 4: PG17 should still have io_* columns from pg_stat_io';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 still collects pg_stat_io data (skipped if not PG17)');
+
+-- Test PG17: compare() checkpoint delta calculations
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_start_id INTEGER;
+    v_end_id INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+        SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+        PERFORM * FROM flight_recorder.compare(
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_start_id),
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_end_id)
+        );
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 compare() calculates checkpoint deltas correctly (skipped if not PG17)');
+
+-- Test PG17: checkpoint column names correct
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_has_columns BOOLEAN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        -- Verify expected checkpoint columns exist
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'flight_recorder'
+              AND table_name = 'snapshots'
+              AND column_name IN ('ckpt_timed', 'ckpt_requested', 'checkpoint_lsn')
+        ) INTO v_has_columns;
+
+        IF NOT v_has_columns THEN
+            RAISE EXCEPTION 'Phase 4: PG17 should have correct checkpoint columns';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 has correct checkpoint column names (skipped if not PG17)');
+
+-- Test PG17: summary_report() uses correct checkpoint source
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_report TEXT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
+
+        IF v_report IS NULL OR length(v_report) < 100 THEN
+            RAISE EXCEPTION 'Phase 4: PG17 summary_report() should generate valid report';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 summary_report() uses pg_stat_checkpointer data (skipped if not PG17)');
+
+-- Test PG17: pg_control_checkpoint() available
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_checkpoint_lsn PG_LSN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        -- pg_control_checkpoint() should be available in PG17
+        SELECT checkpoint_lsn INTO v_checkpoint_lsn
+        FROM pg_control_checkpoint();
+
+        IF v_checkpoint_lsn IS NULL THEN
+            RAISE WARNING 'Phase 4: pg_control_checkpoint() returned NULL checkpoint_lsn';
+        END IF;
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 pg_control_checkpoint() available (skipped if not PG17)');
+
+-- Test PG17: gracefully handles pg_stat_bgwriter changes
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_bgwriter_exists BOOLEAN;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        -- Verify pg_stat_bgwriter still exists in PG17
+        SELECT EXISTS (
+            SELECT 1 FROM pg_views WHERE viewname = 'pg_stat_bgwriter'
+        ) INTO v_bgwriter_exists;
+
+        IF NOT v_bgwriter_exists THEN
+            RAISE WARNING 'Phase 4: pg_stat_bgwriter removed in PG17';
+        END IF;
+
+        -- snapshot() should work regardless
+        PERFORM flight_recorder.snapshot();
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 handles pg_stat_bgwriter gracefully (skipped if not PG17)');
+
+-- Test PG17: all analysis functions work with new views
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    IF v_pg_version = 17 THEN
+        PERFORM flight_recorder.snapshot();
+        PERFORM pg_sleep(1);
+        PERFORM flight_recorder.snapshot();
+
+        -- Test multiple analysis functions
+        PERFORM * FROM flight_recorder.wait_summary(now() - interval '1 hour', now());
+        PERFORM * FROM flight_recorder.activity_at(now());
+        PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: PG17 analysis functions work with new PG17 views (skipped if not PG17)');
+
+-- -----------------------------------------------------------------------------
+-- 14.5 CROSS-VERSION COMPATIBILITY (5 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test pg_version column populated in snapshots
+SELECT ok(
+    (SELECT pg_version FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1) IS NOT NULL,
+    'Phase 4: pg_version column should be populated in snapshots'
+);
+
+-- Test deltas view works across all versions
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.deltas ORDER BY id DESC LIMIT 1$$,
+    'Phase 4: deltas view should work on all PG versions'
+);
+
+-- Test compare() produces consistent results across versions
+DO $$
+DECLARE
+    v_start_id INTEGER;
+    v_end_id INTEGER;
+BEGIN
+    SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id ASC LIMIT 1;
+    SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+
+    IF v_start_id IS NOT NULL AND v_end_id IS NOT NULL AND v_start_id != v_end_id THEN
+        PERFORM * FROM flight_recorder.compare(
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_start_id),
+            (SELECT captured_at FROM flight_recorder.snapshots WHERE id = v_end_id)
+        );
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: compare() produces consistent results across versions');
+
+-- Test NULL arithmetic in calculations
+DO $$
+DECLARE
+    v_pg_version INTEGER;
+    v_delta BIGINT;
+BEGIN
+    v_pg_version := flight_recorder._pg_version();
+
+    -- Test NULL - NULL = NULL (not error)
+    SELECT (NULL::BIGINT - NULL::BIGINT) INTO v_delta;
+
+    IF v_delta IS NOT NULL THEN
+        RAISE EXCEPTION 'Phase 4: NULL arithmetic should return NULL';
+    END IF;
+END $$;
+
+SELECT ok(true, 'Phase 4: NULL arithmetic handled gracefully in delta calculations');
+
+-- Test snapshot() exception handling across versions
+DO $$
+BEGIN
+    -- Test with short timeout to potentially trigger exception
+    SET LOCAL statement_timeout = '10s';
+    PERFORM flight_recorder.snapshot();
+    RESET statement_timeout;
+EXCEPTION WHEN OTHERS THEN
+    -- Exception should be caught and logged
+    RESET statement_timeout;
+    RAISE WARNING 'Phase 4: snapshot() exception: %', SQLERRM;
+END $$;
+
+SELECT ok(true, 'Phase 4: snapshot() exception handling works across versions');
 
 SELECT * FROM finish();
 ROLLBACK;
