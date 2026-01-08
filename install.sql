@@ -1726,7 +1726,7 @@ DECLARE
 BEGIN
     -- Get retention period (default 7 days)
     v_aggregate_retention := COALESCE(
-        (SELECT value FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
+        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
         '7 days'::interval
     );
 
