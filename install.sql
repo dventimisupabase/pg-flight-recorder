@@ -439,7 +439,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     PRIMARY KEY (slot_id, backend_type, wait_event_type, wait_event, state)
 ) WITH (fillfactor = 80);
 
-COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (aggregated by type/event/state). Fill factor 80 reduces page splits from DELETE/INSERT churn.';
+COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (aggregated by type/event/state). Fill factor 80 reduces page splits from DELETE/INSERT churn. Aggressive autovacuum (scale_factor=0.05, threshold=20) handles 14K-72K dead tuples/day.';
 
 -- Activity samples ring buffer
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
@@ -457,7 +457,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     PRIMARY KEY (slot_id, pid)
 ) WITH (fillfactor = 80);
 
-COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (top 25 per sample). Fill factor 80 reduces page splits from DELETE/INSERT churn.';
+COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (top 25 per sample). Fill factor 80 reduces page splits from DELETE/INSERT churn. Aggressive autovacuum (scale_factor=0.05, threshold=20) handles 0-36K dead tuples/day.';
 
 -- Lock samples ring buffer
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
@@ -476,7 +476,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     PRIMARY KEY (slot_id, blocked_pid, blocking_pid)
 ) WITH (fillfactor = 80);
 
-COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (blocked/blocking relationships). Fill factor 80 reduces page splits from DELETE/INSERT churn.';
+COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (blocked/blocking relationships). Fill factor 80 reduces page splits from DELETE/INSERT churn. Most aggressive autovacuum (scale_factor=0.02, threshold=10, cost_limit=2000) handles 0-144K dead tuples/day.';
 
 -- Set fill factor on existing ring buffer tables (for upgrades)
 DO $$
@@ -487,6 +487,42 @@ BEGIN
     ALTER TABLE flight_recorder.lock_samples_ring SET (fillfactor = 80);
 EXCEPTION WHEN OTHERS THEN
     -- Ignore errors (tables may not exist yet)
+    NULL;
+END $$;
+
+-- Aggressive autovacuum for child tables (high DELETE/INSERT churn)
+-- Child tables use DELETE+INSERT pattern creating 14K-144K dead tuples/day
+-- UNLOGGED tables have no WAL contention, so aggressive settings are safe
+DO $$
+BEGIN
+    -- wait_samples_ring: 14K-72K dead tuples/day
+    -- Typical: 10-50 rows per slot, 1,440 cycles/day
+    ALTER TABLE flight_recorder.wait_samples_ring SET (
+        autovacuum_vacuum_scale_factor = 0.05,  -- Trigger at 5% + threshold (vs 20% default)
+        autovacuum_vacuum_threshold = 20,       -- Trigger at 20 dead tuples (vs 50 default)
+        autovacuum_vacuum_cost_delay = 0,       -- No delay (vs 2ms default) - UNLOGGED is safe
+        autovacuum_vacuum_cost_limit = 1000     -- Vacuum faster (vs 200 default)
+    );
+
+    -- activity_samples_ring: 0-36K dead tuples/day
+    -- Typical: 0-25 rows per slot, 1,440 cycles/day
+    ALTER TABLE flight_recorder.activity_samples_ring SET (
+        autovacuum_vacuum_scale_factor = 0.05,
+        autovacuum_vacuum_threshold = 20,
+        autovacuum_vacuum_cost_delay = 0,
+        autovacuum_vacuum_cost_limit = 1000
+    );
+
+    -- lock_samples_ring: 0-144K dead tuples/day (highest churn)
+    -- Typical: 0-100 rows per slot, 1,440 cycles/day
+    ALTER TABLE flight_recorder.lock_samples_ring SET (
+        autovacuum_vacuum_scale_factor = 0.02,  -- Most aggressive (2% + threshold)
+        autovacuum_vacuum_threshold = 10,       -- Trigger very early
+        autovacuum_vacuum_cost_delay = 0,
+        autovacuum_vacuum_cost_limit = 2000     -- Vacuum fastest
+    );
+EXCEPTION WHEN OTHERS THEN
+    -- Ignore errors for upgrade compatibility
     NULL;
 END $$;
 
