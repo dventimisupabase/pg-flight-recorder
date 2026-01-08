@@ -29,65 +29,26 @@ SELECT * FROM flight_recorder.wait_summary('2024-01-15 10:00', '2024-01-15 11:00
 SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:00');
 ```
 
-## Configuration Profiles
+## Optional: Configuration
 
-**Most users:** Just install and go. The default configuration works for typical use.
+**Most users:** Just install. The defaults work.
 
-**Need specific tuning?** Choose a profile instead of configuring 41 parameters:
-
+**Production tuning:**
 ```sql
--- List available profiles
-SELECT * FROM flight_recorder.list_profiles();
-
--- See what a profile changes (without applying)
-SELECT * FROM flight_recorder.explain_profile('production_safe');
-
--- Apply a profile
-SELECT * FROM flight_recorder.apply_profile('production_safe');
-
--- See which profile matches your current config
-SELECT * FROM flight_recorder.get_current_profile();
-```
-
-**Available Profiles:**
-
-| Profile | Use Case | Sample Interval | Overhead |
-|---------|----------|----------------|----------|
-| `default` | General purpose | 180s (6h retention) | ~0.013% CPU |
-| `production_safe` | Production always-on | 300s (10h retention) | ~0.008% CPU |
-| `development` | Staging/dev environments | 180s (6h retention) | ~0.013% CPU |
-| `troubleshooting` | Active incident response | 60s (2h retention) | ~0.04% CPU |
-| `minimal_overhead` | Resource-constrained systems | 300s (10h retention) | ~0.008% CPU |
-| `high_ddl` | Frequent schema changes | 180s (6h retention) | ~0.013% CPU |
-
-**Examples:**
-
-```sql
--- Production deployment
 SELECT flight_recorder.apply_profile('production_safe');
-
--- Investigating a performance issue
-SELECT flight_recorder.apply_profile('troubleshooting');
-
--- Multi-tenant SaaS with lots of DDL
-SELECT flight_recorder.apply_profile('high_ddl');
 ```
 
-## Emergency Controls
-
-**Low-level mode controls** (profiles are easier):
-
+**Troubleshooting an incident:**
 ```sql
-SELECT flight_recorder.set_mode('light');      -- Sample every 3 min (same as normal)
-SELECT flight_recorder.set_mode('emergency');  -- Sample every 5 min (40% less overhead)
-SELECT flight_recorder.disable();              -- Stop completely (use this if overhead is a concern)
-SELECT flight_recorder.enable();               -- Resume
+SELECT flight_recorder.apply_profile('troubleshooting');
 ```
 
-Modes adjust sampling frequency:
-- **Normal**: Every 3 minutes (default, recommended)
-- **Light**: Every 3 minutes (same as normal)
-- **Emergency**: Every 5 minutes (40% less overhead)
+**Need to stop it:**
+```sql
+SELECT flight_recorder.disable();
+```
+
+See [REFERENCE.md](REFERENCE.md) for all profiles and settings.
 
 ## Is It Safe?
 

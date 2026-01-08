@@ -2,6 +2,24 @@
 
 Complete documentation for pg-flight-recorder.
 
+## Table of Contents
+
+**Quick Start:**
+- [Configuration Profiles](#configuration-profiles) - **Start here** for easy configuration
+- [Functions](#functions) - Query and control functions
+- [Safety Features](#safety-features) - Built-in protections
+
+**Architecture:**
+- [How It Works](#how-it-works) - Overview
+- [Three-Tier Architecture](#three-tier-architecture) - Data storage model
+- [Collection Modes](#collection-modes) - Sampling frequencies
+
+**Advanced:**
+- [Configuration](#configuration) - Individual parameters (advanced users)
+- [Catalog Lock Contention](#catalog-lock-contention) - DDL interaction
+- [Diagnostic Patterns](#diagnostic-patterns) - Common troubleshooting scenarios
+- [Testing](#testing) - Running the test suite
+
 ## Requirements
 
 - PostgreSQL 15, 16, or 17
