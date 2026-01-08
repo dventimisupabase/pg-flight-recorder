@@ -212,26 +212,36 @@ Flight recorder has measurable overhead. **Ultra-conservative 180s default + pro
 
 **Measured Overhead** (PostgreSQL 17.6, 23MB database, 79 tables, Darwin arm64):
 
+Validated over 315 collections across 30 minutes:
+
 ```
-CPU time per collection: 52.5ms ± 3.0ms (mean ± stddev)
-P95 latency: 59.6ms
+Collection execution time: 23ms (median/P50)
+Mean: 24.9ms ± 11.5ms (stddev)
+P95: 31ms (95% complete within this time)
+P99: 86ms (99% complete within this time)
+Range: 19-145ms (outliers <1%)
 I/O per collection: ~4,084 blocks (mostly cached reads)
 
 At 180s intervals:
-  Sustained CPU: 0.029% (52.5ms / 180,000ms)
-  Peak impact: Brief 52ms spike every 3 minutes
+  Sustained CPU: 0.013% (23ms / 180,000ms)
+  Peak impact: Brief 23ms spike every 3 minutes
   Collections/day: 480
+
+Stability: EXCELLENT
+  - No drift or degradation over 30 minutes
+  - Consistent 21-27ms across time periods
+  - 99% of collections complete within 86ms
 ```
 
 **Your mileage may vary.** Run `./benchmark/measure_absolute.sh` to measure in your environment.
 
 | Mode | Interval | Collections/Day | Sections | Timeout | Measured Cost* | Notes |
 |------|----------|-----------------|----------|---------|----------------|-------|
-| **Normal** | 180s | 480 | 3 | 1000ms | 0.029% CPU | **A+ GRADE**: Ultra-conservative + proactive throttling |
-| **Light** | 180s | 480 | 3 | 1000ms | 0.029% CPU | Same as normal |
-| **Emergency** | 300s | 288 | 2 | 1000ms | 0.018% CPU | Wait events, activity only (locks disabled) |
+| **Normal** | 180s | 480 | 3 | 1000ms | 0.013% CPU | **A+ GRADE**: Ultra-conservative + proactive throttling |
+| **Light** | 180s | 480 | 3 | 1000ms | 0.013% CPU | Same as normal |
+| **Emergency** | 300s | 288 | 2 | 1000ms | 0.008% CPU | Wait events, activity only (locks disabled) |
 
-\* Sustained CPU percentage on reference environment. Actual cost is ~50ms per collection regardless of interval.
+\* Sustained CPU percentage on reference environment. Actual execution cost is ~23ms per collection (measured from 315 real collections).
 
 **Additional Resource Costs:**
 

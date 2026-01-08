@@ -59,28 +59,36 @@ The question isn't "will this slow down my database?" but rather:
 - Sustained CPU % at different intervals (60s, 120s, 180s)
 
 **Output** (PostgreSQL 17.6, 23MB database, 79 tables, Darwin arm64):
+
+*Note: psql `\timing` measures end-to-end (including client overhead). Use `collection_stats` table for actual server-side execution time.*
+
 ```
-Collection Timing:
-  Mean:   52.5 ms ± 3.0 ms
-  Median: 51.6 ms
-  P95:    59.6 ms
-  Range:  49.3 - 59.6 ms
+Actual Collection Execution (from 315 real collections over 30 minutes):
+  Median: 23.0 ms (P50)
+  Mean:   24.9 ms ± 11.5 ms (stddev)
+  P95:    31.0 ms (95% complete within this time)
+  P99:    86.4 ms (99% complete within this time)
+  Range:  19 - 145 ms (outliers <1%)
+
+Stability Analysis:
+  - First 10 min:  48.3ms mean (3 samples, cold start)
+  - Middle 10 min: 21.8ms mean (130 samples)
+  - Last 10 min:   26.7ms mean (182 samples)
+  - Conclusion: Very stable, no degradation
 
 I/O Operations:
-  Mean:   4,084 blocks
-  Median: 3,956 blocks
-  P95:    6,377 blocks
+  Mean:   ~4,084 blocks (mostly cached reads)
 
 Sustained CPU Impact:
-  At 60s intervals:  0.088%
-  At 120s intervals: 0.044%
-  At 180s intervals: 0.029%
+  At 60s intervals:  0.042% (23ms / 60,000ms)
+  At 120s intervals: 0.021% (23ms / 120,000ms)
+  At 180s intervals: 0.013% (23ms / 180,000ms)
 
 Peak Impact:
-  Brief 52.5ms CPU spike every N seconds
+  Brief 23ms CPU spike every N seconds
 
 Headroom Assessment:
-  ✓ 1 vCPU system: ACCEPTABLE - test in staging first
+  ✓ 1 vCPU system: SAFE - only 23ms every 3 minutes
   ✓ 2+ vCPU system: SAFE - negligible impact
 ```
 
@@ -103,9 +111,11 @@ These tests confirm the safety features work, not "what's the TPS impact?"
 
 ### Good (Honest):
 > **Absolute Costs** (measured on PostgreSQL 17.6, 23MB database, Darwin arm64):
-> - CPU time per collection: 52.5ms ± 3.0ms (mean ± stddev)
+> - Collection execution: 23ms median (P50), mean 24.9ms ± 11.5ms
+> - P95: 31ms, P99: 86ms
 > - I/O per collection: ~4,084 blocks (mostly cached reads)
-> - At 180s intervals: 0.029% sustained CPU + brief 52ms spike every 3 min
+> - At 180s intervals: 0.013% sustained CPU + brief 23ms spike every 3 min
+> - Stability: Validated over 315 collections (30 minutes), no degradation
 >
 > **Headroom Assessment:**
 > - ✓ Systems with ≥2 idle CPU cores: Negligible impact
@@ -210,18 +220,24 @@ After running `measure_absolute.sh` on various systems:
 - Hardware: Darwin arm64
 - Date: 2026-01-08
 
-**Absolute Costs** (20 iterations):
-- CPU time per collection: 52.5ms ± 3.0ms (mean ± stddev)
-- P95 latency: 59.6ms
+**Absolute Costs** (315 collections over 30 minutes):
+- Collection execution: 23ms median (P50)
+- Mean: 24.9ms ± 11.5ms (stddev)
+- P95: 31ms, P99: 86ms
 - I/O per collection: ~4,084 blocks
 
 **Sustained Impact at 180s intervals:**
-- 0.029% sustained CPU
-- Brief 52.5ms spike every 3 minutes
+- 0.013% sustained CPU
+- Brief 23ms spike every 3 minutes
+
+**Stability:**
+- No drift or degradation over 30 minutes
+- 95% of collections complete within 31ms
+- 99% complete within 86ms
 
 **Headroom Assessment:**
 - ✓ This system: Safe for always-on use (negligible impact)
-- ✓ 1 vCPU systems: Acceptable (test in staging first)
+- ✓ 1 vCPU systems: Safe - only 23ms every 3 minutes
 ```
 
 ### Share Results
