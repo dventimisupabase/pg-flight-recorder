@@ -410,68 +410,40 @@ CREATE INDEX IF NOT EXISTS statement_snapshots_queryid_idx
     ON flight_recorder.statement_snapshots(queryid);
 
 -- -----------------------------------------------------------------------------
--- Table: samples - High-frequency sampling (every 60 seconds, adaptive)
--- PARTITIONED BY RANGE (captured_at) - Daily partitions for efficient cleanup
+-- =============================================================================
+-- TIER 1: Ring Buffer Tables (UNLOGGED, fixed 120 slots)
+-- =============================================================================
+-- Implements circular buffers using modular arithmetic
+-- Fixed memory footprint: 120 slots × ~1KB = ~120KB total
+-- Automatic overwrite via UPSERT - no manual cleanup needed
+-- Retains last 2 hours at 60-second intervals
 -- -----------------------------------------------------------------------------
 
-CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples (
-    id              BIGINT GENERATED ALWAYS AS IDENTITY,
-    captured_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (id, captured_at)
-) PARTITION BY RANGE (captured_at);
+-- Ring buffer master table (120 slots = 2 hours at 60s intervals)
+CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
+    slot_id             INTEGER PRIMARY KEY CHECK (slot_id >= 0 AND slot_id < 120),
+    captured_at         TIMESTAMPTZ NOT NULL,
+    epoch_seconds       BIGINT NOT NULL
+);
 
--- Create initial partitions (today, tomorrow, day after)
-DO $$
-DECLARE
-    v_partition_date DATE;
-    v_partition_name TEXT;
-    v_start_date TEXT;
-    v_end_date TEXT;
-BEGIN
-    FOR i IN 0..2 LOOP
-        v_partition_date := CURRENT_DATE + (i || ' days')::interval;
-        v_partition_name := 'samples_' || TO_CHAR(v_partition_date, 'YYYYMMDD');
-        v_start_date := v_partition_date::TEXT;
-        v_end_date := (v_partition_date + 1)::TEXT;
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, 60s intervals, 2 hours retention)';
 
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_tables
-            WHERE schemaname = 'flight_recorder' AND tablename = v_partition_name
-        ) THEN
-            EXECUTE format(
-                'CREATE TABLE IF NOT EXISTS flight_recorder.%I PARTITION OF flight_recorder.samples FOR VALUES FROM (%L) TO (%L)',
-                v_partition_name, v_start_date, v_end_date
-            );
-        END IF;
-    END LOOP;
-END $$;
-
--- Index on parent table (inherited by all partitions)
-CREATE INDEX IF NOT EXISTS samples_captured_at_idx ON flight_recorder.samples(captured_at);
-
--- -----------------------------------------------------------------------------
--- Table: wait_samples - Aggregated wait events per sample
--- -----------------------------------------------------------------------------
-
-CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples (
-    sample_id           INTEGER,
-    sample_captured_at  TIMESTAMPTZ,
+-- Wait events ring buffer
+CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
+    slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
     backend_type        TEXT NOT NULL,
     wait_event_type     TEXT NOT NULL,
     wait_event          TEXT NOT NULL,
     state               TEXT NOT NULL,
     count               INTEGER NOT NULL,
-    PRIMARY KEY (sample_id, backend_type, wait_event_type, wait_event, state),
-    FOREIGN KEY (sample_id, sample_captured_at) REFERENCES flight_recorder.samples(id, captured_at) ON DELETE CASCADE
+    PRIMARY KEY (slot_id, backend_type, wait_event_type, wait_event, state)
 );
 
--- -----------------------------------------------------------------------------
--- Table: activity_samples - Top active sessions per sample
--- -----------------------------------------------------------------------------
+COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (aggregated by type/event/state)';
 
-CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples (
-    sample_id           INTEGER,
-    sample_captured_at  TIMESTAMPTZ,
+-- Activity samples ring buffer
+CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
+    slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
     pid                 INTEGER NOT NULL,
     usename             TEXT,
     application_name    TEXT,
@@ -482,53 +454,105 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples (
     query_start         TIMESTAMPTZ,
     state_change        TIMESTAMPTZ,
     query_preview       TEXT,
-    PRIMARY KEY (sample_id, pid),
-    FOREIGN KEY (sample_id, sample_captured_at) REFERENCES flight_recorder.samples(id, captured_at) ON DELETE CASCADE
+    PRIMARY KEY (slot_id, pid)
 );
 
--- -----------------------------------------------------------------------------
--- Table: progress_samples - Operation progress (vacuum, copy, analyze, etc.)
--- -----------------------------------------------------------------------------
+COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (top 25 per sample)';
 
-CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.progress_samples (
-    sample_id           INTEGER,
-    sample_captured_at  TIMESTAMPTZ,
-    progress_type       TEXT NOT NULL,      -- 'vacuum', 'copy', 'analyze', 'create_index'
-    pid                 INTEGER NOT NULL,
-    relid               OID,                -- Relation OID (convert to name at query time with ::regclass)
-    phase               TEXT,
-    blocks_total        BIGINT,
-    blocks_done         BIGINT,
-    tuples_total        BIGINT,
-    tuples_done         BIGINT,
-    bytes_total         BIGINT,
-    bytes_done          BIGINT,
-    details             JSONB,              -- Type-specific additional fields
-    PRIMARY KEY (sample_id, progress_type, pid),
-    FOREIGN KEY (sample_id, sample_captured_at) REFERENCES flight_recorder.samples(id, captured_at) ON DELETE CASCADE
-);
-
--- -----------------------------------------------------------------------------
--- Table: lock_samples - Blocking lock relationships
--- -----------------------------------------------------------------------------
-
-CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples (
-    sample_id               INTEGER,
-    sample_captured_at  TIMESTAMPTZ,
-    blocked_pid             INTEGER NOT NULL,
+-- Lock samples ring buffer
+CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
+    slot_id                 INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
+    blocked_pid             INTEGER,
     blocked_user            TEXT,
     blocked_app             TEXT,
     blocked_query_preview   TEXT,
     blocked_duration        INTERVAL,
-    blocking_pid            INTEGER NOT NULL,
+    blocking_pid            INTEGER,
     blocking_user           TEXT,
     blocking_app            TEXT,
     blocking_query_preview  TEXT,
     lock_type               TEXT,
-    locked_relation_oid     OID,                -- Relation OID (convert to name at query time with ::regclass)
-    PRIMARY KEY (sample_id, blocked_pid, blocking_pid),
-    FOREIGN KEY (sample_id, sample_captured_at) REFERENCES flight_recorder.samples(id, captured_at) ON DELETE CASCADE
+    locked_relation_oid     OID,
+    PRIMARY KEY (slot_id, blocked_pid, blocking_pid)
 );
+
+COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (blocked/blocking relationships)';
+
+-- Initialize ring buffer slots (0 to 119)
+INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+SELECT
+    generate_series AS slot_id,
+    '1970-01-01'::timestamptz,  -- Placeholder, will be overwritten
+    0
+FROM generate_series(0, 119)
+ON CONFLICT (slot_id) DO NOTHING;
+
+-- =============================================================================
+-- TIER 2: Aggregate Tables (REGULAR, durable, survives crashes)
+-- =============================================================================
+-- Aggregated 5-minute summaries flushed from ring buffer
+-- Provides crash-resistant diagnostics
+-- Retains 7 days by default
+-- -----------------------------------------------------------------------------
+
+-- Wait event aggregates (5-minute windows)
+CREATE TABLE IF NOT EXISTS flight_recorder.wait_event_aggregates (
+    id              BIGSERIAL PRIMARY KEY,
+    start_time      TIMESTAMPTZ NOT NULL,
+    end_time        TIMESTAMPTZ NOT NULL,
+    backend_type    TEXT NOT NULL,
+    wait_event_type TEXT NOT NULL,
+    wait_event      TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    sample_count    INTEGER NOT NULL,      -- How many 60s samples had this wait
+    total_waiters   BIGINT NOT NULL,       -- Sum of waiter counts
+    avg_waiters     NUMERIC NOT NULL,      -- Average concurrent waiters
+    max_waiters     INTEGER NOT NULL,      -- Peak concurrent waiters
+    pct_of_samples  NUMERIC                -- Percentage of samples with this wait
+);
+
+CREATE INDEX IF NOT EXISTS wait_aggregates_time_idx
+    ON flight_recorder.wait_event_aggregates(start_time, end_time);
+CREATE INDEX IF NOT EXISTS wait_aggregates_event_idx
+    ON flight_recorder.wait_event_aggregates(wait_event_type, wait_event);
+
+COMMENT ON TABLE flight_recorder.wait_event_aggregates IS 'TIER 2: Durable wait event summaries (5-min windows, survives crashes)';
+
+-- Lock pattern aggregates
+CREATE TABLE IF NOT EXISTS flight_recorder.lock_aggregates (
+    id                  BIGSERIAL PRIMARY KEY,
+    start_time          TIMESTAMPTZ NOT NULL,
+    end_time            TIMESTAMPTZ NOT NULL,
+    blocked_user        TEXT,
+    blocking_user       TEXT,
+    lock_type           TEXT,
+    locked_relation_oid OID,
+    occurrence_count    INTEGER NOT NULL,      -- How many times this pattern occurred
+    max_duration        INTERVAL,              -- Longest block duration
+    avg_duration        INTERVAL,              -- Average block duration
+    sample_query        TEXT                   -- Example blocked query
+);
+
+CREATE INDEX IF NOT EXISTS lock_aggregates_time_idx
+    ON flight_recorder.lock_aggregates(start_time, end_time);
+
+COMMENT ON TABLE flight_recorder.lock_aggregates IS 'TIER 2: Durable lock pattern summaries (5-min windows, survives crashes)';
+
+-- Query pattern aggregates
+CREATE TABLE IF NOT EXISTS flight_recorder.query_aggregates (
+    id                  BIGSERIAL PRIMARY KEY,
+    start_time          TIMESTAMPTZ NOT NULL,
+    end_time            TIMESTAMPTZ NOT NULL,
+    query_preview       TEXT,
+    occurrence_count    INTEGER NOT NULL,      -- How many times seen
+    max_duration        INTERVAL,              -- Longest execution
+    avg_duration        INTERVAL               -- Average execution
+);
+
+CREATE INDEX IF NOT EXISTS query_aggregates_time_idx
+    ON flight_recorder.query_aggregates(start_time, end_time);
+
+COMMENT ON TABLE flight_recorder.query_aggregates IS 'TIER 2: Durable query pattern summaries (5-min windows, survives crashes)';
 
 -- -----------------------------------------------------------------------------
 -- Helper: Pretty-print bytes
@@ -1287,14 +1311,15 @@ CREATE OR REPLACE FUNCTION flight_recorder.sample()
 RETURNS TIMESTAMPTZ
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_sample_id INTEGER;
     v_captured_at TIMESTAMPTZ := now();
+    v_epoch BIGINT := extract(epoch from v_captured_at)::bigint;
+    v_slot_id INTEGER := (v_epoch / 60) % 120;  -- Ring buffer slot calculation
     v_enable_locks BOOLEAN;
-    v_enable_progress BOOLEAN;
-    v_pg_version INTEGER;
+    v_snapshot_based BOOLEAN;
+    v_blocked_count INTEGER;
+    v_skip_locks_threshold INTEGER;
     v_stat_id INTEGER;
     v_should_skip BOOLEAN;
-    v_snapshot_based BOOLEAN;
 BEGIN
     -- P2 Safety: Check and adjust mode automatically based on system load
     PERFORM flight_recorder._check_and_adjust_mode();
@@ -1307,8 +1332,7 @@ BEGIN
         RETURN v_captured_at;
     END IF;
 
-    -- P0 Safety: Job deduplication - prevent queue buildup (A+ UPGRADE)
-    -- If another sample() job is already running, skip this cycle
+    -- P0 Safety: Job deduplication
     DECLARE
         v_running_count INTEGER;
         v_running_pid INTEGER;
@@ -1317,11 +1341,10 @@ BEGIN
         FROM pg_stat_activity
         WHERE query LIKE '%flight_recorder.sample()%'
           AND state = 'active'
-          AND pid != pg_backend_pid()  -- Exclude ourselves
+          AND pid != pg_backend_pid()
           AND backend_type = 'client backend';
 
         IF v_running_count > 0 THEN
-            -- Another sample() is already running - skip this cycle to prevent queue buildup
             PERFORM flight_recorder._record_collection_skip('sample',
                 format('Job deduplication: %s sample job(s) already running (PID: %s)',
                        v_running_count, v_running_pid));
@@ -1330,8 +1353,8 @@ BEGIN
         END IF;
     END;
 
-    -- P0 Safety: Record collection start for circuit breaker (4 sections: wait events, activity, progress, locks)
-    v_stat_id := flight_recorder._record_collection_start('sample', 4);
+    -- P0 Safety: Record collection start (3 sections: wait events, activity, locks)
+    v_stat_id := flight_recorder._record_collection_start('sample', 3);
 
     -- P0 Safety: Set lock timeout and work_mem
     PERFORM set_config('lock_timeout',
@@ -1339,10 +1362,9 @@ BEGIN
         true);
     PERFORM set_config('work_mem',
         COALESCE(flight_recorder._get_config('work_mem_kb', '2048'), '2048') || 'kB',
-        true);  -- Limit memory for joins/sorts
+        true);
 
     -- Adaptive sampling - skip if system idle (opt-in)
-    -- IMPORTANT: This check happens AFTER lock_timeout is set, so it's protected
     DECLARE
         v_adaptive_sampling BOOLEAN;
         v_idle_threshold INTEGER;
@@ -1359,7 +1381,6 @@ BEGIN
                 5
             );
 
-            -- This query is now protected by lock_timeout=100ms set above
             SELECT count(*) INTO v_active_count
             FROM pg_stat_activity
             WHERE state = 'active' AND backend_type = 'client backend';
@@ -1368,7 +1389,6 @@ BEGIN
                 PERFORM flight_recorder._record_collection_skip('sample',
                     format('Adaptive sampling: system idle (%s active connections < %s threshold)',
                            v_active_count, v_idle_threshold));
-                -- Reset timeout before returning
                 PERFORM set_config('statement_timeout', '0', true);
                 RETURN v_captured_at;
             END IF;
@@ -1380,47 +1400,40 @@ BEGIN
         flight_recorder._get_config('enable_locks', 'true')::boolean,
         TRUE
     );
-    v_enable_progress := COALESCE(
-        flight_recorder._get_config('enable_progress', 'true')::boolean,
-        TRUE
-    );
-    v_pg_version := flight_recorder._pg_version();
-
-    -- Snapshot-based collection (default enabled) - Query pg_stat_activity once
     v_snapshot_based := COALESCE(
         flight_recorder._get_config('snapshot_based_collection', 'true')::boolean,
         true
     );
 
+    -- Update ring buffer slot metadata (UPSERT pattern)
+    INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+    VALUES (v_slot_id, v_captured_at, v_epoch)
+    ON CONFLICT (slot_id) DO UPDATE SET
+        captured_at = EXCLUDED.captured_at,
+        epoch_seconds = EXCLUDED.epoch_seconds;
+
+    -- Clear old data in child tables for this slot
+    DELETE FROM flight_recorder.wait_samples_ring WHERE slot_id = v_slot_id;
+    DELETE FROM flight_recorder.activity_samples_ring WHERE slot_id = v_slot_id;
+    DELETE FROM flight_recorder.lock_samples_ring WHERE slot_id = v_slot_id;
+
+    -- Snapshot-based collection
     IF v_snapshot_based THEN
-        -- Create temp table snapshot of pg_stat_activity (ONE catalog lock)
-        -- This replaces 3+ queries to pg_stat_activity with 1 query
         CREATE TEMP TABLE IF NOT EXISTS _fr_psa_snapshot (
             LIKE pg_stat_activity
         ) ON COMMIT DROP;
-
         TRUNCATE _fr_psa_snapshot;
-
         INSERT INTO _fr_psa_snapshot
         SELECT * FROM pg_stat_activity WHERE pid != pg_backend_pid();
     END IF;
 
-    -- Create sample record (set section timeout before each section)
-    PERFORM flight_recorder._set_section_timeout();
-    INSERT INTO flight_recorder.samples (captured_at)
-    VALUES (v_captured_at)
-    RETURNING id INTO v_sample_id;
-
     -- Section 1: Wait events
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
-
-        -- Use snapshot table if enabled (reduces catalog locks)
         IF v_snapshot_based THEN
-            INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
+            INSERT INTO flight_recorder.wait_samples_ring (slot_id, backend_type, wait_event_type, wait_event, state, count)
             SELECT
-                v_sample_id,
-                v_captured_at,
+                v_slot_id,
                 COALESCE(backend_type, 'unknown'),
                 COALESCE(wait_event_type, 'Running'),
                 COALESCE(wait_event, 'CPU'),
@@ -1429,10 +1442,9 @@ BEGIN
             FROM _fr_psa_snapshot
             GROUP BY backend_type, wait_event_type, wait_event, state;
         ELSE
-            INSERT INTO flight_recorder.wait_samples (sample_id, sample_captured_at, backend_type, wait_event_type, wait_event, state, count)
+            INSERT INTO flight_recorder.wait_samples_ring (slot_id, backend_type, wait_event_type, wait_event, state, count)
             SELECT
-                v_sample_id,
-                v_captured_at,
+                v_slot_id,
                 COALESCE(backend_type, 'unknown'),
                 COALESCE(wait_event_type, 'Running'),
                 COALESCE(wait_event, 'CPU'),
@@ -1442,27 +1454,21 @@ BEGIN
             WHERE pid != pg_backend_pid()
             GROUP BY backend_type, wait_event_type, wait_event, state;
         END IF;
-
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Wait events collection failed: %', SQLERRM;
     END;
 
-    -- Section 2: Active sessions (cost-based skip)
-    -- OPTIMIZATION 2: Skip redundant COUNT - just query LIMIT 25 directly
-    -- Rationale: We only need 25 rows, threshold is 100 (much higher)
-    -- The COUNT was defensive but adds overhead by scanning the table twice
+    -- Section 2: Active sessions (OPTIMIZATION 2: skip redundant count)
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
-        -- Use snapshot table if enabled
         IF v_snapshot_based THEN
-            INSERT INTO flight_recorder.activity_samples (
-                sample_id, sample_captured_at, pid, usename, application_name, backend_type,
+            INSERT INTO flight_recorder.activity_samples_ring (
+                slot_id, pid, usename, application_name, backend_type,
                 state, wait_event_type, wait_event, query_start, state_change, query_preview
             )
             SELECT
-                v_sample_id,
-                v_captured_at,
+                v_slot_id,
                 pid,
                 usename,
                 application_name,
@@ -1478,13 +1484,12 @@ BEGIN
             ORDER BY query_start ASC NULLS LAST
             LIMIT 25;
         ELSE
-            INSERT INTO flight_recorder.activity_samples (
-                sample_id, sample_captured_at, pid, usename, application_name, backend_type,
+            INSERT INTO flight_recorder.activity_samples_ring (
+                slot_id, pid, usename, application_name, backend_type,
                 state, wait_event_type, wait_event, query_start, state_change, query_preview
             )
             SELECT
-                v_sample_id,
-                v_captured_at,
+                v_slot_id,
                 pid,
                 usename,
                 application_name,
@@ -1500,138 +1505,12 @@ BEGIN
             ORDER BY query_start ASC NULLS LAST
             LIMIT 25;
         END IF;
-
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Activity samples collection failed: %', SQLERRM;
     END;
 
-    -- Section 3: Progress tracking
-    IF v_enable_progress THEN
-    BEGIN
-        PERFORM flight_recorder._set_section_timeout();
-        -- Vacuum progress (handle PG17 column changes)
-        IF v_pg_version >= 17 THEN
-            INSERT INTO flight_recorder.progress_samples (
-                sample_id, sample_captured_at, progress_type, pid, relid, phase,
-                blocks_total, blocks_done, tuples_total, tuples_done, details
-            )
-            SELECT
-                v_sample_id,
-                v_captured_at,
-                'vacuum',
-                p.pid,
-                p.relid,
-                p.phase,
-                p.heap_blks_total,
-                p.heap_blks_vacuumed,
-                p.max_dead_tuple_bytes,
-                p.dead_tuple_bytes,
-                jsonb_build_object(
-                    'heap_blks_scanned', p.heap_blks_scanned,
-                    'index_vacuum_count', p.index_vacuum_count,
-                    'num_dead_item_ids', p.num_dead_item_ids
-                )
-            FROM pg_stat_progress_vacuum p;
-        ELSE
-            INSERT INTO flight_recorder.progress_samples (
-                sample_id, sample_captured_at, progress_type, pid, relid, phase,
-                blocks_total, blocks_done, tuples_total, tuples_done, details
-            )
-            SELECT
-                v_sample_id,
-                v_captured_at,
-                'vacuum',
-                p.pid,
-                p.relid,
-                p.phase,
-                p.heap_blks_total,
-                p.heap_blks_vacuumed,
-                p.max_dead_tuples,
-                p.num_dead_tuples,
-                jsonb_build_object(
-                    'heap_blks_scanned', p.heap_blks_scanned,
-                    'index_vacuum_count', p.index_vacuum_count
-                )
-            FROM pg_stat_progress_vacuum p;
-        END IF;
-
-        -- COPY progress
-        INSERT INTO flight_recorder.progress_samples (
-            sample_id, sample_captured_at, progress_type, pid, relid, phase,
-            tuples_done, bytes_total, bytes_done, details
-        )
-        SELECT
-            v_sample_id,
-            v_captured_at,
-            'copy',
-            p.pid,
-            p.relid,
-            p.command || '/' || p.type,
-            p.tuples_processed,
-            p.bytes_total,
-            p.bytes_processed,
-            jsonb_build_object(
-                'tuples_excluded', p.tuples_excluded
-            )
-        FROM pg_stat_progress_copy p;
-
-        -- Analyze progress
-        INSERT INTO flight_recorder.progress_samples (
-            sample_id, sample_captured_at, progress_type, pid, relid, phase,
-            blocks_total, blocks_done, details
-        )
-        SELECT
-            v_sample_id,
-            v_captured_at,
-            'analyze',
-            p.pid,
-            p.relid,
-            p.phase,
-            p.sample_blks_total,
-            p.sample_blks_scanned,
-            jsonb_build_object(
-                'ext_stats_total', p.ext_stats_total,
-                'ext_stats_computed', p.ext_stats_computed,
-                'child_tables_total', p.child_tables_total,
-                'child_tables_done', p.child_tables_done
-            )
-        FROM pg_stat_progress_analyze p;
-
-        -- Create index progress
-        INSERT INTO flight_recorder.progress_samples (
-            sample_id, sample_captured_at, progress_type, pid, relid, phase,
-            blocks_total, blocks_done, tuples_total, tuples_done, details
-        )
-        SELECT
-            v_sample_id,
-            v_captured_at,
-            'create_index',
-            p.pid,
-            p.relid,
-            p.phase,
-            p.blocks_total,
-            p.blocks_done,
-            p.tuples_total,
-            p.tuples_done,
-            jsonb_build_object(
-                'index_relid', p.index_relid,
-                'command', p.command,
-                'lockers_total', p.lockers_total,
-                'lockers_done', p.lockers_done,
-                'partitions_total', p.partitions_total,
-                'partitions_done', p.partitions_done
-            )
-        FROM pg_stat_progress_create_index p;
-
-        PERFORM flight_recorder._record_section_success(v_stat_id);
-    EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'pg-flight-recorder: Progress tracking collection failed: %', SQLERRM;
-    END;
-    END IF;  -- v_enable_progress
-
-    -- Section 4: Lock sampling (O(n) algorithm using pg_blocking_pids())
-    -- Uses pg_blocking_pids() which is O(n) instead of O(n²) join on pg_locks
+    -- Section 3: Lock sampling (OPTIMIZATION 1: materialized blocked sessions)
     IF v_enable_locks THEN
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
@@ -1644,9 +1523,7 @@ BEGIN
                 50
             );
 
-            -- OPTIMIZATION 1: Materialize blocked sessions with pg_blocking_pids() computed ONCE
-            -- This reduces function calls by 50% and CROSS JOIN work by ~95%
-            -- Create temp table with ONLY blocked sessions (early filtering)
+            -- Materialize blocked sessions with pg_blocking_pids() computed ONCE
             IF v_snapshot_based THEN
                 CREATE TEMP TABLE _fr_blocked_sessions ON COMMIT DROP AS
                 SELECT
@@ -1657,9 +1534,9 @@ BEGIN
                     query_start,
                     wait_event_type,
                     wait_event,
-                    pg_blocking_pids(pid) AS blocking_pids  -- Computed once!
+                    pg_blocking_pids(pid) AS blocking_pids
                 FROM _fr_psa_snapshot
-                WHERE cardinality(pg_blocking_pids(pid)) > 0;  -- Only blocked sessions
+                WHERE cardinality(pg_blocking_pids(pid)) > 0;
             ELSE
                 CREATE TEMP TABLE _fr_blocked_sessions ON COMMIT DROP AS
                 SELECT
@@ -1676,23 +1553,19 @@ BEGIN
                   AND cardinality(pg_blocking_pids(pid)) > 0;
             END IF;
 
-            -- Check count using materialized table (no re-computation)
             SELECT count(*) INTO v_blocked_count FROM _fr_blocked_sessions;
 
             IF v_blocked_count > v_skip_locks_threshold THEN
-                RAISE NOTICE 'pg-flight-recorder: Skipping lock collection - % blocked sessions exceeds threshold % (potential lock storm)',
+                RAISE NOTICE 'pg-flight-recorder: Skipping lock collection - % blocked sessions exceeds threshold %',
                     v_blocked_count, v_skip_locks_threshold;
             ELSE
-                -- Use the pre-computed results from materialized table
-                -- CROSS JOIN now operates on ONLY blocked sessions (not all sessions)
-                INSERT INTO flight_recorder.lock_samples (
-                    sample_id, sample_captured_at, blocked_pid, blocked_user, blocked_app,
+                INSERT INTO flight_recorder.lock_samples_ring (
+                    slot_id, blocked_pid, blocked_user, blocked_app,
                     blocked_query_preview, blocked_duration, blocking_pid, blocking_user,
                     blocking_app, blocking_query_preview, lock_type, locked_relation_oid
                 )
                 SELECT DISTINCT ON (bs.pid, blocking_pid)
-                    v_sample_id,
-                    v_captured_at,
+                    v_slot_id,
                     bs.pid,
                     bs.usename,
                     bs.application_name,
@@ -1702,12 +1575,10 @@ BEGIN
                     blocking.usename,
                     blocking.application_name,
                     left(blocking.query, 200),
-                    -- Get lock type from the blocked session's wait_event
                     CASE
                         WHEN bs.wait_event_type = 'Lock' THEN bs.wait_event
                         ELSE 'unknown'
                     END,
-                    -- Get relation if waiting on a relation lock
                     CASE
                         WHEN bs.wait_event IN ('relation', 'extend', 'page', 'tuple') THEN
                             (SELECT l.relation
@@ -1716,36 +1587,128 @@ BEGIN
                              LIMIT 1)
                         ELSE NULL
                     END
-                FROM _fr_blocked_sessions bs  -- Only blocked sessions!
-                CROSS JOIN LATERAL unnest(bs.blocking_pids) AS blocking_pid  -- Use cached array
+                FROM _fr_blocked_sessions bs
+                CROSS JOIN LATERAL unnest(bs.blocking_pids) AS blocking_pid
                 JOIN _fr_psa_snapshot blocking ON blocking.pid = blocking_pid
                 ORDER BY bs.pid, blocking_pid
                 LIMIT 100;
             END IF;
         END;
-
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Lock sampling collection failed: %', SQLERRM;
     END;
-    END IF;  -- v_enable_locks
+    END IF;
 
     -- P0 Safety: Record successful completion
     PERFORM flight_recorder._record_collection_end(v_stat_id, true, NULL);
 
-    -- Reset statement_timeout to avoid affecting subsequent queries
-    PERFORM set_config('statement_timeout', '0', true);
-
     RETURN v_captured_at;
 EXCEPTION
     WHEN OTHERS THEN
-        -- P0 Safety: Record failure if entire function fails
         PERFORM flight_recorder._record_collection_end(v_stat_id, false, SQLERRM);
-        -- Reset statement_timeout even on failure
-        PERFORM set_config('statement_timeout', '0', true);
-        RAISE;
+        RAISE WARNING 'pg-flight-recorder: Sample collection failed: %', SQLERRM;
+        RETURN v_captured_at;
 END;
 $$;
+
+COMMENT ON FUNCTION flight_recorder.sample() IS 'TIER 1: Collect samples into ring buffer (60s intervals, 3 sections: waits, activity, locks)';
+
+-- =============================================================================
+-- Flush Function: Ring Buffer → Aggregates (TIER 1 → TIER 2)
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION flight_recorder.flush_ring_to_aggregates()
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_start_time TIMESTAMPTZ;
+    v_end_time TIMESTAMPTZ;
+    v_total_samples INTEGER;
+    v_last_flush TIMESTAMPTZ;
+BEGIN
+    -- Find the last flush time
+    SELECT COALESCE(max(end_time), '1970-01-01')
+    INTO v_last_flush
+    FROM flight_recorder.wait_event_aggregates;
+
+    -- Find the time range covered by current ring buffer (samples newer than last flush)
+    SELECT min(captured_at), max(captured_at), count(*)
+    INTO v_start_time, v_end_time, v_total_samples
+    FROM flight_recorder.samples_ring
+    WHERE captured_at > v_last_flush;
+
+    -- If no new data, exit early
+    IF v_start_time IS NULL OR v_total_samples = 0 THEN
+        RETURN;
+    END IF;
+
+    -- Aggregate and flush wait events
+    INSERT INTO flight_recorder.wait_event_aggregates (
+        start_time, end_time, backend_type, wait_event_type, wait_event, state,
+        sample_count, total_waiters, avg_waiters, max_waiters, pct_of_samples
+    )
+    SELECT
+        v_start_time,
+        v_end_time,
+        w.backend_type,
+        w.wait_event_type,
+        w.wait_event,
+        w.state,
+        count(DISTINCT w.slot_id) AS sample_count,
+        sum(w.count) AS total_waiters,
+        round(avg(w.count), 2) AS avg_waiters,
+        max(w.count) AS max_waiters,
+        round(100.0 * count(DISTINCT w.slot_id) / NULLIF(v_total_samples, 0), 1) AS pct_of_samples
+    FROM flight_recorder.wait_samples_ring w
+    JOIN flight_recorder.samples_ring s ON s.slot_id = w.slot_id
+    WHERE s.captured_at BETWEEN v_start_time AND v_end_time
+    GROUP BY w.backend_type, w.wait_event_type, w.wait_event, w.state;
+
+    -- Aggregate and flush lock patterns
+    INSERT INTO flight_recorder.lock_aggregates (
+        start_time, end_time, blocked_user, blocking_user, lock_type,
+        locked_relation_oid, occurrence_count, max_duration, avg_duration, sample_query
+    )
+    SELECT
+        v_start_time,
+        v_end_time,
+        l.blocked_user,
+        l.blocking_user,
+        l.lock_type,
+        l.locked_relation_oid,
+        count(*) AS occurrence_count,
+        max(l.blocked_duration) AS max_duration,
+        avg(l.blocked_duration) AS avg_duration,
+        min(l.blocked_query_preview) AS sample_query
+    FROM flight_recorder.lock_samples_ring l
+    JOIN flight_recorder.samples_ring s ON s.slot_id = l.slot_id
+    WHERE s.captured_at BETWEEN v_start_time AND v_end_time
+    GROUP BY l.blocked_user, l.blocking_user, l.lock_type, l.locked_relation_oid;
+
+    -- Aggregate and flush query patterns
+    INSERT INTO flight_recorder.query_aggregates (
+        start_time, end_time, query_preview, occurrence_count, max_duration, avg_duration
+    )
+    SELECT
+        v_start_time,
+        v_end_time,
+        a.query_preview,
+        count(*) AS occurrence_count,
+        max(s.captured_at - a.query_start) AS max_duration,
+        avg(s.captured_at - a.query_start) AS avg_duration
+    FROM flight_recorder.activity_samples_ring a
+    JOIN flight_recorder.samples_ring s ON s.slot_id = a.slot_id
+    WHERE s.captured_at BETWEEN v_start_time AND v_end_time
+      AND a.query_start IS NOT NULL
+    GROUP BY a.query_preview;
+
+    RAISE NOTICE 'pg-flight-recorder: Flushed ring buffer (% to %, % samples)',
+        v_start_time, v_end_time, v_total_samples;
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.flush_ring_to_aggregates() IS 'TIER 2: Flush ring buffer to durable aggregates every 5 minutes';
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.snapshot() - Capture current state
@@ -2314,16 +2277,16 @@ $$;
 
 CREATE OR REPLACE VIEW flight_recorder.recent_waits AS
 SELECT
-    sm.captured_at,
+    sr.captured_at,
     w.backend_type,
     w.wait_event_type,
     w.wait_event,
     w.state,
     w.count
-FROM flight_recorder.samples sm
-JOIN flight_recorder.wait_samples w ON w.sample_id = sm.id
-WHERE sm.captured_at > now() - interval '2 hours'
-ORDER BY sm.captured_at DESC, w.count DESC;
+FROM flight_recorder.samples_ring sr
+JOIN flight_recorder.wait_samples_ring w ON w.slot_id = sr.slot_id
+WHERE sr.captured_at > now() - interval '2 hours'
+ORDER BY sr.captured_at DESC, w.count DESC;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.recent_activity - View of active sessions from last 2 hours
@@ -2331,7 +2294,7 @@ ORDER BY sm.captured_at DESC, w.count DESC;
 
 CREATE OR REPLACE VIEW flight_recorder.recent_activity AS
 SELECT
-    sm.captured_at,
+    sr.captured_at,
     a.pid,
     a.usename,
     a.application_name,
@@ -2340,12 +2303,12 @@ SELECT
     a.wait_event_type,
     a.wait_event,
     a.query_start,
-    sm.captured_at - a.query_start AS running_for,
+    sr.captured_at - a.query_start AS running_for,
     a.query_preview
-FROM flight_recorder.samples sm
-JOIN flight_recorder.activity_samples a ON a.sample_id = sm.id
-WHERE sm.captured_at > now() - interval '2 hours'
-ORDER BY sm.captured_at DESC, a.query_start ASC;
+FROM flight_recorder.samples_ring sr
+JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
+WHERE sr.captured_at > now() - interval '2 hours'
+ORDER BY sr.captured_at DESC, a.query_start ASC;
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.recent_locks - View of lock contention from last 2 hours
@@ -2353,7 +2316,7 @@ ORDER BY sm.captured_at DESC, a.query_start ASC;
 
 CREATE OR REPLACE VIEW flight_recorder.recent_locks AS
 SELECT
-    sm.captured_at,
+    sr.captured_at,
     l.blocked_pid,
     l.blocked_user,
     l.blocked_app,
@@ -2365,37 +2328,16 @@ SELECT
     COALESCE(l.locked_relation_oid::regclass::text, 'OID:' || l.locked_relation_oid::text) AS locked_relation,
     l.blocked_query_preview,
     l.blocking_query_preview
-FROM flight_recorder.samples sm
-JOIN flight_recorder.lock_samples l ON l.sample_id = sm.id
-WHERE sm.captured_at > now() - interval '2 hours'
-ORDER BY sm.captured_at DESC, l.blocked_duration DESC;
+FROM flight_recorder.samples_ring sr
+JOIN flight_recorder.lock_samples_ring l ON l.slot_id = sr.slot_id
+WHERE sr.captured_at > now() - interval '2 hours'
+ORDER BY sr.captured_at DESC, l.blocked_duration DESC;
 
 -- -----------------------------------------------------------------------------
--- flight_recorder.recent_progress - View of operation progress from last 2 hours
+-- flight_recorder.recent_progress - REMOVED (not in ring buffer architecture)
 -- -----------------------------------------------------------------------------
-
-CREATE OR REPLACE VIEW flight_recorder.recent_progress AS
-SELECT
-    sm.captured_at,
-    p.progress_type,
-    p.pid,
-    COALESCE(p.relid::regclass::text, 'OID:' || p.relid::text) AS relname,
-    p.phase,
-    p.blocks_done,
-    p.blocks_total,
-    CASE WHEN p.blocks_total > 0
-        THEN round(100.0 * p.blocks_done / p.blocks_total, 1)
-        ELSE NULL END AS blocks_pct,
-    p.tuples_done,
-    p.tuples_total,
-    p.bytes_done,
-    p.bytes_total,
-    flight_recorder._pretty_bytes(p.bytes_done) AS bytes_done_pretty,
-    p.details
-FROM flight_recorder.samples sm
-JOIN flight_recorder.progress_samples p ON p.sample_id = sm.id
-WHERE sm.captured_at > now() - interval '2 hours'
-ORDER BY sm.captured_at DESC, p.progress_type, p.relid;
+-- Progress tracking removed from ring buffer to minimize footprint
+-- Use pg_stat_progress_* views directly for real-time progress
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.recent_replication - View of replication lag from last 2 hours
