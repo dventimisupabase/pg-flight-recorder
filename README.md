@@ -1,5 +1,8 @@
 # pg-flight-recorder
 
+[![Test Suite](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/test.yml/badge.svg)](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/test.yml)
+[![Lint](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/lint.yml/badge.svg)](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/lint.yml)
+
 **"What was happening in my database?"**
 
 Server-side flight recorder for PostgreSQL. Runs automatically via pg_cron. Zero config.
