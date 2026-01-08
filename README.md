@@ -77,4 +77,11 @@ psql -f uninstall.sql
 
 ## For Developers
 
-Run tests: `./test.sh` (PG 16) or `./test.sh all` (PG 15-17). See [REFERENCE.md](REFERENCE.md) for full documentation.
+Run the test suite:
+
+```bash
+./test.sh     # PostgreSQL 16
+./test.sh all # All versions (15, 16, 17)
+```
+
+See [REFERENCE.md](REFERENCE.md) for full documentation.
