@@ -58,7 +58,7 @@
 --       Returns: timestamp of capture
 --
 --   flight_recorder.sample()
---       Capture point-in-time activity. Called automatically every 30 sec.
+--       Capture point-in-time activity. Called automatically at adaptive intervals (180s normal/light, 300s emergency).
 --       Returns: timestamp of capture
 --
 --   flight_recorder.compare(start_time, end_time)
@@ -84,26 +84,21 @@
 --                    temp_files_delta, temp_bytes_pretty
 --
 --   flight_recorder.recent_waits
---       Wait events from last 2 hours.
+--       Wait events from last 10 hours.
 --       Columns: captured_at, backend_type, wait_event_type, wait_event, state, count
 --
 --   flight_recorder.recent_activity
---       Active sessions from last 2 hours.
+--       Active sessions from last 10 hours.
 --       Columns: captured_at, pid, usename, backend_type, state, wait_event,
 --                running_for, query_preview
 --
 --   flight_recorder.recent_locks
---       Lock contention from last 2 hours.
+--       Lock contention from last 10 hours.
 --       Columns: captured_at, blocked_pid, blocked_duration, blocking_pid,
 --                lock_type, locked_relation, blocked_query_preview
 --
---   flight_recorder.recent_progress
---       Operation progress (vacuum/copy/analyze/create_index) from last 2 hours.
---       Columns: captured_at, progress_type, pid, relname, phase,
---                blocks_pct, tuples_done, bytes_done_pretty
---
 --   flight_recorder.recent_replication
---       Replication lag from last 2 hours.
+--       Replication lag from last 10 hours.
 --       Columns: captured_at, application_name, state, sync_state,
 --                replay_lag_bytes, replay_lag_pretty, write_lag, flush_lag, replay_lag
 --
@@ -276,6 +271,7 @@
 -- ---------
 --   SELECT cron.unschedule('flight_recorder_snapshot');
 --   SELECT cron.unschedule('flight_recorder_sample');
+--   SELECT cron.unschedule('flight_recorder_flush');
 --   SELECT cron.unschedule('flight_recorder_cleanup');
 --   DROP SCHEMA flight_recorder CASCADE;
 --
