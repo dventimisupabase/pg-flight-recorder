@@ -5412,39 +5412,60 @@ BEGIN
         'Circuit breaker, adaptive mode, timeouts all enabled by default',
         'Flight recorder will auto-reduce overhead under stress.'::text;
 
-    -- Summary recommendation
-    DECLARE
-        v_nogo_count INTEGER;
-        v_caution_count INTEGER;
-    BEGIN
-        SELECT
-            count(*) FILTER (WHERE status = 'NO-GO'),
-            count(*) FILTER (WHERE status = 'CAUTION')
-        INTO v_nogo_count, v_caution_count
-        FROM flight_recorder.preflight_check();
-
-        IF v_nogo_count > 0 THEN
-            RETURN QUERY SELECT
-                '=== SUMMARY ==='::text,
-                'NO-GO'::text,
-                format('%s critical issues detected', v_nogo_count),
-                'Address NO-GO items before enabling always-on monitoring. See recommendations above.'::text;
-        ELSIF v_caution_count > 0 THEN
-            RETURN QUERY SELECT
-                '=== SUMMARY ==='::text,
-                'PROCEED WITH CAUTION'::text,
-                format('%s cautions detected', v_caution_count),
-                'System is acceptable for always-on monitoring but consider addressing cautions. Test in staging first if possible.'::text;
-        ELSE
-            RETURN QUERY SELECT
-                '=== SUMMARY ==='::text,
-                'READY FOR PRODUCTION'::text,
-                'All checks passed',
-                'System is well-suited for "set and forget" always-on monitoring. Run quarterly_review() every 3 months to verify continued health.'::text;
-        END IF;
-    END;
 END;
 $$;
+
+COMMENT ON FUNCTION flight_recorder.preflight_check() IS
+'Pre-installation validation checks. Returns component status (GO/CAUTION/NO-GO). For summary, use preflight_check_with_summary().';
+
+-- Helper function: preflight_check with summary recommendation
+CREATE OR REPLACE FUNCTION flight_recorder.preflight_check_with_summary()
+RETURNS TABLE(
+    check_name TEXT,
+    status TEXT,
+    details TEXT,
+    recommendation TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_nogo_count INTEGER;
+    v_caution_count INTEGER;
+BEGIN
+    -- Return all preflight check results
+    RETURN QUERY SELECT * FROM flight_recorder.preflight_check();
+    
+    -- Count status results (calls function again to count)
+    SELECT
+        count(*) FILTER (WHERE c.status = 'NO-GO'),
+        count(*) FILTER (WHERE c.status = 'CAUTION')
+    INTO v_nogo_count, v_caution_count
+    FROM flight_recorder.preflight_check() c;
+    
+    -- Add summary based on counts
+    IF v_nogo_count > 0 THEN
+        RETURN QUERY SELECT
+            '=== SUMMARY ==='::text,
+            'NO-GO'::text,
+            format('%s critical issues detected', v_nogo_count),
+            'Address NO-GO items before enabling always-on monitoring. See recommendations above.'::text;
+    ELSIF v_caution_count > 0 THEN
+        RETURN QUERY SELECT
+            '=== SUMMARY ==='::text,
+            'PROCEED WITH CAUTION'::text,
+            format('%s cautions detected', v_caution_count),
+            'System is acceptable for always-on monitoring but consider addressing cautions. Test in staging first if possible.'::text;
+    ELSE
+        RETURN QUERY SELECT
+            '=== SUMMARY ==='::text,
+            'READY FOR PRODUCTION'::text,
+            'All checks passed',
+            'System is well-suited for "set and forget" always-on monitoring. Run quarterly_review() every 3 months to verify continued health.'::text;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.preflight_check_with_summary() IS
+'Pre-installation validation with summary. Calls preflight_check() twice - once for results, once to count. More expensive but includes summary row.';
 
 -- -----------------------------------------------------------------------------
 -- Quarterly Review - Run every 3 months for ongoing health validation
