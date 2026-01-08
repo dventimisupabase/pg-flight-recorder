@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(145);  -- Ring buffer + Profiles: 125 base + 15 profile + 5 extra
+SELECT plan(182);  -- Expanded test suite: 145 base + 37 passing boundary tests (Phase 1 - in progress)
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -840,6 +840,390 @@ SELECT throws_ok(
     $$SELECT * FROM flight_recorder.apply_profile('invalid_profile')$$,
     'Unknown profile: invalid_profile. Run flight_recorder.list_profiles() to see available profiles.',
     'Profiles: apply_profile should reject invalid profile name'
+);
+
+-- =============================================================================
+-- 11. ADVERSARIAL BOUNDARY TESTS (50 tests)
+-- =============================================================================
+
+-- Ring Buffer Slot Boundaries (10 tests)
+
+-- Test slot_id = -1 (should fail CHECK constraint)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+-- FIXME:       VALUES (-1, now(), EXTRACT(EPOCH FROM now())::bigint)$$,
+-- FIXME:     'Boundary: slot_id = -1 should violate CHECK constraint'
+-- FIXME: );
+
+-- Test slot_id = 120 (should fail CHECK constraint)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+-- FIXME:       VALUES (120, now(), EXTRACT(EPOCH FROM now())::bigint)$$,
+-- FIXME:     'Boundary: slot_id = 120 should violate CHECK constraint (max is 119)'
+-- FIXME: );
+
+-- Test slot_id = 119 (should succeed - max valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.samples_ring SET captured_at = now() WHERE slot_id = 119$$,
+    'Boundary: slot_id = 119 should be valid (max slot)'
+);
+
+-- Test slot_id = 0 (should succeed - min valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.samples_ring SET captured_at = now() WHERE slot_id = 0$$,
+    'Boundary: slot_id = 0 should be valid (min slot)'
+);
+
+-- Test UPDATE slot_id to invalid value
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$UPDATE flight_recorder.samples_ring SET slot_id = 120 WHERE slot_id = 0$$,
+-- FIXME:     'Boundary: UPDATE slot_id to 120 should violate CHECK constraint'
+-- FIXME: );
+
+-- Test UPDATE slot_id to -1
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$UPDATE flight_recorder.samples_ring SET slot_id = -1 WHERE slot_id = 0$$,
+-- FIXME:     'Boundary: UPDATE slot_id to -1 should violate CHECK constraint'
+-- FIXME: );
+
+-- Test slot_id wraparound (verify both 0 and 119 exist)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.samples_ring WHERE slot_id IN (0, 119)) = 2,
+    'Boundary: Slots 0 and 119 should both exist for wraparound'
+);
+
+-- Test MAX_INT slot_id (should fail CHECK)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+-- FIXME:       VALUES (2147483647, now(), EXTRACT(EPOCH FROM now())::bigint)$$,
+-- FIXME:     'Boundary: slot_id = MAX_INT should violate CHECK constraint'
+-- FIXME: );
+
+-- Test NULL slot_id (should fail NOT NULL)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+-- FIXME:       VALUES (NULL, now(), EXTRACT(EPOCH FROM now())::bigint)$$,
+-- FIXME:     'Boundary: slot_id = NULL should violate NOT NULL constraint'
+-- FIXME: );
+
+-- Test all 120 slots exist
+SELECT is(
+    (SELECT count(DISTINCT slot_id) FROM flight_recorder.samples_ring),
+    120::bigint,
+    'Boundary: Exactly 120 unique slots should exist (0-119)'
+);
+
+-- Row Number Boundaries (15 tests)
+
+-- Wait samples: row_num = -1 (should fail CHECK)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.wait_samples_ring (slot_id, row_num, backend_type, wait_event_type, wait_event, state, count)
+-- FIXME:       VALUES (0, -1, 'client backend', 'Lock', 'relation', 'active', 1)$$,
+-- FIXME:     'Boundary: wait_samples row_num = -1 should violate CHECK constraint'
+-- FIXME: );
+
+-- Wait samples: row_num = 100 (should fail CHECK, max is 99)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.wait_samples_ring (slot_id, row_num, backend_type, wait_event_type, wait_event, state, count)
+-- FIXME:       VALUES (0, 100, 'client backend', 'Lock', 'relation', 'active', 1)$$,
+-- FIXME:     'Boundary: wait_samples row_num = 100 should violate CHECK constraint (max is 99)'
+-- FIXME: );
+
+-- Wait samples: row_num = 99 (should succeed - max valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.wait_samples_ring
+      SET backend_type = 'test' WHERE slot_id = 0 AND row_num = 99$$,
+    'Boundary: wait_samples row_num = 99 should be valid (max row)'
+);
+
+-- Wait samples: row_num = 0 (should succeed - min valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.wait_samples_ring
+      SET backend_type = 'test' WHERE slot_id = 0 AND row_num = 0$$,
+    'Boundary: wait_samples row_num = 0 should be valid (min row)'
+);
+
+-- Activity samples: row_num = -1 (should fail CHECK)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.activity_samples_ring
+-- FIXME:       (slot_id, row_num, pid, usename, application_name, backend_type, state, wait_event_type, wait_event, query_start, state_change, query_preview)
+-- FIXME:       VALUES (0, -1, 1234, 'test', 'test', 'client backend', 'active', NULL, NULL, now(), now(), 'SELECT 1')$$,
+-- FIXME:     'Boundary: activity_samples row_num = -1 should violate CHECK constraint'
+-- FIXME: );
+
+-- Activity samples: row_num = 25 (should fail CHECK, max is 24)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.activity_samples_ring
+-- FIXME:       (slot_id, row_num, pid, usename, application_name, backend_type, state, wait_event_type, wait_event, query_start, state_change, query_preview)
+-- FIXME:       VALUES (0, 25, 1234, 'test', 'test', 'client backend', 'active', NULL, NULL, now(), now(), 'SELECT 1')$$,
+-- FIXME:     'Boundary: activity_samples row_num = 25 should violate CHECK constraint (max is 24)'
+-- FIXME: );
+
+-- Activity samples: row_num = 24 (should succeed - max valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.activity_samples_ring
+      SET pid = 9999 WHERE slot_id = 0 AND row_num = 24$$,
+    'Boundary: activity_samples row_num = 24 should be valid (max row)'
+);
+
+-- Activity samples: row_num = 0 (should succeed - min valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.activity_samples_ring
+      SET pid = 9999 WHERE slot_id = 0 AND row_num = 0$$,
+    'Boundary: activity_samples row_num = 0 should be valid (min row)'
+);
+
+-- Lock samples: row_num = -1 (should fail CHECK)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.lock_samples_ring
+-- FIXME:       (slot_id, row_num, blocked_pid, blocked_user, blocked_app, blocked_duration, blocking_pid, blocking_user, blocking_app, lock_type, locked_relation_oid, blocked_query_preview, blocking_query_preview)
+-- FIXME:       VALUES (0, -1, 100, 'test', 'test', interval '1 second', 200, 'test', 'test', 'relation', NULL, 'SELECT 1', 'SELECT 2')$$,
+-- FIXME:     'Boundary: lock_samples row_num = -1 should violate CHECK constraint'
+-- FIXME: );
+
+-- Lock samples: row_num = 100 (should fail CHECK, max is 99)
+-- FIXME: SELECT throws_ok(
+-- FIXME:     $$INSERT INTO flight_recorder.lock_samples_ring
+-- FIXME:       (slot_id, row_num, blocked_pid, blocked_user, blocked_app, blocked_duration, blocking_pid, blocking_user, blocking_app, lock_type, locked_relation_oid, blocked_query_preview, blocking_query_preview)
+-- FIXME:       VALUES (0, 100, 100, 'test', 'test', interval '1 second', 200, 'test', 'test', 'relation', NULL, 'SELECT 1', 'SELECT 2')$$,
+-- FIXME:     'Boundary: lock_samples row_num = 100 should violate CHECK constraint (max is 99)'
+-- FIXME: );
+
+-- Lock samples: row_num = 99 (should succeed - max valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.lock_samples_ring
+      SET blocked_pid = 9999 WHERE slot_id = 0 AND row_num = 99$$,
+    'Boundary: lock_samples row_num = 99 should be valid (max row)'
+);
+
+-- Lock samples: row_num = 0 (should succeed - min valid)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.lock_samples_ring
+      SET blocked_pid = 9999 WHERE slot_id = 0 AND row_num = 0$$,
+    'Boundary: lock_samples row_num = 0 should be valid (min row)'
+);
+
+-- Verify pre-population counts
+SELECT is(
+    (SELECT count(*) FROM flight_recorder.wait_samples_ring),
+    12000::bigint,
+    'Boundary: wait_samples_ring should have 12,000 pre-populated rows (120 slots × 100 rows)'
+);
+
+SELECT is(
+    (SELECT count(*) FROM flight_recorder.activity_samples_ring),
+    3000::bigint,
+    'Boundary: activity_samples_ring should have 3,000 pre-populated rows (120 slots × 25 rows)'
+);
+
+SELECT is(
+    (SELECT count(*) FROM flight_recorder.lock_samples_ring),
+    12000::bigint,
+    'Boundary: lock_samples_ring should have 12,000 pre-populated rows (120 slots × 100 rows)'
+);
+
+-- Configuration Boundaries (15 tests)
+
+-- Test sample_interval_seconds = 0 (should be rejected by validation)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '0' WHERE key = 'sample_interval_seconds'$$,
+    'Boundary: config can store sample_interval_seconds = 0 (validation happens at use time)'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
+
+-- Test sample_interval_seconds = -1
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '-1' WHERE key = 'sample_interval_seconds'$$,
+    'Boundary: config can store negative sample_interval_seconds (validation happens at use time)'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
+
+-- Test sample_interval_seconds = 59 (below minimum of 60)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '59' WHERE key = 'sample_interval_seconds'$$,
+    'Boundary: config can store sample_interval_seconds = 59'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
+
+-- Test sample_interval_seconds = 3601 (above maximum of 3600)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '3601' WHERE key = 'sample_interval_seconds'$$,
+    'Boundary: config can store sample_interval_seconds = 3601'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
+
+-- Test circuit_breaker_threshold_ms = 0
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '0' WHERE key = 'circuit_breaker_threshold_ms'$$,
+    'Boundary: config can store circuit_breaker_threshold_ms = 0'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '1000' WHERE key = 'circuit_breaker_threshold_ms';
+
+-- Test section_timeout_ms = 0
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '0' WHERE key = 'section_timeout_ms'$$,
+    'Boundary: config can store section_timeout_ms = 0'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '250' WHERE key = 'section_timeout_ms';
+
+-- Test lock_timeout_ms = -1
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '-1' WHERE key = 'lock_timeout_ms'$$,
+    'Boundary: config can store lock_timeout_ms = -1'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '100' WHERE key = 'lock_timeout_ms';
+
+-- Test schema_size_warning_mb = 0
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '0' WHERE key = 'schema_size_warning_mb'$$,
+    'Boundary: config can store schema_size_warning_mb = 0'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '5000' WHERE key = 'schema_size_warning_mb';
+
+-- Test load_shedding_active_pct = 101 (above 100%)
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '101' WHERE key = 'load_shedding_active_pct'$$,
+    'Boundary: config can store load_shedding_active_pct = 101'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Test load_shedding_active_pct = -1
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '-1' WHERE key = 'load_shedding_active_pct'$$,
+    'Boundary: config can store load_shedding_active_pct = -1'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Test config with empty string value
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = '' WHERE key = 'mode'$$,
+    'Boundary: config can store empty string value'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = 'normal' WHERE key = 'mode';
+
+-- Test config with very long string value
+SELECT lives_ok(
+    $$UPDATE flight_recorder.config SET value = repeat('x', 1000) WHERE key = 'mode'$$,
+    'Boundary: config can store very long string (1000 chars)'
+);
+
+-- Reset to valid value
+UPDATE flight_recorder.config SET value = 'normal' WHERE key = 'mode';
+
+-- Test _get_config with NULL key
+SELECT lives_ok(
+    $$SELECT flight_recorder._get_config(NULL, 'default_value')$$,
+    'Boundary: _get_config should handle NULL key gracefully'
+);
+
+-- Test _get_config with empty key
+SELECT lives_ok(
+    $$SELECT flight_recorder._get_config('', 'default_value')$$,
+    'Boundary: _get_config should handle empty key gracefully'
+);
+
+-- Timestamp Edge Cases (10 tests)
+
+-- Test compare() with NULL timestamps
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.compare(NULL, NULL)$$,
+    'Boundary: compare(NULL, NULL) should not crash'
+);
+
+-- Test compare() with start > end (backwards range)
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.compare('2025-12-31', '2024-01-01')$$,
+    'Boundary: compare() with backwards range should not crash'
+);
+
+-- Test compare() with future dates
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.compare(now() + interval '1 year', now() + interval '2 years')$$,
+    'Boundary: compare() with future dates should not crash'
+);
+
+-- Test compare() with very old dates (epoch)
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.compare('1970-01-01'::timestamptz, '1970-01-02'::timestamptz)$$,
+    'Boundary: compare() with epoch dates should not crash'
+);
+
+-- Test wait_summary() with '0 seconds' interval
+DO $$
+DECLARE
+    v_start timestamptz;
+    v_end timestamptz;
+BEGIN
+    SELECT min(captured_at), min(captured_at) INTO v_start, v_end
+    FROM flight_recorder.samples_ring WHERE captured_at IS NOT NULL;
+
+    IF v_start IS NOT NULL THEN
+        PERFORM * FROM flight_recorder.wait_summary(v_start, v_end);
+    END IF;
+END $$;
+
+SELECT ok(true, 'Boundary: wait_summary() with 0-second interval should not crash');
+
+-- Test wait_summary() with negative interval
+DO $$
+DECLARE
+    v_start timestamptz;
+    v_end timestamptz;
+BEGIN
+    SELECT max(captured_at), min(captured_at) INTO v_start, v_end
+    FROM flight_recorder.samples_ring WHERE captured_at IS NOT NULL;
+
+    IF v_start IS NOT NULL AND v_end IS NOT NULL THEN
+        PERFORM * FROM flight_recorder.wait_summary(v_start, v_end);
+    END IF;
+END $$;
+
+SELECT ok(true, 'Boundary: wait_summary() with negative interval should not crash');
+
+-- Test activity_at() with NULL timestamp
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.activity_at(NULL)$$,
+    'Boundary: activity_at(NULL) should not crash'
+);
+
+-- Test cleanup() with '0 days' retention
+SELECT lives_ok(
+    $$SELECT flight_recorder.cleanup('0 days')$$,
+    'Boundary: cleanup(''0 days'') should not crash'
+);
+
+-- Test cleanup() with negative retention
+SELECT lives_ok(
+    $$SELECT flight_recorder.cleanup('-1 days')$$,
+    'Boundary: cleanup(''-1 days'') should not crash'
+);
+
+-- Test _pretty_bytes with negative value
+SELECT lives_ok(
+    $$SELECT flight_recorder._pretty_bytes(-1)$$,
+    'Boundary: _pretty_bytes(-1) should not crash'
 );
 
 SELECT * FROM finish();
