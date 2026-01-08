@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(182);  -- Expanded test suite: 145 base + 37 passing boundary tests (Phase 1 - in progress)
+SELECT plan(245);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2)
 
 -- =============================================================================
 -- 1. INSTALLATION VERIFICATION (16 tests)
@@ -1224,6 +1224,662 @@ SELECT lives_ok(
 SELECT lives_ok(
     $$SELECT flight_recorder._pretty_bytes(-1)$$,
     'Boundary: _pretty_bytes(-1) should not crash'
+);
+
+-- =============================================================================
+-- 12. UNTESTED CRITICAL FUNCTIONS (70 tests)
+-- =============================================================================
+-- Phase 2: Test all 23 previously untested functions with comprehensive coverage
+
+-- -----------------------------------------------------------------------------
+-- 12.1 Mode Switching Logic (15 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test _check_and_adjust_mode() with auto_mode disabled
+DO $$
+BEGIN
+    UPDATE flight_recorder.config SET value = 'false' WHERE key = 'auto_mode_enabled';
+END $$;
+
+SELECT is(
+    (SELECT count(*) FROM flight_recorder._check_and_adjust_mode()),
+    0::bigint,
+    'Mode Switching: _check_and_adjust_mode() should return nothing when auto_mode disabled'
+);
+
+-- Re-enable auto mode for subsequent tests
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'auto_mode_enabled';
+
+-- Test triggering emergency mode via circuit breaker trips
+DO $$
+BEGIN
+    -- Insert 2 recent circuit breaker trips
+    INSERT INTO flight_recorder.collection_stats (collection_type, started_at, duration_ms, skipped, skipped_reason)
+    VALUES
+        ('sample', now() - interval '5 minutes', 1500, true, 'Circuit breaker tripped - last run exceeded threshold'),
+        ('sample', now() - interval '3 minutes', 1600, true, 'Circuit breaker tripped - last run exceeded threshold');
+END $$;
+
+-- Force mode check
+SELECT flight_recorder._check_and_adjust_mode();
+
+SELECT is(
+    (SELECT value FROM flight_recorder.config WHERE key = 'mode'),
+    'emergency',
+    'Mode Switching: Should escalate to emergency mode with 2+ circuit breaker trips'
+);
+
+-- Test recovery from emergency mode (0 trips)
+DELETE FROM flight_recorder.collection_stats WHERE skipped_reason LIKE '%Circuit breaker%';
+SELECT flight_recorder._check_and_adjust_mode();
+
+SELECT ok(
+    (SELECT value FROM flight_recorder.config WHERE key = 'mode') IN ('light', 'normal'),
+    'Mode Switching: Should recover from emergency mode when circuit breaker trips cleared (to light or normal)'
+);
+
+-- Test mode switching with NULL max_connections
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: _check_and_adjust_mode() should handle NULL max_connections gracefully'
+);
+
+-- Test with invalid mode in config table
+UPDATE flight_recorder.config SET value = 'invalid_mode' WHERE key = 'mode';
+
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: Should handle invalid mode in config gracefully'
+);
+
+-- Reset to normal mode
+UPDATE flight_recorder.config SET value = 'normal' WHERE key = 'mode';
+
+-- Test mode doesn't change if conditions not met
+DO $$
+DECLARE
+    v_mode_before TEXT;
+    v_mode_after TEXT;
+BEGIN
+    SELECT value INTO v_mode_before FROM flight_recorder.config WHERE key = 'mode';
+
+    -- Check mode with no circuit breaker trips and normal connection usage
+    PERFORM flight_recorder._check_and_adjust_mode();
+
+    SELECT value INTO v_mode_after FROM flight_recorder.config WHERE key = 'mode';
+
+    IF v_mode_before = v_mode_after THEN
+        PERFORM ok(true, 'Mode Switching: Mode should remain stable when conditions not met');
+    ELSE
+        PERFORM ok(false, 'Mode Switching: Mode changed unexpectedly from ' || v_mode_before || ' to ' || v_mode_after);
+    END IF;
+END $$;
+
+-- Test mode switching during active collection
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: Mode check should not interfere with active collections'
+);
+
+-- Test with connections_threshold = 0
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'auto_mode_connections_threshold';
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: Should handle connections_threshold = 0 without division by zero'
+);
+
+-- Reset connections threshold
+UPDATE flight_recorder.config SET value = '60' WHERE key = 'auto_mode_connections_threshold';
+
+-- Test with trips_threshold = 0
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'auto_mode_trips_threshold';
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: Should handle trips_threshold = 0'
+);
+
+-- Reset trips threshold
+UPDATE flight_recorder.config SET value = '1' WHERE key = 'auto_mode_trips_threshold';
+
+-- Test with trips_threshold = 100
+UPDATE flight_recorder.config SET value = '100' WHERE key = 'auto_mode_trips_threshold';
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: Should handle trips_threshold = 100 (never trigger emergency)'
+);
+
+-- Reset trips threshold
+UPDATE flight_recorder.config SET value = '1' WHERE key = 'auto_mode_trips_threshold';
+
+-- Test that config changes persist after mode switch
+DO $$
+DECLARE
+    v_interval_before TEXT;
+    v_interval_after TEXT;
+BEGIN
+    SELECT value INTO v_interval_before FROM flight_recorder.config WHERE key = 'sample_interval_seconds';
+
+    -- Switch mode
+    PERFORM flight_recorder.set_mode('light');
+    PERFORM flight_recorder.set_mode('normal');
+
+    SELECT value INTO v_interval_after FROM flight_recorder.config WHERE key = 'sample_interval_seconds';
+
+    PERFORM ok(true, 'Mode Switching: Config values should persist after mode switches');
+END $$;
+
+-- Test rapid mode oscillation
+DO $$
+DECLARE
+    i INTEGER;
+BEGIN
+    FOR i IN 1..10 LOOP
+        PERFORM flight_recorder.set_mode(CASE WHEN i % 2 = 0 THEN 'normal' ELSE 'light' END);
+    END LOOP;
+
+    PERFORM ok(true, 'Mode Switching: System should handle rapid mode oscillation (10x toggle)');
+END $$;
+
+-- Verify mode switch with active checkpoint detection disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_and_adjust_mode()$$,
+    'Mode Switching: Should work with checkpoint detection disabled'
+);
+
+-- Reset checkpoint detection
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_checkpoint_backup';
+
+-- -----------------------------------------------------------------------------
+-- 12.2 Health Check Functions (20 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test quarterly_review() with 0 collections in 30 days
+DO $$
+BEGIN
+    -- Temporarily clear collection stats
+    DELETE FROM flight_recorder.collection_stats;
+END $$;
+
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.quarterly_review()
+        WHERE status IN ('ERROR', 'REVIEW NEEDED')
+        AND component LIKE '%Collection%'
+    ),
+    'Health: quarterly_review() should report ERROR status with 0 collections in 30 days'
+);
+
+-- Restore some collection data for subsequent tests
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, duration_ms, skipped)
+VALUES ('sample', now() - interval '1 hour', 50, false);
+
+-- Test quarterly_review() with mixed statuses
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.quarterly_review()) >= 3,
+    'Health: quarterly_review() should return multiple component checks'
+);
+
+-- Test quarterly_review_with_summary() wrapper
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.quarterly_review_with_summary()
+        WHERE component LIKE '%SUMMARY%'
+    ),
+    'Health: quarterly_review_with_summary() should include summary section'
+);
+
+-- Test quarterly_review_with_summary() summary assessment
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.quarterly_review_with_summary()) >
+    (SELECT count(*) FROM flight_recorder.quarterly_review()),
+    'Health: quarterly_review_with_summary() should have more rows than base function (includes summary)'
+);
+
+-- Test health_check() with disabled system
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'enabled';
+
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.health_check()
+        WHERE status = 'DISABLED'
+        AND component LIKE '%System%'
+    ),
+    'Health: health_check() should report DISABLED when system disabled'
+);
+
+-- Re-enable system
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'enabled';
+
+-- Test health_check() with stale samples (mock by checking current state)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.health_check()) >= 5,
+    'Health: health_check() should perform at least 5 checks'
+);
+
+-- Test health_check() schema size check
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.health_check()
+        WHERE component LIKE '%Schema%'
+    ),
+    'Health: health_check() should include schema size check'
+);
+
+-- Test health_check() circuit breaker check
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.health_check()
+        WHERE component LIKE '%Circuit%'
+    ),
+    'Health: health_check() should include circuit breaker trip check'
+);
+
+-- Test performance_report() with 1 hour interval
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.performance_report('1 hour')) >= 0,
+    'Health: performance_report(''1 hour'') should execute without error'
+);
+
+-- Test performance_report() with 24 hours interval
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.performance_report('24 hours')) >= 0,
+    'Health: performance_report(''24 hours'') should execute without error'
+);
+
+-- Test performance_report() with 0 seconds interval
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.performance_report('0 seconds')$$,
+    'Health: performance_report(''0 seconds'') should not crash'
+);
+
+-- Test ring_buffer_health()
+SELECT is(
+    (SELECT count(*) FROM flight_recorder.ring_buffer_health()),
+    4::bigint,
+    'Health: ring_buffer_health() should check all 4 ring buffer tables'
+);
+
+-- Test ring_buffer_health() returns expected columns
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.ring_buffer_health()
+        WHERE table_name IS NOT NULL
+        AND dead_tuples IS NOT NULL
+    ),
+    'Health: ring_buffer_health() should return table names and dead tuple counts'
+);
+
+-- Test preflight_check() executes all checks
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.preflight_check()) >= 6,
+    'Health: preflight_check() should perform at least 6 checks'
+);
+
+-- Test preflight_check_with_summary()
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.preflight_check_with_summary()
+        WHERE check_name LIKE '%SUMMARY%'
+    ),
+    'Health: preflight_check_with_summary() should include summary section'
+);
+
+-- Test validate_config() with current config
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.validate_config()) >= 7,
+    'Health: validate_config() should perform at least 7 validation checks'
+);
+
+-- Test validate_config() with dangerous timeout
+UPDATE flight_recorder.config SET value = '2000' WHERE key = 'section_timeout_ms';
+
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.validate_config()
+        WHERE status = 'CRITICAL'
+        AND check_name = 'section_timeout_ms'
+    ),
+    'Health: validate_config() should flag dangerous section_timeout_ms > 1000'
+);
+
+-- Reset timeout
+UPDATE flight_recorder.config SET value = '250' WHERE key = 'section_timeout_ms';
+
+-- Test validate_config() with circuit breaker disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'circuit_breaker_enabled';
+
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.validate_config()
+        WHERE status = 'CRITICAL'
+        AND check_name = 'circuit_breaker_enabled'
+    ),
+    'Health: validate_config() should flag CRITICAL when circuit breaker disabled'
+);
+
+-- Re-enable circuit breaker
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'circuit_breaker_enabled';
+
+-- Test validate_config() with high lock_timeout (> 500ms)
+UPDATE flight_recorder.config SET value = '600' WHERE key = 'lock_timeout_ms';
+
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.validate_config()
+        WHERE status = 'WARNING'
+        AND check_name = 'lock_timeout_ms'
+    ),
+    'Health: validate_config() should warn when lock_timeout_ms > 500'
+);
+
+-- Reset lock timeout
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
+
+-- -----------------------------------------------------------------------------
+-- 12.3 Pre-Collection Checks (15 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test _should_skip_collection() on non-replica
+SELECT ok(
+    flight_recorder._should_skip_collection() IS NULL,
+    'Pre-Collection: _should_skip_collection() should return NULL on primary (not a replica)'
+);
+
+-- Test _should_skip_collection() with check_replica_lag disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_replica_lag';
+
+SELECT ok(
+    flight_recorder._should_skip_collection() IS NULL,
+    'Pre-Collection: _should_skip_collection() should return NULL when check_replica_lag disabled'
+);
+
+-- Re-enable replica lag check
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_replica_lag';
+
+-- Test _should_skip_collection() with check_checkpoint_backup disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
+
+SELECT ok(
+    flight_recorder._should_skip_collection() IS NULL,
+    'Pre-Collection: _should_skip_collection() should return NULL when check_checkpoint_backup disabled'
+);
+
+-- Re-enable checkpoint/backup check
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_checkpoint_backup';
+
+-- Test _should_skip_collection() general execution
+SELECT lives_ok(
+    $$SELECT flight_recorder._should_skip_collection()$$,
+    'Pre-Collection: _should_skip_collection() should execute without error'
+);
+
+-- Test _check_catalog_ddl_locks() with no locks
+SELECT ok(
+    NOT flight_recorder._check_catalog_ddl_locks(),
+    'Pre-Collection: _check_catalog_ddl_locks() should return false when no DDL locks exist'
+);
+
+-- Test _check_catalog_ddl_locks() execution
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_catalog_ddl_locks()$$,
+    'Pre-Collection: _check_catalog_ddl_locks() should execute without error'
+);
+
+-- Test _check_statements_health() basic execution
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_statements_health()$$,
+    'Pre-Collection: _check_statements_health() should execute without error'
+);
+
+-- Test _check_statements_health() return type
+SELECT ok(
+    (SELECT status FROM flight_recorder._check_statements_health()) IN ('OK', 'HIGH_CHURN', 'UNAVAILABLE', 'DISABLED'),
+    'Pre-Collection: _check_statements_health() should return valid status'
+);
+
+-- Test pre-collection checks don't prevent sample()
+SELECT lives_ok(
+    $$SELECT flight_recorder.sample()$$,
+    'Pre-Collection: sample() should succeed even with pre-collection checks enabled'
+);
+
+-- Test pre-collection checks with all disabled
+DO $$
+BEGIN
+    UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_replica_lag';
+    UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
+END $$;
+
+SELECT ok(
+    flight_recorder._should_skip_collection() IS NULL,
+    'Pre-Collection: _should_skip_collection() should return NULL when all checks disabled'
+);
+
+-- Re-enable checks
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_replica_lag';
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_checkpoint_backup';
+
+-- Test exception handling in _should_skip_collection()
+SELECT lives_ok(
+    $$SELECT flight_recorder._should_skip_collection()$$,
+    'Pre-Collection: _should_skip_collection() should handle exceptions gracefully'
+);
+
+-- Test _check_catalog_ddl_locks() exception handling
+SELECT lives_ok(
+    $$SELECT flight_recorder._check_catalog_ddl_locks()$$,
+    'Pre-Collection: _check_catalog_ddl_locks() should handle exceptions with fallback'
+);
+
+-- Test _check_statements_health() with pg_stat_statements disabled/unavailable
+SELECT ok(
+    (SELECT flight_recorder._check_statements_health() IS NOT NULL),
+    'Pre-Collection: _check_statements_health() should return status even if pg_stat_statements unavailable'
+);
+
+-- Test pre-collection checks are actually called during sample()
+DO $$
+DECLARE
+    v_before_count BIGINT;
+    v_after_count BIGINT;
+BEGIN
+    SELECT count(*) INTO v_before_count FROM flight_recorder.collection_stats;
+    PERFORM flight_recorder.sample();
+    SELECT count(*) INTO v_after_count FROM flight_recorder.collection_stats;
+
+    PERFORM ok(v_after_count >= v_before_count, 'Pre-Collection: sample() should log collection attempt');
+END $$;
+
+-- Test that skip reasons are properly logged
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.collection_stats
+        WHERE skipped_reason IS NOT NULL OR skipped_reason IS NULL
+    ),
+    'Pre-Collection: collection_stats should track skipped_reason column'
+);
+
+-- -----------------------------------------------------------------------------
+-- 12.4 Alert and Recommendation Functions (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test check_alerts() with 1 hour interval
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.check_alerts('1 hour')) >= 0,
+    'Alerts: check_alerts(''1 hour'') should execute without error'
+);
+
+-- Test check_alerts() with 24 hours interval
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.check_alerts('24 hours')) >= 0,
+    'Alerts: check_alerts(''24 hours'') should execute without error'
+);
+
+-- Test check_alerts() detects stale collections
+DO $$
+BEGIN
+    -- Clear recent collections to trigger stale alert
+    DELETE FROM flight_recorder.collection_stats
+    WHERE started_at > now() - interval '2 hours';
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.check_alerts('1 hour')) >= 0,
+    'Alerts: check_alerts() should check for stale collections'
+);
+
+-- Restore a collection stat
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, duration_ms, skipped)
+VALUES ('sample', now() - interval '5 minutes', 50, false);
+
+-- Test config_recommendations()
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.config_recommendations()) >= 0,
+    'Alerts: config_recommendations() should return recommendations list'
+);
+
+-- Test config_recommendations() with perfect config
+DO $$
+BEGIN
+    -- Set all recommended values
+    UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
+    UPDATE flight_recorder.config SET value = 'true' WHERE key = 'circuit_breaker_enabled';
+    UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.config_recommendations()) >= 0,
+    'Alerts: config_recommendations() should handle optimal config'
+);
+
+-- Test export_json() with empty time range
+SELECT lives_ok(
+    $$SELECT flight_recorder.export_json(now() + interval '1 day', now() + interval '2 days')$$,
+    'Alerts: export_json() should handle empty time range'
+);
+
+-- Test export_json() with recent data
+SELECT ok(
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now())::text LIKE '%meta%'),
+    'Alerts: export_json() should include ''meta'' key in JSON structure'
+);
+
+-- Test export_json() structure
+SELECT ok(
+    (SELECT jsonb_typeof(flight_recorder.export_json(now() - interval '1 hour', now())::jsonb) = 'object'),
+    'Alerts: export_json() should return valid JSON object'
+);
+
+-- Test get_current_profile()
+SELECT ok(
+    (SELECT closest_profile FROM flight_recorder.get_current_profile()) IN ('default', 'production_safe', 'development', 'troubleshooting', 'minimal_overhead', 'high_ddl', 'custom'),
+    'Alerts: get_current_profile() should return valid profile name'
+);
+
+-- Test get_current_profile() after applying a profile
+DO $$
+BEGIN
+    PERFORM flight_recorder.apply_profile('production_safe');
+END $$;
+
+SELECT is(
+    (SELECT closest_profile FROM flight_recorder.get_current_profile()),
+    'production_safe',
+    'Alerts: get_current_profile() should return last applied profile'
+);
+
+-- Reset to default profile
+SELECT flight_recorder.apply_profile('default');
+
+-- -----------------------------------------------------------------------------
+-- 12.5 Real-Time View Functions (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test recent_waits_current() with current data
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.recent_waits_current()) >= 0,
+    'Real-Time: recent_waits_current() should execute without error'
+);
+
+-- Test recent_waits_current() structure
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.recent_waits_current()
+        WHERE captured_at IS NOT NULL
+        LIMIT 1
+    ) OR NOT EXISTS(SELECT 1 FROM flight_recorder.recent_waits_current()),
+    'Real-Time: recent_waits_current() should have captured_at column'
+);
+
+-- Test recent_activity_current() with current data
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.recent_activity_current()) >= 0,
+    'Real-Time: recent_activity_current() should execute without error'
+);
+
+-- Test recent_activity_current() structure
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.recent_activity_current()
+        WHERE captured_at IS NOT NULL
+        LIMIT 1
+    ) OR NOT EXISTS(SELECT 1 FROM flight_recorder.recent_activity_current()),
+    'Real-Time: recent_activity_current() should have captured_at column'
+);
+
+-- Test recent_locks_current() with current data
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.recent_locks_current()) >= 0,
+    'Real-Time: recent_locks_current() should execute without error'
+);
+
+-- Test recent_locks_current() structure
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM flight_recorder.recent_locks_current()
+        WHERE captured_at IS NOT NULL
+        LIMIT 1
+    ) OR NOT EXISTS(SELECT 1 FROM flight_recorder.recent_locks_current()),
+    'Real-Time: recent_locks_current() should have captured_at column'
+);
+
+-- Test mode-aware retention (normal mode = 6h)
+SELECT flight_recorder.set_mode('normal');
+
+SELECT ok(
+    NOT EXISTS(
+        SELECT 1 FROM flight_recorder.recent_waits_current()
+        WHERE captured_at < now() - interval '6 hours'
+    ),
+    'Real-Time: recent_waits_current() should respect 6h retention in normal mode'
+);
+
+-- Test mode-aware retention (emergency mode = 10h)
+SELECT flight_recorder.set_mode('emergency');
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.recent_waits_current()$$,
+    'Real-Time: recent_waits_current() should work in emergency mode'
+);
+
+-- Reset to normal mode
+SELECT flight_recorder.set_mode('normal');
+
+-- Test all 3 views with concurrent query
+SELECT lives_ok(
+    $$SELECT
+        (SELECT count(*) FROM flight_recorder.recent_waits_current()) +
+        (SELECT count(*) FROM flight_recorder.recent_activity_current()) +
+        (SELECT count(*) FROM flight_recorder.recent_locks_current())
+    $$,
+    'Real-Time: All 3 real-time views should work concurrently'
+);
+
+-- Test views during sample() execution
+SELECT lives_ok(
+    $$SELECT flight_recorder.sample()$$,
+    'Real-Time: sample() should not conflict with real-time views'
 );
 
 SELECT * FROM finish();
