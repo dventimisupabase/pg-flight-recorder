@@ -8,17 +8,27 @@
 -- REQUIREMENTS
 -- ------------
 --   - PostgreSQL 15, 16, or 17
---   - pg_cron extension (1.4.1+ recommended for 30-second sampling)
+--   - pg_cron extension (1.4.1+ recommended)
 --   - Superuser or appropriate privileges to create schema/functions
 --
 -- INSTALLATION
 -- ------------
 --   psql -f install.sql
 --
--- TWO-TIER COLLECTION
--- -------------------
---   1. Snapshots (every 5 min via pg_cron)
---      Cumulative stats that are meaningful as deltas:
+-- THREE-TIER ARCHITECTURE
+-- -----------------------
+--   TIER 1: Ring Buffers (every 60 sec, 2-hour rolling window, UNLOGGED)
+--      - Wait events: aggregated by backend_type, wait_event_type, wait_event
+--      - Active sessions: top 25 non-idle sessions with query preview
+--      - Lock contention: blocked/blocking PIDs with queries
+--      - Low overhead (<0.1% CPU): HOT updates, aggressive autovacuum
+--
+--   TIER 2: Aggregates (flushed every 5 min from ring buffer, 7-day retention)
+--      - Wait event patterns summarized over 5-minute windows
+--      - Lock contention patterns
+--      - Query execution patterns
+--
+--   TIER 3: Snapshots (every 5 min, 30-day retention, cumulative stats)
 --      - WAL: bytes generated, write/sync time
 --      - Checkpoints: timed/requested count, write/sync time, buffers
 --      - BGWriter: buffers clean/alloc/backend (backend writes = pressure)
@@ -26,13 +36,6 @@
 --      - Replication lag: per-replica write_lag, flush_lag, replay_lag
 --      - Temp files: cumulative temp files and bytes (work_mem spills)
 --      - pg_stat_io (PG16+): I/O by backend type
---
---   2. Samples (every 30 sec via pg_cron)
---      Point-in-time snapshots for real-time visibility:
---      - Wait events: aggregated by backend_type, wait_event_type, wait_event
---      - Active sessions: top 25 non-idle sessions with query preview
---      - Operation progress: vacuum, COPY, analyze, create index
---      - Lock contention: blocked/blocking PIDs with queries
 --
 -- QUICK START
 -- -----------

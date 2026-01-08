@@ -39,9 +39,9 @@ SELECT flight_recorder.enable();               -- Resume
 
 ## Performance Impact
 
-**Default overhead: ~0.5% CPU** (3-minute sampling)
+**Default overhead: <0.1% CPU** (60-second sampling with ring buffers)
 
-Built for production with automatic safety controls (circuit breaker, adaptive mode, timeouts). See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
+Built for production with automatic safety controls (circuit breaker, adaptive mode, timeouts). Ring buffer architecture provides 2-hour rolling window with minimal overhead. See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
 
 ## Set and Forget
 

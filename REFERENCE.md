@@ -5,18 +5,112 @@ Complete documentation for pg-flight-recorder.
 ## Requirements
 
 - PostgreSQL 15, 16, or 17
-- `pg_cron` extension (1.4.1+ for 30-second sampling, older versions use 60 seconds)
+- `pg_cron` extension (1.4.1+ recommended)
 - Superuser privileges
 - Optional: `pg_stat_statements` for query analysis
 
 ## How It Works
 
-Flight Recorder uses `pg_cron` to run two collection types:
+Flight Recorder uses `pg_cron` to run three collection types:
 
-1. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
-2. **Samples** (every 30 seconds): Point-in-time - wait events, active sessions, locks, operation progress
+1. **Samples** (every 60 seconds): Ring buffer - wait events, active sessions, locks (2-hour rolling window)
+2. **Flush** (every 5 minutes): Ring buffer → aggregates (durable storage)
+3. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
 
-Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
+The ring buffer provides low-overhead, high-frequency sampling. Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
+
+## Three-Tier Architecture
+
+Flight Recorder uses a three-tier data architecture optimized for minimal overhead and maximum retention flexibility:
+
+### TIER 1: Ring Buffers (High-Frequency, Short Retention)
+
+**Purpose:** Low-overhead, high-frequency sampling with 2-hour rolling window
+
+**Tables:**
+- `samples_ring` (master, 120 slots, UNLOGGED)
+- `wait_samples_ring` (wait events aggregated by type/event/state)
+- `activity_samples_ring` (top 25 active sessions per sample)
+- `lock_samples_ring` (lock contention details)
+
+**Characteristics:**
+- **UNLOGGED tables** - No WAL overhead, don't survive crashes (intentional trade-off)
+- **Fixed 60-second intervals** - Consistent slot rotation (slot = epoch / 60 % 120)
+- **2-hour retention** - 120 slots × 60 seconds = 7,200 seconds
+- **UPSERT pattern** - samples_ring uses HOT updates (90%+ ratio, minimal bloat)
+- **DELETE+INSERT pattern** - Child tables cleared per slot (aggressive autovacuum handles dead tuples)
+- **Ring buffer self-cleans** - New data overwrites old slots automatically
+
+**Optimization:**
+- `fillfactor=70` on master (30% free space for HOT updates)
+- `fillfactor=80` on children (reduce page splits)
+- Aggressive autovacuum settings (scale_factor=0.02-0.05, threshold=10-20, cost_delay=0)
+
+**Query with:**
+- `recent_waits`, `recent_activity`, `recent_locks` views (last 2 hours)
+- `activity_at(timestamp)` function (specific moment)
+
+### TIER 2: Aggregates (Durable, Medium Retention)
+
+**Purpose:** Flushed ring buffer data for longer retention and historical analysis
+
+**Tables:**
+- `wait_event_aggregates` (wait event patterns over 5-minute windows)
+- `lock_aggregates` (lock contention patterns)
+- `query_aggregates` (query execution patterns)
+
+**Characteristics:**
+- **Durable (LOGGED)** - Survives crashes
+- **Flushed every 5 minutes** - Ring buffer → aggregates
+- **7-day default retention** - Configurable via `retention_samples_days`
+- **Aggregated data** - Summarizes ring buffer samples (e.g., avg/max waiters, occurrence counts)
+
+**How flush works:**
+1. Find min/max timestamp in ring buffer (since last flush)
+2. Aggregate samples by dimensions (backend_type, wait_event, etc.)
+3. INSERT aggregated rows into durable tables
+4. Ring buffer continues (not cleared - provides 2-hour recent window)
+
+**Query with:**
+- `wait_summary(start, end)` function (aggregate wait events over time)
+- Direct SQL on aggregate tables for custom analysis
+
+### TIER 3: Snapshots (Durable, Long Retention)
+
+**Purpose:** Point-in-time cumulative statistics for long-term trends
+
+**Tables:**
+- `snapshots` (pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O)
+- `replication_snapshots` (pg_stat_replication, replication slots)
+- `statement_snapshots` (pg_stat_statements top queries)
+
+**Characteristics:**
+- **Durable (LOGGED)** - Survives crashes
+- **Every 5 minutes** - Cumulative stats (counters since PostgreSQL start)
+- **30-day default retention** - Configurable via `retention_snapshots_days`
+- **Delta analysis** - Compare two snapshots to see changes over time
+
+**Query with:**
+- `compare(start, end)` function (snapshot-over-snapshot deltas)
+- `statement_compare(start, end)` function (query performance changes)
+- `deltas` view (recent snapshot changes)
+
+### Data Flow
+
+```
+Every 60s: sample() → Ring Buffer (TIER 1)
+Every 5m:  flush_ring_to_aggregates() → Ring Buffer → Aggregates (TIER 2)
+Every 5m:  snapshot() → Snapshots (TIER 3)
+Daily:     cleanup() → Delete old TIER 2 and TIER 3 data
+```
+
+### Architecture Benefits
+
+1. **Ring buffer minimizes write overhead** - UNLOGGED, small tables, HOT updates
+2. **Aggregates provide medium-term analysis** - 7 days of summarized data
+3. **Snapshots capture long-term trends** - 30 days of cumulative stats
+4. **Tiered retention** - Keep high-frequency data short, summaries longer
+5. **Crash resilience where it matters** - Aggregates and snapshots are durable; ring buffer is ephemeral by design
 
 ## Functions
 
@@ -40,6 +134,7 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 | `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity               |
 | `get_mode()`                             | Show current mode and settings            |
 | `cleanup(interval)`                      | Delete old data (default: 7 days)         |
+| `validate_config()`                      | Validate configuration settings           |
 
 ### Health & Monitoring
 
@@ -48,10 +143,20 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 | `preflight_check()`            | **Pre-installation validation (run first)**   |
 | `quarterly_review()`           | **90-day health check (run every 3 months)**  |
 | `health_check()`               | Component status overview                     |
+| `ring_buffer_health()`         | Ring buffer XID age, dead tuples, HOT updates |
 | `performance_report(interval)` | Flight recorder's own performance             |
 | `check_alerts(interval)`       | Active alerts (if enabled)                    |
 | `config_recommendations()`     | Optimization suggestions                      |
 | `export_json(start, end)`      | AI-friendly data export                       |
+
+### Internal (Scheduled via pg_cron)
+
+| Function                       | Purpose                                       |
+|--------------------------------|-----------------------------------------------|
+| `snapshot()`                   | Collect system stats snapshot                |
+| `sample()`                     | Collect ring buffer sample                   |
+| `flush_ring_to_aggregates()`   | Flush ring buffer to durable aggregates      |
+| `cleanup_aggregates()`         | Clean old aggregate data                     |
 
 **"Set and Forget" Workflow:**
 1. Before installation: `SELECT * FROM flight_recorder.preflight_check();`
@@ -65,27 +170,25 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 | `recent_waits`       | Wait events (last 2 hours)                  |
 | `recent_activity`    | Active sessions (last 2 hours)              |
 | `recent_locks`       | Lock contention (last 2 hours)              |
-| `recent_progress`    | Vacuum/COPY/analyze progress (last 2 hours) |
 | `recent_replication` | Replication lag (last 2 hours)              |
 | `deltas`             | Snapshot-over-snapshot changes              |
 
 ## Collection Modes
 
-Modes control **what** is collected, not **how often**. Sample interval is configured separately via `sample_interval_seconds` (default: 180s).
+Modes control **what** is collected. Ring buffer samples at fixed 60-second intervals.
 
-| Mode        | Locks | Progress | Interval Behavior | Use Case        |
-|-------------|-------|----------|-------------------|-----------------|
-| `normal`    | Yes   | Yes      | Uses configured interval | Default (4 sections) |
-| `light`     | Yes   | No       | Uses configured interval | Moderate load (3 sections) |
-| `emergency` | No    | No       | Forces min 180s | System stressed (2 sections) |
+| Mode        | Locks | Activity Detail | Use Case                     |
+|-------------|-------|-----------------|------------------------------|
+| `normal`    | Yes   | Full (25 rows)  | Default (3 sections)         |
+| `light`     | Yes   | Full (25 rows)  | Moderate load (3 sections)   |
+| `emergency` | No    | Limited         | System stressed (2 sections) |
 
 ```sql
 SELECT flight_recorder.set_mode('light');
 SELECT * FROM flight_recorder.get_mode();
 
--- Sample interval is independent of mode
-UPDATE flight_recorder.config SET value = '180' WHERE key = 'sample_interval_seconds';
-SELECT flight_recorder.enable();  -- Reschedule with new interval
+-- Ring buffer always samples at 60-second fixed intervals
+-- Modes only control what data is collected, not frequency
 ```
 
 ## Anomaly Detection
@@ -105,14 +208,13 @@ SELECT flight_recorder.enable();  -- Reschedule with new interval
 
 ### Observer Effect
 
-Flight recorder has measurable overhead. Exact cost depends on configuration:
+Flight recorder has measurable overhead. Ring buffer uses fixed 60-second intervals:
 
-| Config | Sample Interval | Timeout/Section | Worst-Case CPU | Notes |
-|--------|-----------------|-----------------|----------------|-------|
-| **Default** | 180s | 250ms | 0.5% | 4 sections: wait, activity, progress, locks |
-| **High Resolution** | 60s | 250ms | 1.7% | Set sample_interval_seconds=60 for higher temporal resolution |
-| **Light Mode** | 180s | 250ms | 0.4% | 3 sections: wait, activity, locks (progress disabled) |
-| **Emergency Mode** | 180s | 250ms | 0.3% | 2 sections: wait, activity (locks and progress disabled) |
+| Mode | Sections | Timeout/Section | Typical CPU | Notes |
+|------|----------|-----------------|-------------|-------|
+| **Normal** | 3 | 250ms | <0.1% | Ring buffer: wait events, activity, locks |
+| **Light** | 3 | 250ms | <0.1% | Same as normal (mode distinction for future use) |
+| **Emergency** | 2 | 250ms | <0.05% | Ring buffer: wait events, activity only (locks disabled) |
 
 **Additional Resource Costs:**
 
@@ -316,10 +418,10 @@ SELECT flight_recorder.disable();
 **Solution (upgraded):**
 
 Automatic health checks for all 4 required pg_cron jobs:
-- `flight_recorder_sample`
-- `flight_recorder_snapshot`
-- `flight_recorder_cleanup`
-- `flight_recorder_partition`
+- `flight_recorder_sample` (every 60 seconds - ring buffer)
+- `flight_recorder_snapshot` (every 5 minutes - system stats)
+- `flight_recorder_flush` (every 5 minutes - ring buffer → aggregates)
+- `flight_recorder_cleanup` (daily at 3 AM - old data cleanup)
 
 **Health Checks:**
 
@@ -386,7 +488,7 @@ Key settings:
 | `lock_timeout_ms`                   | 100     | Max wait for catalog locks                     |
 | `skip_locks_threshold`              | 50      | Skip lock collection if > N blocked            |
 | `skip_activity_conn_threshold`      | 100     | Skip activity if > N active conns              |
-| `sample_interval_seconds`           | 120     | Sample collection interval (60, 120, 180, ...) |
+| `sample_interval_seconds`           | 180     | UNUSED - ring buffer uses fixed 60s interval   |
 | `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
 | `statements_top_n`                  | 20      | Number of top queries to capture               |
 | `snapshot_based_collection`         | true    | Use temp table snapshot (reduces catalog locks)|
@@ -499,23 +601,11 @@ UPDATE flight_recorder.config SET value = '5' WHERE key = 'adaptive_sampling_idl
 - Workloads with idle periods (dev/staging, batch processing)
 - Systems where you want absolute minimum overhead
 
-### Adjustable Sample Interval
+### Ring Buffer Architecture
 
-**Purpose:** Trade temporal resolution for lower overhead
+**Ring buffer samples at fixed 60-second intervals** for consistent slot rotation. The 2-hour rolling window (120 slots) provides low-overhead, high-frequency sampling with <0.1% CPU overhead.
 
-**Configure:**
-```sql
--- High resolution (1.7% overhead)
-UPDATE flight_recorder.config SET value = '60' WHERE key = 'sample_interval_seconds';
-
--- Default (0.8% overhead)
-UPDATE flight_recorder.config SET value = '120' WHERE key = 'sample_interval_seconds';
-
--- Low overhead (0.4% overhead)
-UPDATE flight_recorder.config SET value = '240' WHERE key = 'sample_interval_seconds';
-```
-
-**Note:** Must call `flight_recorder.disable()` then `flight_recorder.enable()` to reschedule pg_cron jobs.
+To reduce overhead further, use `set_mode('emergency')` to disable lock collection while maintaining wait events and activity monitoring.
 
 ### pg_stat_statements Tuning
 
