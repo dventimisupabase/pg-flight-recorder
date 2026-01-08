@@ -37,29 +37,25 @@ SELECT flight_recorder.disable();              -- Stop completely
 SELECT flight_recorder.enable();               -- Resume
 ```
 
-## Performance Impact
+## Is It Safe?
 
-**Default overhead: <0.1% CPU** (60-second sampling with ring buffers)
+**Yes.** Uses less than 0.1% of your CPU. Safe to run 24/7.
 
-Built for production with automatic safety controls (circuit breaker, adaptive mode, timeouts). Ring buffer architecture provides 2-hour rolling window with minimal overhead. See [REFERENCE.md](REFERENCE.md) for detailed performance characteristics and tuning options.
+Built-in safety controls automatically protect your database. If things get busy, it backs off automatically.
 
-## Set and Forget
+## Health Checks
 
-Safe for always-on monitoring. Before enabling:
+Optional but recommended:
 
 ```sql
--- Run preflight check (one-time setup validation)
+-- Before you start (one time)
 SELECT * FROM flight_recorder.preflight_check();
-```
 
-After installation, run quarterly health checks:
-
-```sql
--- Run every 3 months (takes ~1 second)
+-- Every 3 months (takes 1 second)
 SELECT * FROM flight_recorder.quarterly_review();
 ```
 
-These affordances make safety validation a no-brainer.
+That's it. No maintenance required.
 
 ## Uninstall
 
@@ -67,34 +63,15 @@ These affordances make safety validation a no-brainer.
 psql -f uninstall.sql
 ```
 
-## Testing
+## For Developers
 
-Run tests locally with Docker:
-
-```bash
-# Test on PostgreSQL 16 (default)
-./test.sh
-
-# Test on specific version
-./test.sh 15   # PostgreSQL 15
-./test.sh 17   # PostgreSQL 17
-
-# Test on all versions (15, 16, 17)
-./test.sh all
-```
-
-Or test against your own PostgreSQL 15+ instance with pg_cron and pgTAP installed:
+Want to modify or contribute? Run the test suite:
 
 ```bash
-psql -f install.sql
-psql -c "CREATE EXTENSION pgtap;"
-pg_prove -U postgres -d postgres flight_recorder_test.sql
+./test.sh     # PostgreSQL 16
+./test.sh all # All versions (15, 16, 17)
 ```
 
-## Documentation
+## Need More?
 
-See [REFERENCE.md](REFERENCE.md) for complete documentation including:
-- All analysis functions and views
-- Performance tuning and configuration
-- Safety mechanisms and troubleshooting
-- Advanced features
+See [REFERENCE.md](REFERENCE.md) for full documentation.
