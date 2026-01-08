@@ -3116,13 +3116,14 @@ $$;
 -- flight_recorder.cleanup() - Remove old flight recorder data
 -- -----------------------------------------------------------------------------
 
+DROP FUNCTION IF EXISTS flight_recorder.cleanup(INTERVAL);
+
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup(p_retain_interval INTERVAL DEFAULT NULL)
 RETURNS TABLE(
     deleted_snapshots   BIGINT,
     deleted_samples     BIGINT,
     deleted_statements  BIGINT,
-    deleted_stats       BIGINT,
-    vacuumed_tables     INTEGER
+    deleted_stats       BIGINT
 )
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -3130,8 +3131,6 @@ DECLARE
     v_deleted_samples BIGINT;
     v_deleted_statements BIGINT;
     v_deleted_stats BIGINT;
-    v_vacuumed_count INTEGER := 0;
-    v_table_name TEXT;
     v_samples_retention_days INTEGER;
     v_snapshots_retention_days INTEGER;
     v_statements_retention_days INTEGER;
@@ -3173,11 +3172,9 @@ BEGIN
         v_stats_cutoff := now() - (v_stats_retention_days || ' days')::interval;
     END IF;
 
-    -- Delete old samples (cascades to wait_samples, activity_samples, progress_samples, lock_samples)
-    WITH deleted AS (
-        DELETE FROM flight_recorder.samples_ring WHERE captured_at < v_samples_cutoff RETURNING 1
-    )
-    SELECT count(*) INTO v_deleted_samples FROM deleted;
+    -- Ring buffers self-clean via modular arithmetic (UPSERT pattern)
+    -- No deletion needed - slots automatically overwrite after 2 hours
+    v_deleted_samples := 0;
 
     -- Delete old snapshots (cascades to replication_snapshots, statement_snapshots)
     WITH deleted AS (
@@ -3202,32 +3199,68 @@ BEGIN
     )
     SELECT count(*) INTO v_deleted_stats FROM deleted;
 
-    -- P1 Safety: VACUUM ANALYZE after cleanup to reclaim space and update stats
-    -- This prevents bloat in flight recorder tables and keeps query planner informed
-    FOR v_table_name IN
-        SELECT c.relname
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'flight_recorder'
-          AND c.relkind = 'r'  -- regular tables only
-          AND c.relname IN (
-              'samples', 'wait_samples', 'activity_samples', 'progress_samples', 'lock_samples',
-              'snapshots', 'table_snapshots', 'replication_snapshots', 'statement_snapshots',
-              'collection_stats'
-          )
-        ORDER BY c.relname
-    LOOP
-        BEGIN
-            EXECUTE format('VACUUM ANALYZE flight_recorder.%I', v_table_name);
-            v_vacuumed_count := v_vacuumed_count + 1;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'pg-flight-recorder: Failed to VACUUM table %: %', v_table_name, SQLERRM;
-        END;
-    END LOOP;
+    -- Note: VACUUM cannot run inside a transaction block (function context)
+    -- Autovacuum handles cleanup naturally:
+    --   - Ring buffers: Small tables (120 rows) trigger autovacuum ~20x/day
+    --   - Aggregate tables: Autovacuum triggers after DELETE operations
+    --   - Snapshot tables: Autovacuum triggers after DELETE operations
+    -- Use ring_buffer_health() to monitor dead tuples and XID age
+    -- Manual VACUUM: VACUUM ANALYZE flight_recorder.samples_ring; (run outside function)
 
-    RETURN QUERY SELECT v_deleted_snapshots, v_deleted_samples, v_deleted_statements, v_deleted_stats, v_vacuumed_count;
+    RETURN QUERY SELECT v_deleted_snapshots, v_deleted_samples, v_deleted_statements, v_deleted_stats;
 END;
 $$;
+
+-- -----------------------------------------------------------------------------
+-- flight_recorder.ring_buffer_health() - Monitor XID age and bloat in ring buffers
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.ring_buffer_health()
+RETURNS TABLE(
+    table_name              TEXT,
+    row_count               BIGINT,
+    dead_tuples             BIGINT,
+    dead_tuple_pct          NUMERIC,
+    xid_age                 INTEGER,
+    last_vacuum             TIMESTAMPTZ,
+    last_autovacuum         TIMESTAMPTZ,
+    autovacuum_threshold    BIGINT,
+    needs_vacuum            BOOLEAN,
+    status                  TEXT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        c.relname::text,
+        s.n_live_tup,
+        s.n_dead_tup,
+        CASE
+            WHEN s.n_live_tup > 0 THEN round(100.0 * s.n_dead_tup / NULLIF(s.n_live_tup, 0), 1)
+            ELSE 0
+        END,
+        age(c.relfrozenxid)::integer,
+        s.last_vacuum,
+        s.last_autovacuum,
+        -- Autovacuum threshold: 50 + 0.2 * n_live_tup
+        (50 + (0.2 * s.n_live_tup)::bigint),
+        -- Needs vacuum if dead tuples exceed threshold
+        s.n_dead_tup > (50 + (0.2 * s.n_live_tup)::bigint),
+        CASE
+            WHEN age(c.relfrozenxid) > 200000000 THEN 'CRITICAL: XID wraparound risk'
+            WHEN age(c.relfrozenxid) > 100000000 THEN 'WARNING: High XID age'
+            WHEN s.n_dead_tup > (50 + (0.2 * s.n_live_tup)::bigint) THEN 'INFO: Autovacuum pending'
+            ELSE 'OK'
+        END::text
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+    WHERE n.nspname = 'flight_recorder'
+      AND c.relkind = 'r'
+      AND c.relname IN ('samples_ring', 'wait_samples_ring', 'activity_samples_ring', 'lock_samples_ring')
+    ORDER BY age(c.relfrozenxid) DESC;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.ring_buffer_health() IS
+'Monitor ring buffer XID age and dead tuple bloat. Ring buffers have high UPDATE churn (1,440/day) creating dead tuples. Autovacuum handles this naturally but this function provides visibility.';
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.disable() - Emergency kill switch: stop all collection
