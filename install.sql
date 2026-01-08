@@ -424,9 +424,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     slot_id             INTEGER PRIMARY KEY CHECK (slot_id >= 0 AND slot_id < 120),
     captured_at         TIMESTAMPTZ NOT NULL,
     epoch_seconds       BIGINT NOT NULL
-);
+) WITH (fillfactor = 70);
 
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, 60s intervals, 2 hours retention)';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, 60s intervals, 2 hours retention). Fill factor 70 enables HOT updates (UPSERT pattern updates non-indexed columns 1,440x/day).';
 
 -- Wait events ring buffer
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
@@ -437,9 +437,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     state               TEXT NOT NULL,
     count               INTEGER NOT NULL,
     PRIMARY KEY (slot_id, backend_type, wait_event_type, wait_event, state)
-);
+) WITH (fillfactor = 80);
 
-COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (aggregated by type/event/state)';
+COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (aggregated by type/event/state). Fill factor 80 reduces page splits from DELETE/INSERT churn.';
 
 -- Activity samples ring buffer
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
@@ -455,9 +455,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     state_change        TIMESTAMPTZ,
     query_preview       TEXT,
     PRIMARY KEY (slot_id, pid)
-);
+) WITH (fillfactor = 80);
 
-COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (top 25 per sample)';
+COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (top 25 per sample). Fill factor 80 reduces page splits from DELETE/INSERT churn.';
 
 -- Lock samples ring buffer
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
@@ -474,9 +474,21 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     lock_type               TEXT,
     locked_relation_oid     OID,
     PRIMARY KEY (slot_id, blocked_pid, blocking_pid)
-);
+) WITH (fillfactor = 80);
 
-COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (blocked/blocking relationships)';
+COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (blocked/blocking relationships). Fill factor 80 reduces page splits from DELETE/INSERT churn.';
+
+-- Set fill factor on existing ring buffer tables (for upgrades)
+DO $$
+BEGIN
+    ALTER TABLE flight_recorder.samples_ring SET (fillfactor = 70);
+    ALTER TABLE flight_recorder.wait_samples_ring SET (fillfactor = 80);
+    ALTER TABLE flight_recorder.activity_samples_ring SET (fillfactor = 80);
+    ALTER TABLE flight_recorder.lock_samples_ring SET (fillfactor = 80);
+EXCEPTION WHEN OTHERS THEN
+    -- Ignore errors (tables may not exist yet)
+    NULL;
+END $$;
 
 -- Initialize ring buffer slots (0 to 119)
 INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
@@ -3215,6 +3227,8 @@ $$;
 -- flight_recorder.ring_buffer_health() - Monitor XID age and bloat in ring buffers
 -- -----------------------------------------------------------------------------
 
+DROP FUNCTION IF EXISTS flight_recorder.ring_buffer_health();
+
 CREATE OR REPLACE FUNCTION flight_recorder.ring_buffer_health()
 RETURNS TABLE(
     table_name              TEXT,
@@ -3222,6 +3236,9 @@ RETURNS TABLE(
     dead_tuples             BIGINT,
     dead_tuple_pct          NUMERIC,
     xid_age                 INTEGER,
+    total_updates           BIGINT,
+    hot_updates             BIGINT,
+    hot_update_pct          NUMERIC,
     last_vacuum             TIMESTAMPTZ,
     last_autovacuum         TIMESTAMPTZ,
     autovacuum_threshold    BIGINT,
@@ -3238,6 +3255,12 @@ LANGUAGE sql STABLE AS $$
             ELSE 0
         END,
         age(c.relfrozenxid)::integer,
+        s.n_tup_upd,
+        s.n_tup_hot_upd,
+        CASE
+            WHEN s.n_tup_upd > 0 THEN round(100.0 * s.n_tup_hot_upd / NULLIF(s.n_tup_upd, 0), 1)
+            ELSE 0
+        END,
         s.last_vacuum,
         s.last_autovacuum,
         -- Autovacuum threshold: 50 + 0.2 * n_live_tup
@@ -3247,6 +3270,7 @@ LANGUAGE sql STABLE AS $$
         CASE
             WHEN age(c.relfrozenxid) > 200000000 THEN 'CRITICAL: XID wraparound risk'
             WHEN age(c.relfrozenxid) > 100000000 THEN 'WARNING: High XID age'
+            WHEN c.relname = 'samples_ring' AND s.n_tup_upd > 100 AND (100.0 * s.n_tup_hot_upd / NULLIF(s.n_tup_upd, 0)) < 50 THEN 'WARNING: Low HOT update ratio'
             WHEN s.n_dead_tup > (50 + (0.2 * s.n_live_tup)::bigint) THEN 'INFO: Autovacuum pending'
             ELSE 'OK'
         END::text
@@ -3256,11 +3280,11 @@ LANGUAGE sql STABLE AS $$
     WHERE n.nspname = 'flight_recorder'
       AND c.relkind = 'r'
       AND c.relname IN ('samples_ring', 'wait_samples_ring', 'activity_samples_ring', 'lock_samples_ring')
-    ORDER BY age(c.relfrozenxid) DESC;
+    ORDER BY c.relname;
 $$;
 
 COMMENT ON FUNCTION flight_recorder.ring_buffer_health() IS
-'Monitor ring buffer XID age and dead tuple bloat. Ring buffers have high UPDATE churn (1,440/day) creating dead tuples. Autovacuum handles this naturally but this function provides visibility.';
+'Monitor ring buffer XID age, dead tuple bloat, and HOT update effectiveness. samples_ring uses UPSERT (1,440x/day) and should achieve >90% HOT update ratio with fillfactor=70. Child tables use DELETE/INSERT so HOT updates are N/A.';
 
 -- -----------------------------------------------------------------------------
 -- flight_recorder.disable() - Emergency kill switch: stop all collection
