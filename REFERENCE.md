@@ -30,13 +30,16 @@ Complete documentation for pg-flight-recorder.
 
 ## How It Works
 
-Flight Recorder uses `pg_cron` to run three collection types:
+Flight Recorder uses `pg_cron` to run four collection types:
 
-1. **Samples** (every 60 seconds): Ring buffer - wait events, active sessions, locks (2-hour rolling window)
+1. **Samples** (adaptive frequency): Ring buffer - wait events, active sessions, locks
+   - Normal/Light: every 180 seconds (4-hour rolling window)
+   - Emergency: every 300 seconds (10-hour rolling window)
 2. **Flush** (every 5 minutes): Ring buffer → aggregates (durable storage)
 3. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
+4. **Cleanup** (daily at 3 AM): Remove old aggregates and snapshots
 
-The ring buffer provides low-overhead, high-frequency sampling. Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
+The ring buffer provides low-overhead, adaptive-frequency sampling using a fixed 120-slot circular buffer with modular arithmetic. Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
 
 ## Three-Tier Architecture
 
@@ -44,29 +47,33 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 
 ### TIER 1: Ring Buffers (High-Frequency, Short Retention)
 
-**Purpose:** Low-overhead, high-frequency sampling with 2-hour rolling window
+**Purpose:** Low-overhead, adaptive-frequency sampling with 4-10 hour rolling window
 
 **Tables:**
-- `samples_ring` (master, 120 slots, UNLOGGED)
-- `wait_samples_ring` (wait events aggregated by type/event/state)
-- `activity_samples_ring` (top 25 active sessions per sample)
-- `lock_samples_ring` (lock contention details)
+- `samples_ring` (master, 120 fixed slots, UNLOGGED)
+- `wait_samples_ring` (12,000 pre-populated rows: 120 slots × 100 rows)
+- `activity_samples_ring` (3,000 pre-populated rows: 120 slots × 25 rows)
+- `lock_samples_ring` (12,000 pre-populated rows: 120 slots × 100 rows)
 
 **Characteristics:**
 - **UNLOGGED tables** - No WAL overhead, don't survive crashes (intentional trade-off)
-- **Fixed 60-second intervals** - Consistent slot rotation (slot = epoch / 60 % 120)
-- **2-hour retention** - 120 slots × 60 seconds = 7,200 seconds
-- **UPSERT pattern** - samples_ring uses HOT updates (90%+ ratio, minimal bloat)
-- **UPDATE-only pattern** - Child tables pre-populated (27K rows), cleared via UPDATE to NULL, then UPSERT (zero DELETEs, 100% HOT updates, eliminates dead tuples)
-- **Ring buffer self-cleans** - New data overwrites old slots automatically
+- **Adaptive intervals** - Slot rotation: `(epoch / sample_interval_seconds) % 120`
+  - Normal/Light mode: 180s intervals = 120 slots × 180s = 6 hours retention
+  - Emergency mode: 300s intervals = 120 slots × 300s = 10 hours retention
+- **Pre-populated rows** - 27,000 total rows allocated at installation (master + children)
+- **UPSERT pattern** - samples_ring master uses HOT updates (90%+ ratio, minimal bloat)
+- **UPDATE-only pattern** - Child tables cleared via `UPDATE ... SET col = NULL`, then `INSERT ... ON CONFLICT DO UPDATE` (zero DELETEs, 100% HOT updates, eliminates dead tuples)
+- **Ring buffer self-cleans** - New data overwrites old slots automatically via modular arithmetic
+- **Zero autovacuum pressure** - No dead tuples generated, only HOT updates
 
 **Optimization:**
 - `fillfactor=70` on master (30% free space for HOT updates)
-- `fillfactor=80` on children (reduce page splits)
-- Autovacuum settings tuned for HOT updates (scale_factor=0.02-0.05, threshold=10-20, cost_delay=0)
+- `fillfactor=90` on children (10% free space for HOT updates)
+- No aggressive autovacuum needed (UPDATE-only pattern eliminates dead tuples)
 
 **Query with:**
-- `recent_waits`, `recent_activity`, `recent_locks` views (last 2 hours)
+- `recent_waits`, `recent_activity`, `recent_locks` views (static 10-hour window, covers all modes)
+- `recent_waits_current()`, `recent_activity_current()`, `recent_locks_current()` functions (dynamic retention based on current mode)
 - `activity_at(timestamp)` function (specific moment)
 
 ### TIER 2: Aggregates (Durable, Medium Retention)
@@ -81,7 +88,7 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 **Characteristics:**
 - **Durable (LOGGED)** - Survives crashes
 - **Flushed every 5 minutes** - Ring buffer → aggregates
-- **7-day default retention** - Configurable via `retention_samples_days`
+- **7-day default retention** - Configurable via `aggregate_retention_days`
 - **Aggregated data** - Summarizes ring buffer samples (e.g., avg/max waiters, occurrence counts)
 
 **How flush works:**
@@ -117,10 +124,12 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 ### Data Flow
 
 ```
-Every 60s: sample() → Ring Buffer (TIER 1)
+Adaptive:  sample() → Ring Buffer (TIER 1)
+           - Normal/Light: Every 180s (3 minutes)
+           - Emergency: Every 300s (5 minutes)
 Every 5m:  flush_ring_to_aggregates() → Ring Buffer → Aggregates (TIER 2)
 Every 5m:  snapshot() → Snapshots (TIER 3)
-Daily:     cleanup() → Delete old TIER 2 and TIER 3 data
+Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 data
 ```
 
 ### Architecture Benefits
@@ -186,11 +195,16 @@ Daily:     cleanup() → Delete old TIER 2 and TIER 3 data
 
 | View                 | Purpose                                     |
 |----------------------|---------------------------------------------|
-| `recent_waits`       | Wait events (last 2 hours)                  |
-| `recent_activity`    | Active sessions (last 2 hours)              |
-| `recent_locks`       | Lock contention (last 2 hours)              |
-| `recent_replication` | Replication lag (last 2 hours)              |
+| `recent_waits`       | Wait events (last 10 hours, static window covers all modes) |
+| `recent_activity`    | Active sessions (last 10 hours, static window) |
+| `recent_locks`       | Lock contention (last 10 hours, static window) |
+| `recent_replication` | Replication lag (last 2 hours, from snapshots) |
 | `deltas`             | Snapshot-over-snapshot changes              |
+
+**Dynamic Retention Functions** (use these for mode-aware retention):
+- `recent_waits_current()` - Returns waits with retention matching current mode (6-10 hours)
+- `recent_activity_current()` - Returns activity with mode-aware retention
+- `recent_locks_current()` - Returns locks with mode-aware retention
 
 ## Collection Modes
 
@@ -509,7 +523,7 @@ SELECT flight_recorder.disable();
 **Solution (upgraded):**
 
 Automatic health checks for all 4 required pg_cron jobs:
-- `flight_recorder_sample` (every 60 seconds - ring buffer)
+- `flight_recorder_sample` (adaptive frequency: 180s normal/light, 300s emergency - ring buffer)
 - `flight_recorder_snapshot` (every 5 minutes - system stats)
 - `flight_recorder_flush` (every 5 minutes - ring buffer → aggregates)
 - `flight_recorder_cleanup` (daily at 3 AM - old data cleanup)
@@ -823,21 +837,28 @@ Key settings:
 | `load_throttle_blk_threshold`       | 10000   | Skip if block I/O > N/sec                      |
 | `schema_size_warning_mb`            | 5000    | Warning threshold                              |
 | `schema_size_critical_mb`           | 10000   | Auto-disable threshold                         |
-| `retention_samples_days`            | 7       | Sample retention                               |
-| `retention_snapshots_days`          | 30      | Snapshot retention                             |
+| `retention_samples_days`            | 7       | Sample retention (legacy, ring buffers self-clean) |
+| `aggregate_retention_days`          | 7       | TIER 2 aggregate retention                     |
+| `retention_snapshots_days`          | 30      | TIER 3 snapshot retention                      |
+| `retention_statements_days`         | 30      | pg_stat_statements snapshot retention          |
+| `retention_collection_stats_days`   | 30      | Collection performance stats retention         |
 
 ## Catalog Lock Contention
 
-Every collection acquires AccessShareLock on system catalogs (pg_stat_activity, pg_locks, etc.). This is generally harmless. Collection stores OIDs (not names) to avoid querying pg_class during sampling, reducing catalog lock frequency by ~95%.
+Every collection acquires AccessShareLock on system catalogs (pg_stat_activity, pg_locks, etc.). This is generally harmless.
+
+**Catalog Lock Minimization:**
+- **Snapshot-based collection** (enabled by default): Creates temp table copy of `pg_stat_activity` once, then all sections query the temp table instead of the catalog. Reduces catalog locks from 3 to 1 per sample (67% reduction).
+- **OID storage**: Stores relation OIDs instead of names in `lock_samples_ring.locked_relation_oid`, avoiding `pg_class` joins during collection. Name resolution happens at query time in views using `::regclass` cast.
 
 ### System Views Accessed
 
 | System View            | Lock Target          | Acquired By         | Frequency  |
 |------------------------|----------------------|---------------------|------------|
-| `pg_stat_activity`     | pg_stat_activity     | sample() + snapshot | Every 60s  |
+| `pg_stat_activity`     | pg_stat_activity     | sample() + snapshot() | sample(): 180-300s (adaptive), snapshot(): 5min |
 | `pg_stat_replication`  | pg_stat_replication  | snapshot()          | Every 5min |
-| `pg_locks`             | pg_locks             | sample()            | Every 60s  |
-| `pg_stat_statements`   | pg_stat_statements   | snapshot()          | Every 5min |
+| `pg_locks`             | pg_locks             | sample()            | 180-300s (adaptive, if locks enabled) |
+| `pg_stat_statements`   | pg_stat_statements   | snapshot()          | Every 15min (if enabled) |
 | `::regclass` casts     | pg_class             | Views (query-time)  | On demand (OID→name conversion) |
 
 ### Lock Timeout Behavior
@@ -852,7 +873,7 @@ Default `lock_timeout` = 100ms:
 
 **✓ VALIDATED: DDL blocking is negligible with snapshot-based collection**
 
-**Test Results** (Supabase Micro, PostgreSQL 17.6, 120s intervals):
+**Test Results** (Supabase Micro, PostgreSQL 17.6, 180s intervals):
 - 202 DDL operations (ALTER TABLE, CREATE INDEX, DROP, VACUUM)
 - **0% blocking rate** - No DDL operations delayed
 - Mean DDL duration: 1.61ms (unchanged whether concurrent with collection or not)
