@@ -1447,7 +1447,6 @@ BEGIN
         END IF;
     END;
 
-    -- Get configuration
     v_enable_locks := COALESCE(
         flight_recorder._get_config('enable_locks', 'true')::boolean,
         TRUE
@@ -1457,19 +1456,16 @@ BEGIN
         true
     );
 
-    -- Update ring buffer slot metadata (UPSERT pattern)
     INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
     VALUES (v_slot_id, v_captured_at, v_epoch)
     ON CONFLICT (slot_id) DO UPDATE SET
         captured_at = EXCLUDED.captured_at,
         epoch_seconds = EXCLUDED.epoch_seconds;
 
-    -- Clear old data in child tables for this slot
     DELETE FROM flight_recorder.wait_samples_ring WHERE slot_id = v_slot_id;
     DELETE FROM flight_recorder.activity_samples_ring WHERE slot_id = v_slot_id;
     DELETE FROM flight_recorder.lock_samples_ring WHERE slot_id = v_slot_id;
 
-    -- Snapshot-based collection
     IF v_snapshot_based THEN
         CREATE TEMP TABLE IF NOT EXISTS _fr_psa_snapshot (
             LIKE pg_stat_activity
@@ -1684,23 +1680,19 @@ DECLARE
     v_total_samples INTEGER;
     v_last_flush TIMESTAMPTZ;
 BEGIN
-    -- Find the last flush time
     SELECT COALESCE(max(end_time), '1970-01-01')
     INTO v_last_flush
     FROM flight_recorder.wait_event_aggregates;
 
-    -- Find the time range covered by current ring buffer (samples newer than last flush)
     SELECT min(captured_at), max(captured_at), count(*)
     INTO v_start_time, v_end_time, v_total_samples
     FROM flight_recorder.samples_ring
     WHERE captured_at > v_last_flush;
 
-    -- If no new data, exit early
     IF v_start_time IS NULL OR v_total_samples = 0 THEN
         RETURN;
     END IF;
 
-    -- Aggregate and flush wait events
     INSERT INTO flight_recorder.wait_event_aggregates (
         start_time, end_time, backend_type, wait_event_type, wait_event, state,
         sample_count, total_waiters, avg_waiters, max_waiters, pct_of_samples
@@ -1722,7 +1714,6 @@ BEGIN
     WHERE s.captured_at BETWEEN v_start_time AND v_end_time
     GROUP BY w.backend_type, w.wait_event_type, w.wait_event, w.state;
 
-    -- Aggregate and flush lock patterns
     INSERT INTO flight_recorder.lock_aggregates (
         start_time, end_time, blocked_user, blocking_user, lock_type,
         locked_relation_oid, occurrence_count, max_duration, avg_duration, sample_query
@@ -1743,7 +1734,6 @@ BEGIN
     WHERE s.captured_at BETWEEN v_start_time AND v_end_time
     GROUP BY l.blocked_user, l.blocking_user, l.lock_type, l.locked_relation_oid;
 
-    -- Aggregate and flush query patterns
     INSERT INTO flight_recorder.query_aggregates (
         start_time, end_time, query_preview, occurrence_count, max_duration, avg_duration
     )
@@ -1780,23 +1770,19 @@ DECLARE
     v_deleted_locks INTEGER;
     v_deleted_queries INTEGER;
 BEGIN
-    -- Get retention period (default 7 days)
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
         '7 days'::interval
     );
 
-    -- Delete old wait event aggregates
     DELETE FROM flight_recorder.wait_event_aggregates
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_waits = ROW_COUNT;
 
-    -- Delete old lock aggregates
     DELETE FROM flight_recorder.lock_aggregates
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_locks = ROW_COUNT;
 
-    -- Delete old query aggregates
     DELETE FROM flight_recorder.query_aggregates
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_queries = ROW_COUNT;
@@ -1862,11 +1848,10 @@ BEGIN
         FROM pg_stat_activity
         WHERE query LIKE '%flight_recorder.snapshot()%'
           AND state = 'active'
-          AND pid != pg_backend_pid()  -- Exclude ourselves
+          AND pid != pg_backend_pid()
           AND backend_type = 'client backend';
 
         IF v_running_count > 0 THEN
-            -- Another snapshot() is already running - skip this cycle to prevent queue buildup
             PERFORM flight_recorder._record_collection_skip('snapshot',
                 format('Job deduplication: %s snapshot job(s) already running (PID: %s)',
                        v_running_count, v_running_pid));
