@@ -2430,8 +2430,8 @@ RETURNS TABLE(
 )
 LANGUAGE sql STABLE AS $$
     WITH sample_range AS (
-        SELECT id, captured_at
-        FROM flight_recorder.samples
+        SELECT slot_id, captured_at
+        FROM flight_recorder.samples_ring
         WHERE captured_at BETWEEN p_start_time AND p_end_time
     ),
     total_samples AS (
@@ -2441,13 +2441,13 @@ LANGUAGE sql STABLE AS $$
         w.backend_type,
         w.wait_event_type,
         w.wait_event,
-        count(DISTINCT w.sample_id) AS sample_count,
+        count(DISTINCT w.slot_id) AS sample_count,
         sum(w.count) AS total_waiters,
         round(avg(w.count), 2) AS avg_waiters,
         max(w.count) AS max_waiters,
-        round(100.0 * count(DISTINCT w.sample_id) / NULLIF(t.cnt, 0), 1) AS pct_of_samples
-    FROM flight_recorder.wait_samples w
-    JOIN sample_range sr ON sr.id = w.sample_id
+        round(100.0 * count(DISTINCT w.slot_id) / NULLIF(t.cnt, 0), 1) AS pct_of_samples
+    FROM flight_recorder.wait_samples_ring w
+    JOIN sample_range sr ON sr.slot_id = w.slot_id
     CROSS JOIN total_samples t
     WHERE w.state NOT IN ('idle', 'idle in transaction')
     GROUP BY w.backend_type, w.wait_event_type, w.wait_event, t.cnt
@@ -2634,9 +2634,9 @@ RETURNS TABLE(
 LANGUAGE sql STABLE AS $$
     WITH
     nearest_sample AS (
-        SELECT id, captured_at,
+        SELECT slot_id, captured_at,
                ABS(EXTRACT(EPOCH FROM (captured_at - p_timestamp))) AS offset_secs
-        FROM flight_recorder.samples
+        FROM flight_recorder.samples_ring
         ORDER BY ABS(EXTRACT(EPOCH FROM (captured_at - p_timestamp)))
         LIMIT 1
     ),
@@ -2655,8 +2655,8 @@ LANGUAGE sql STABLE AS $$
         SELECT
             wait_event_type || ':' || wait_event AS wait_event,
             count
-        FROM flight_recorder.wait_samples w
-        JOIN nearest_sample ns ON ns.id = w.sample_id
+        FROM flight_recorder.wait_samples_ring w
+        JOIN nearest_sample ns ON ns.slot_id = w.slot_id
         WHERE w.state NOT IN ('idle', 'idle in transaction')
         ORDER BY count DESC
         LIMIT 3
@@ -2671,24 +2671,23 @@ LANGUAGE sql STABLE AS $$
             count(*) FILTER (WHERE state = 'active') AS active_sessions,
             count(*) FILTER (WHERE wait_event IS NOT NULL) AS waiting_sessions,
             count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction
-        FROM flight_recorder.activity_samples a
-        JOIN nearest_sample ns ON ns.id = a.sample_id
+        FROM flight_recorder.activity_samples_ring a
+        JOIN nearest_sample ns ON ns.slot_id = a.slot_id
     ),
     sample_locks AS (
         SELECT
             count(DISTINCT blocked_pid) AS blocked_pids,
             max(blocked_duration) AS longest_blocked
-        FROM flight_recorder.lock_samples l
-        JOIN nearest_sample ns ON ns.id = l.sample_id
+        FROM flight_recorder.lock_samples_ring l
+        JOIN nearest_sample ns ON ns.slot_id = l.slot_id
     ),
     sample_progress AS (
+        -- Progress tracking not available in ring buffer architecture
         SELECT
-            count(*) FILTER (WHERE progress_type = 'vacuum') AS vacuums,
-            count(*) FILTER (WHERE progress_type = 'copy') AS copies,
-            count(*) FILTER (WHERE progress_type = 'create_index') AS indexes,
-            count(*) FILTER (WHERE progress_type = 'analyze') AS analyzes
-        FROM flight_recorder.progress_samples p
-        JOIN nearest_sample ns ON ns.id = p.sample_id
+            0 AS vacuums,
+            0 AS copies,
+            0 AS indexes,
+            0 AS analyzes
     )
     SELECT
         ns.captured_at,
@@ -2824,8 +2823,8 @@ BEGIN
     -- Check 6: Lock contention
     SELECT count(DISTINCT blocked_pid), max(blocked_duration)
     INTO v_lock_count, v_max_block_duration
-    FROM flight_recorder.lock_samples l
-    JOIN flight_recorder.samples s ON s.id = l.sample_id
+    FROM flight_recorder.lock_samples_ring l
+    JOIN flight_recorder.samples_ring s ON s.slot_id = l.slot_id
     WHERE s.captured_at BETWEEN p_start_time AND p_end_time;
 
     IF v_lock_count > 0 THEN
@@ -2873,7 +2872,7 @@ BEGIN
     SELECT * INTO v_cmp FROM flight_recorder.compare(p_start_time, p_end_time);
 
     SELECT count(*) INTO v_sample_count
-    FROM flight_recorder.samples WHERE captured_at BETWEEN p_start_time AND p_end_time;
+    FROM flight_recorder.samples_ring WHERE captured_at BETWEEN p_start_time AND p_end_time;
 
     SELECT count(*) INTO v_anomaly_count
     FROM flight_recorder.anomaly_report(p_start_time, p_end_time);
@@ -2977,8 +2976,8 @@ BEGIN
         count(DISTINCT blocked_pid) AS blocked_count,
         max(blocked_duration) AS max_duration
     INTO v_lock_summary
-    FROM flight_recorder.lock_samples l
-    JOIN flight_recorder.samples s ON s.id = l.sample_id
+    FROM flight_recorder.lock_samples_ring l
+    JOIN flight_recorder.samples_ring s ON s.slot_id = l.slot_id
     WHERE s.captured_at BETWEEN p_start_time AND p_end_time;
 
     metric := 'Blocked Sessions';
@@ -3103,8 +3102,8 @@ LANGUAGE sql STABLE AS $$
     SELECT
         flight_recorder._get_config('mode', 'normal') AS mode,
         CASE flight_recorder._get_config('mode', 'normal')
-            WHEN 'normal' THEN '60 seconds'
-            WHEN 'light' THEN '60 seconds'
+            WHEN 'normal' THEN '* * * * *'
+            WHEN 'light' THEN '* * * * *'
             WHEN 'emergency' THEN '120 seconds'
             ELSE 'unknown'
         END AS sample_interval,
@@ -3176,7 +3175,7 @@ BEGIN
 
     -- Delete old samples (cascades to wait_samples, activity_samples, progress_samples, lock_samples)
     WITH deleted AS (
-        DELETE FROM flight_recorder.samples WHERE captured_at < v_samples_cutoff RETURNING 1
+        DELETE FROM flight_recorder.samples_ring WHERE captured_at < v_samples_cutoff RETURNING 1
     )
     SELECT count(*) INTO v_deleted_samples FROM deleted;
 
@@ -3362,7 +3361,7 @@ BEGIN
 
         -- Schedule sample (fixed 60 second interval for ring buffer)
         -- Ring buffer architecture requires consistent 60s intervals for proper slot rotation
-        PERFORM cron.schedule('flight_recorder_sample', '60 seconds', 'SELECT flight_recorder.sample()');
+        PERFORM cron.schedule('flight_recorder_sample', '* * * * *', 'SELECT flight_recorder.sample()');
         v_sample_schedule := 'every 60 seconds (ring buffer)';
         v_scheduled := v_scheduled + 1;
 
@@ -3460,7 +3459,7 @@ BEGIN
     -- Ring buffer architecture requires consistent 60s intervals for proper slot rotation
     PERFORM cron.schedule(
         'flight_recorder_sample',
-        '60 seconds',
+        '* * * * *',
         'SELECT flight_recorder.sample()'
     );
     v_sample_schedule := 'every 60 seconds (ring buffer)';
@@ -3703,7 +3702,7 @@ BEGIN
         END::text;
 
     -- Component 4: Collection freshness
-    SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples;
+    SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples_ring;
     SELECT max(captured_at) INTO v_last_snapshot FROM flight_recorder.snapshots;
 
     RETURN QUERY SELECT
@@ -3743,7 +3742,7 @@ BEGIN
         END::text;
 
     -- Component 5: Data volume
-    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples;
+    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples_ring;
     SELECT count(*) INTO v_snapshot_count FROM flight_recorder.snapshots;
 
     RETURN QUERY SELECT
@@ -4090,7 +4089,7 @@ BEGIN
     DECLARE
         v_last_sample TIMESTAMPTZ;
     BEGIN
-        SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples;
+        SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples_ring;
 
         IF v_last_sample IS NULL OR v_last_sample < now() - interval '15 minutes' THEN
             RETURN QUERY SELECT
@@ -4143,8 +4142,8 @@ BEGIN
                     ws.wait_event,
                     ws.count
                 ))
-                FROM flight_recorder.wait_samples ws
-                WHERE ws.sample_id = s.id
+                FROM flight_recorder.wait_samples_ring ws
+                WHERE ws.slot_id = s.slot_id
             ), '[]'::jsonb),
             COALESCE((
                 SELECT jsonb_agg(jsonb_build_array(
@@ -4153,13 +4152,13 @@ BEGIN
                     ls.lock_type,
                     ls.blocked_duration
                 ))
-                FROM flight_recorder.lock_samples ls
-                WHERE ls.sample_id = s.id
+                FROM flight_recorder.lock_samples_ring ls
+                WHERE ls.slot_id = s.slot_id
             ), '[]'::jsonb)
         )
     )
     INTO v_samples
-    FROM flight_recorder.samples s
+    FROM flight_recorder.samples_ring s
     WHERE s.captured_at BETWEEN p_start_time AND p_end_time;
 
     -- 4. Get Snapshots (Compact format)
@@ -4219,7 +4218,7 @@ BEGIN
     -- Get current state
     v_mode := flight_recorder._get_config('mode', 'normal');
     SELECT schema_size_mb INTO v_schema_size_mb FROM flight_recorder._check_schema_size();
-    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples;
+    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples_ring;
     SELECT count(*) INTO v_snapshot_count FROM flight_recorder.snapshots;
 
     SELECT avg(duration_ms) INTO v_avg_sample_ms
@@ -4549,7 +4548,7 @@ BEGIN
 
     -- Metric 2: Storage consumption
     SELECT schema_size_mb INTO v_schema_size_mb FROM flight_recorder._check_schema_size();
-    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples;
+    SELECT count(*) INTO v_sample_count FROM flight_recorder.samples_ring;
 
     IF v_schema_size_mb < 3000 THEN
         RETURN QUERY SELECT
@@ -4626,7 +4625,7 @@ BEGIN
     END IF;
 
     -- Metric 5: Data freshness
-    SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples;
+    SELECT max(captured_at) INTO v_last_sample FROM flight_recorder.samples_ring;
     SELECT max(captured_at) INTO v_last_snapshot FROM flight_recorder.snapshots;
 
     IF v_last_sample > now() - interval '10 minutes' AND v_last_snapshot > now() - interval '15 minutes' THEN
