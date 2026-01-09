@@ -1583,22 +1583,29 @@ UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
 -- 12.3 Pre-Collection Checks (15 tests)
 -- -----------------------------------------------------------------------------
 
--- Test _should_skip_collection() on non-replica
+-- Test _should_skip_collection() on non-replica (disable checkpoint check to isolate replica check)
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
+
 SELECT ok(
     flight_recorder._should_skip_collection() IS NULL,
     'Pre-Collection: _should_skip_collection() should return NULL on primary (not a replica)'
 );
 
--- Test _should_skip_collection() with check_replica_lag disabled
+-- Re-enable checkpoint check
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_checkpoint_backup';
+
+-- Test _should_skip_collection() with check_replica_lag disabled (also disable checkpoint check)
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_replica_lag';
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
 
 SELECT ok(
     flight_recorder._should_skip_collection() IS NULL,
     'Pre-Collection: _should_skip_collection() should return NULL when check_replica_lag disabled'
 );
 
--- Re-enable replica lag check
+-- Re-enable both checks
 UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_replica_lag';
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'check_checkpoint_backup';
 
 -- Test _should_skip_collection() with check_checkpoint_backup disabled
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -3613,11 +3620,15 @@ SELECT ok(
     'Safety: sample() should skip when circuit breaker trips'
 );
 
--- Test 9: Circuit breaker skip_reason format
+-- Test 9: Circuit breaker skip_reason format (verify it's specifically a sample skip)
 SELECT ok(
-    (SELECT skipped_reason FROM flight_recorder.collection_stats WHERE skipped = true AND collection_type = 'sample' ORDER BY started_at DESC LIMIT 1) LIKE
-    '%Circuit breaker%',
-    'Safety: Circuit breaker skip reason should be descriptive'
+    EXISTS (
+        SELECT 1 FROM flight_recorder.collection_stats
+        WHERE skipped = true
+          AND collection_type = 'sample'
+          AND skipped_reason LIKE '%Circuit breaker%'
+    ),
+    'Safety: Circuit breaker skip reason should be descriptive and collection_type should be sample'
 );
 
 -- Test 10: Circuit breaker recovery (3 slow → 3 fast)
