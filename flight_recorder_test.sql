@@ -2489,7 +2489,7 @@ END $$;
 
 SELECT ok(true, 'Phase 4: PG15 collects checkpoint stats from pg_stat_bgwriter (skipped if not PG15 or snapshot skipped)');
 
--- Test PG15: verify buffers_backend populated
+-- Test PG15: verify bgw_buffers_backend populated
 DO $$
 DECLARE
     v_pg_version INTEGER;
@@ -2500,16 +2500,16 @@ BEGIN
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
 
-        SELECT buffers_backend INTO v_buffers_backend
+        SELECT bgw_buffers_backend INTO v_buffers_backend
         FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
         IF v_buffers_backend IS NULL THEN
-            RAISE EXCEPTION 'Phase 4: PG15 should have buffers_backend from pg_stat_bgwriter';
+            RAISE EXCEPTION 'Phase 4: PG15 should have bgw_buffers_backend from pg_stat_bgwriter';
         END IF;
     END IF;
 END $$;
 
-SELECT ok(true, 'Phase 4: PG15 has buffers_backend from pg_stat_bgwriter (skipped if not PG15)');
+SELECT ok(true, 'Phase 4: PG15 has bgw_buffers_backend from pg_stat_bgwriter (skipped if not PG15)');
 
 -- Test PG15: verify deltas view doesn't error on missing io_* columns
 DO $$
