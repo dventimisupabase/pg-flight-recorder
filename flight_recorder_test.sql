@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(345);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 40 version-specific (Phase 4)
+SELECT plan(374);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 40 version-specific (Phase 4) + 29 safety mechanisms (Phase 5)
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -3186,6 +3186,467 @@ EXCEPTION WHEN OTHERS THEN
 END $$;
 
 SELECT ok(true, 'Phase 4: snapshot() exception handling works across versions');
+
+-- =============================================================================
+-- 15. LOAD SHEDDING & CIRCUIT BREAKER (30 tests) - Phase 5
+-- =============================================================================
+-- Tests P0 safety mechanisms that protect database from collection overhead
+
+-- -----------------------------------------------------------------------------
+-- 15.1 LOAD SHEDDING (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: Load shedding disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'load_shedding_enabled';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE skipped = false AND collection_type = 'sample') >= 1,
+    'Safety: Load shedding disabled should allow collection'
+);
+
+-- Re-enable for other tests
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'load_shedding_enabled';
+
+-- Test 2: Load shedding with threshold = 0% (always skip if any connections exist)
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+-- Check if collection was attempted and skipped (if active connections > 0%)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE collection_type = 'sample') > 0,
+    'Safety: Load shedding with 0% threshold should create collection_stats entry'
+);
+
+-- Test 3: Verify skip_reason format for load shedding
+SELECT ok(
+    (SELECT skipped_reason FROM flight_recorder.collection_stats WHERE collection_type = 'sample' AND skipped = true ORDER BY started_at DESC LIMIT 1) LIKE '%Load shedding: high load%',
+    'Safety: Load shedding skip reason should match expected format'
+);
+
+-- Test 4: Load shedding with threshold = 100% (never skip unless at 100% connections)
+UPDATE flight_recorder.config SET value = '100' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+-- With 100% threshold, load shedding should not trigger (unless exactly at 100% connections)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE collection_type = 'sample') > 0,
+    'Safety: Load shedding with 100% threshold should create collection_stats entry'
+);
+
+-- Reset to default
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Test 5: collection_stats logging for load shedding
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    EXISTS (
+        SELECT 1 FROM flight_recorder.collection_stats
+        WHERE collection_type = 'sample'
+          AND skipped = true
+          AND skipped_reason IS NOT NULL
+          AND skipped_reason LIKE '%Load shedding%'
+    ),
+    'Safety: Load shedding should log skip to collection_stats with reason'
+);
+
+-- Reset
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Test 6: Load shedding doesn't affect snapshot()
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.snapshots WHERE captured_at > now() - interval '1 minute';
+
+DO $$ BEGIN
+    PERFORM flight_recorder.snapshot();
+END $$;
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.snapshots WHERE captured_at > now() - interval '10 seconds'),
+    'Safety: Load shedding should not affect snapshot() collections'
+);
+
+-- Reset
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Test 7: Load shedding recovery (high → normal)
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.collection_stats;
+
+-- First sample should skip
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+-- Change to normal threshold
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Second sample should succeed
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE skipped = false AND collection_type = 'sample') >= 1,
+    'Safety: Load shedding recovery - collection should succeed after threshold increased'
+);
+
+-- Test 8: Verify skip_reason includes threshold value
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT skipped_reason FROM flight_recorder.collection_stats WHERE collection_type = 'sample' AND skipped = true ORDER BY started_at DESC LIMIT 1) LIKE
+    '%0% threshold%',
+    'Safety: Load shedding skip reason should include configured threshold'
+);
+
+-- Reset
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- Test 9: Load shedding with production_safe profile (60% threshold)
+SELECT flight_recorder.apply_profile('production_safe');
+DELETE FROM flight_recorder.collection_stats;
+
+-- Should use 60% threshold from profile
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    flight_recorder._get_config('load_shedding_active_pct', '70')::integer = 60,
+    'Safety: production_safe profile should set load shedding to 60%'
+);
+
+-- Reset to default profile
+SELECT flight_recorder.apply_profile('default');
+
+-- Test 10: Multiple load shedding skips tracked correctly
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+DELETE FROM flight_recorder.collection_stats;
+
+-- Generate 3 skipped collections
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+    PERFORM flight_recorder.sample();
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE collection_type = 'sample' AND skipped = true AND skipped_reason LIKE '%Load shedding%') = 3,
+    'Safety: Multiple load shedding skips should all be tracked in collection_stats'
+);
+
+-- Reset
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+
+-- -----------------------------------------------------------------------------
+-- 15.2 LOAD THROTTLING (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: Load throttling disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'load_throttle_enabled';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE skipped = false AND collection_type = 'sample') >= 1,
+    'Safety: Load throttling disabled should allow collection'
+);
+
+-- Re-enable
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'load_throttle_enabled';
+
+-- Test 2: Config values can be set for transaction threshold
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_throttle_xact_threshold';
+
+SELECT ok(
+    flight_recorder._get_config('load_throttle_xact_threshold', '1000')::integer = 0,
+    'Safety: Load throttling transaction threshold config can be set'
+);
+
+-- Reset transaction threshold
+UPDATE flight_recorder.config SET value = '1000' WHERE key = 'load_throttle_xact_threshold';
+
+-- Test 3: Config values can be set for block I/O threshold
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_throttle_blk_threshold';
+
+SELECT ok(
+    flight_recorder._get_config('load_throttle_blk_threshold', '10000')::integer = 0,
+    'Safety: Load throttling block I/O threshold config can be set'
+);
+
+-- Reset block threshold
+UPDATE flight_recorder.config SET value = '10000' WHERE key = 'load_throttle_blk_threshold';
+
+-- Test 7: Load throttling doesn't affect snapshot()
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_throttle_xact_threshold';
+DELETE FROM flight_recorder.snapshots WHERE captured_at > now() - interval '1 minute';
+
+DO $$ BEGIN
+    PERFORM flight_recorder.snapshot();
+END $$;
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.snapshots WHERE captured_at > now() - interval '10 seconds'),
+    'Safety: Load throttling should not affect snapshot() collections'
+);
+
+-- Reset
+UPDATE flight_recorder.config SET value = '1000' WHERE key = 'load_throttle_xact_threshold';
+
+-- Test 8: Combined load shedding + throttling (shedding runs first)
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
+UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_throttle_xact_threshold';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+-- Load shedding runs first, so skip_reason should be load shedding
+SELECT ok(
+    (SELECT skipped_reason FROM flight_recorder.collection_stats WHERE collection_type = 'sample' AND skipped = true ORDER BY started_at DESC LIMIT 1) LIKE
+    '%Load shedding%',
+    'Safety: When both mechanisms active, load shedding should run first'
+);
+
+-- Reset
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'load_shedding_active_pct';
+UPDATE flight_recorder.config SET value = '1000' WHERE key = 'load_throttle_xact_threshold';
+
+-- Test 9: Throttling with troubleshooting profile (disabled)
+SELECT flight_recorder.apply_profile('troubleshooting');
+
+SELECT ok(
+    flight_recorder._get_config('load_throttle_enabled', 'true')::boolean = false,
+    'Safety: troubleshooting profile should disable load throttling'
+);
+
+-- Reset to default profile
+SELECT flight_recorder.apply_profile('default');
+
+-- Test 10: Load throttling works with default thresholds
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE collection_type = 'sample') > 0,
+    'Safety: Load throttling with default thresholds should allow collection'
+);
+
+-- -----------------------------------------------------------------------------
+-- 15.3 CIRCUIT BREAKER (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: Circuit breaker disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'circuit_breaker_enabled';
+DELETE FROM flight_recorder.collection_stats;
+
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE skipped = false AND collection_type = 'sample') >= 1,
+    'Safety: Circuit breaker disabled should allow collection'
+);
+
+-- Re-enable
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'circuit_breaker_enabled';
+
+-- Test 2: _check_circuit_breaker() with < 3 collections (inactive)
+DELETE FROM flight_recorder.collection_stats;
+
+-- Insert only 2 collections
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 1500, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 1200, true, false);
+
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = false,
+    'Safety: Circuit breaker should be inactive with < 3 collections in window'
+);
+
+-- Test 3: _check_circuit_breaker() with 3 fast collections (should not trip)
+DELETE FROM flight_recorder.collection_stats;
+
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 500, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 600, true, false),
+    ('sample', now() - interval '1 minute', now() - interval '1 minute', 550, true, false);
+
+-- Avg = 550ms < 1000ms threshold
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = false,
+    'Safety: Circuit breaker should not trip with 3 fast collections (avg 550ms < 1000ms)'
+);
+
+-- Test 4: _check_circuit_breaker() with 3 slow collections (should trip)
+-- First ensure circuit breaker is enabled and threshold is default
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'circuit_breaker_enabled';
+UPDATE flight_recorder.config SET value = '1000' WHERE key = 'circuit_breaker_threshold_ms';
+
+DELETE FROM flight_recorder.collection_stats;
+
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 1500, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 1200, true, false),
+    ('sample', now() - interval '1 minute', now() - interval '1 minute', 1400, true, false);
+
+-- Verify we have 3 rows
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.collection_stats WHERE collection_type = 'sample' AND success = true AND skipped = false) = 3,
+    'Safety: Circuit breaker test data - should have 3 successful non-skipped samples'
+);
+
+-- Avg = 1366ms > 1000ms threshold
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = true,
+    'Safety: Circuit breaker should trip with 3 slow collections (avg 1366ms > 1000ms)'
+);
+
+-- Test 5: Circuit breaker moving average (2 fast + 1 slow)
+DELETE FROM flight_recorder.collection_stats;
+
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 500, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 600, true, false),
+    ('sample', now() - interval '1 minute', now() - interval '1 minute', 1500, true, false);
+
+-- Avg = 866ms < 1000ms threshold
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = false,
+    'Safety: Circuit breaker moving average should not trip (2 fast + 1 slow = 866ms avg)'
+);
+
+-- Test 6: Circuit breaker window (old collections ignored)
+DELETE FROM flight_recorder.collection_stats;
+
+-- Insert slow collections outside 15-minute window
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '20 minutes', now() - interval '20 minutes', 1500, true, false),
+    ('sample', now() - interval '18 minutes', now() - interval '18 minutes', 1400, true, false),
+    ('sample', now() - interval '16 minutes', now() - interval '16 minutes', 1600, true, false);
+
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = false,
+    'Safety: Circuit breaker should ignore collections outside 15-minute window'
+);
+
+-- Test 7: Circuit breaker with aggressive 100ms threshold
+UPDATE flight_recorder.config SET value = '100' WHERE key = 'circuit_breaker_threshold_ms';
+DELETE FROM flight_recorder.collection_stats;
+
+-- Insert collections with 200ms avg (would be fine with 1000ms, but trips at 100ms)
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 200, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 210, true, false),
+    ('sample', now() - interval '1 minute', now() - interval '1 minute', 190, true, false);
+
+-- Avg = 200ms > 100ms threshold
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = true,
+    'Safety: Circuit breaker with 100ms threshold should be highly sensitive'
+);
+
+-- Reset threshold
+UPDATE flight_recorder.config SET value = '1000' WHERE key = 'circuit_breaker_threshold_ms';
+
+-- Test 8: sample() respects circuit breaker
+DELETE FROM flight_recorder.collection_stats;
+
+-- Insert 3 slow collections to trip circuit breaker
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 1500, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 1200, true, false),
+    ('sample', now() - interval '1 minute', now() - interval '1 minute', 1400, true, false);
+
+-- Now sample() should skip
+DO $$ BEGIN
+    PERFORM flight_recorder.sample();
+END $$;
+
+SELECT ok(
+    EXISTS (
+        SELECT 1 FROM flight_recorder.collection_stats
+        WHERE skipped = true
+          AND skipped_reason LIKE '%Circuit breaker%'
+        ORDER BY started_at DESC LIMIT 1
+    ),
+    'Safety: sample() should skip when circuit breaker trips'
+);
+
+-- Test 9: Circuit breaker skip_reason format
+SELECT ok(
+    (SELECT skipped_reason FROM flight_recorder.collection_stats WHERE skipped = true AND collection_type = 'sample' ORDER BY started_at DESC LIMIT 1) LIKE
+    '%Circuit breaker%',
+    'Safety: Circuit breaker skip reason should be descriptive'
+);
+
+-- Test 10: Circuit breaker recovery (3 slow → 3 fast)
+DELETE FROM flight_recorder.collection_stats;
+
+-- First: 3 slow collections (circuit trips)
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '10 minutes', now() - interval '10 minutes', 1500, true, false),
+    ('sample', now() - interval '8 minutes', now() - interval '8 minutes', 1200, true, false),
+    ('sample', now() - interval '6 minutes', now() - interval '6 minutes', 1400, true, false);
+
+-- Verify circuit is tripped
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = true,
+    'Safety: Circuit breaker should be tripped before recovery'
+);
+
+-- Now: 3 fast collections (circuit recovers)
+INSERT INTO flight_recorder.collection_stats (collection_type, started_at, completed_at, duration_ms, success, skipped)
+VALUES
+    ('sample', now() - interval '5 minutes', now() - interval '5 minutes', 500, true, false),
+    ('sample', now() - interval '3 minutes', now() - interval '3 minutes', 600, true, false),
+    ('sample', now() - interval '1 minute', now() - interval '1 minute', 550, true, false);
+
+-- Verify circuit has recovered (moving avg uses last 3: 500, 600, 550 = 550ms)
+SELECT ok(
+    flight_recorder._check_circuit_breaker('sample') = false,
+    'Safety: Circuit breaker should recover after 3 fast collections'
+);
 
 SELECT * FROM finish();
 ROLLBACK;
