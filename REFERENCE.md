@@ -33,14 +33,15 @@ Complete documentation for pg-flight-recorder.
 
 ## How It Works
 
-Flight Recorder uses `pg_cron` to run four collection types:
+Flight Recorder uses `pg_cron` to run five collection types:
 
 1. **Samples** (adaptive frequency): Ring buffer - wait events, active sessions, locks
    - Normal/Light: every 180 seconds (4-hour rolling window)
    - Emergency: every 300 seconds (10-hour rolling window)
 2. **Flush** (every 5 minutes): Ring buffer → aggregates (durable storage)
-3. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
-4. **Cleanup** (daily at 3 AM): Remove old aggregates and snapshots
+3. **Archive** (every 15 minutes): Ring buffer → raw sample archives (high-resolution forensics)
+4. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
+5. **Cleanup** (daily at 3 AM): Remove old aggregates, archives, and snapshots
 
 The ring buffer provides low-overhead, adaptive-frequency sampling using a fixed 120-slot circular buffer with modular arithmetic. Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
 
@@ -111,6 +112,73 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 
 - `wait_summary(start, end)` function (aggregate wait events over time)
 - Direct SQL on aggregate tables for custom analysis
+
+### TIER 1.5: Raw Sample Archives (Durable, High-Resolution Forensics)
+
+**Purpose:** Periodic snapshots of raw samples for high-resolution forensic analysis beyond ring buffer retention
+
+**Tables:**
+
+- `activity_samples_archive` (raw activity samples: PIDs, queries, sessions)
+- `lock_samples_archive` (raw lock samples: blocking chains, PIDs)
+
+**Characteristics:**
+
+- **Durable (LOGGED)** - Survives crashes
+- **Archived every 15 minutes** - Configurable via `archive_sample_frequency_minutes`
+- **7-day default retention** - Configurable via `archive_retention_days`
+- **Full resolution** - Not aggregated, preserves all details (PIDs, exact timestamps, complete blocking chains)
+- **Slower cadence** - Archives less frequently than flush (15 min vs 5 min) to minimize overhead
+
+**What's preserved (that aggregates lose):**
+
+- **Specific PIDs** - Can answer "what was PID 12345 doing at 3:42 PM?"
+- **Exact timestamps** - Precise timing within archived period
+- **Complete blocking chains** - Full lock dependency graphs with all participants
+- **Session details** - Individual session characteristics and queries
+
+**How archival works:**
+
+1. Checks when last archive was created
+2. If enough time has passed (default: 15 minutes), copies raw samples from ring buffers
+3. Uses `sample_id` (epoch_seconds) to group related samples
+4. Filters out NULL rows (unused pre-allocated slots)
+
+**Configuration:**
+
+- `archive_samples_enabled` - Enable/disable archival (default: true)
+- `archive_sample_frequency_minutes` - How often to archive (default: 15)
+- `archive_retention_days` - How long to keep archives (default: 7)
+- `archive_activity_samples` - Archive activity samples (default: true)
+- `archive_lock_samples` - Archive lock samples (default: true)
+
+**Storage overhead:**
+
+- ~1-5 MB/day for typical workloads
+- 7-day retention: ~7-35 MB
+- 30-day retention: ~30-150 MB
+
+**Use cases:**
+
+- "What was PID X doing 2 days ago at specific time?"
+- "Show me the exact blocking chain during that incident"
+- "Was this specific session blocking others?"
+- Forensic analysis requiring full resolution beyond 6-10 hour ring buffer window
+
+**Query directly from:**
+
+```sql
+-- Find what PID 12345 was doing around 2024-01-14 15:30
+SELECT * FROM flight_recorder.activity_samples_archive
+WHERE pid = 12345
+  AND captured_at BETWEEN '2024-01-14 15:25' AND '2024-01-14 15:35'
+ORDER BY captured_at;
+
+-- Reconstruct blocking chain at specific time
+SELECT * FROM flight_recorder.lock_samples_archive
+WHERE captured_at BETWEEN '2024-01-14 15:30' AND '2024-01-14 15:31'
+ORDER BY blocked_pid, blocking_pid;
+```
 
 ### TIER 3: Snapshots (Durable, Long Retention)
 

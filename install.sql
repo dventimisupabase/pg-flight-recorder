@@ -598,6 +598,71 @@ CREATE INDEX IF NOT EXISTS query_aggregates_time_idx
 
 COMMENT ON TABLE flight_recorder.query_aggregates IS 'TIER 2: Durable query pattern summaries (5-min windows, survives crashes)';
 
+-- =============================================================================
+-- TIER 1.5: Raw Sample Archive Tables (REGULAR, durable, survives crashes)
+-- =============================================================================
+-- Periodic snapshots of raw samples from ring buffers (not aggregated)
+-- Provides high-resolution forensic analysis beyond ring buffer retention
+-- Captured on slower cadence (default: every 15 minutes) to minimize overhead
+-- Retains full detail: PIDs, exact timestamps, complete blocking chains
+-- Retains 7 days by default (configurable)
+-- -----------------------------------------------------------------------------
+
+-- Activity samples archive - Raw session activity snapshots
+CREATE TABLE IF NOT EXISTS flight_recorder.activity_samples_archive (
+    id                  BIGSERIAL PRIMARY KEY,
+    sample_id           BIGINT NOT NULL,           -- Reference to collection cycle
+    captured_at         TIMESTAMPTZ NOT NULL,      -- When this sample was captured
+    pid                 INTEGER,
+    usename             TEXT,
+    application_name    TEXT,
+    backend_type        TEXT,
+    state               TEXT,
+    wait_event_type     TEXT,
+    wait_event          TEXT,
+    query_start         TIMESTAMPTZ,
+    state_change        TIMESTAMPTZ,
+    query_preview       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS activity_archive_captured_at_idx
+    ON flight_recorder.activity_samples_archive(captured_at);
+CREATE INDEX IF NOT EXISTS activity_archive_sample_id_idx
+    ON flight_recorder.activity_samples_archive(sample_id);
+CREATE INDEX IF NOT EXISTS activity_archive_pid_idx
+    ON flight_recorder.activity_samples_archive(pid, captured_at);
+
+COMMENT ON TABLE flight_recorder.activity_samples_archive IS 'TIER 1.5: Raw activity samples for forensic analysis (15-min cadence, full resolution)';
+
+-- Lock samples archive - Raw lock contention snapshots
+CREATE TABLE IF NOT EXISTS flight_recorder.lock_samples_archive (
+    id                      BIGSERIAL PRIMARY KEY,
+    sample_id               BIGINT NOT NULL,           -- Reference to collection cycle
+    captured_at             TIMESTAMPTZ NOT NULL,      -- When this sample was captured
+    blocked_pid             INTEGER,
+    blocked_user            TEXT,
+    blocked_app             TEXT,
+    blocked_query_preview   TEXT,
+    blocked_duration        INTERVAL,
+    blocking_pid            INTEGER,
+    blocking_user           TEXT,
+    blocking_app            TEXT,
+    blocking_query_preview  TEXT,
+    lock_type               TEXT,
+    locked_relation_oid     OID
+);
+
+CREATE INDEX IF NOT EXISTS lock_archive_captured_at_idx
+    ON flight_recorder.lock_samples_archive(captured_at);
+CREATE INDEX IF NOT EXISTS lock_archive_sample_id_idx
+    ON flight_recorder.lock_samples_archive(sample_id);
+CREATE INDEX IF NOT EXISTS lock_archive_blocked_pid_idx
+    ON flight_recorder.lock_samples_archive(blocked_pid, captured_at);
+CREATE INDEX IF NOT EXISTS lock_archive_blocking_pid_idx
+    ON flight_recorder.lock_samples_archive(blocking_pid, captured_at);
+
+COMMENT ON TABLE flight_recorder.lock_samples_archive IS 'TIER 1.5: Raw lock samples for forensic analysis (15-min cadence, full blocking chains)';
+
 -- -----------------------------------------------------------------------------
 -- Helper: Pretty-print bytes
 -- -----------------------------------------------------------------------------
@@ -704,7 +769,13 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('load_throttle_blk_threshold', '10000'),  -- Skip if block reads+writes > N/sec (I/O pressure)
     -- Collection jitter (A+ upgrade: prevent synchronized monitoring tools)
     ('collection_jitter_enabled', 'true'),     -- Add random delay to collection start
-    ('collection_jitter_max_seconds', '10')    -- Max jitter (0-N seconds random delay)
+    ('collection_jitter_max_seconds', '10'),   -- Max jitter (0-N seconds random delay)
+    -- Raw sample archival (TIER 1.5: high-resolution forensics)
+    ('archive_samples_enabled', 'true'),       -- Enable periodic archival of raw samples
+    ('archive_sample_frequency_minutes', '15'), -- How often to archive (default: every 15 min)
+    ('archive_retention_days', '7'),           -- How long to keep archived samples (default: 7 days)
+    ('archive_activity_samples', 'true'),      -- Archive activity samples (PIDs, queries, sessions)
+    ('archive_lock_samples', 'true')           -- Archive lock samples (blocking chains, PIDs)
 ON CONFLICT (key) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
@@ -2221,6 +2292,139 @@ $$;
 COMMENT ON FUNCTION flight_recorder.flush_ring_to_aggregates() IS 'TIER 2: Flush ring buffer to durable aggregates every 5 minutes';
 
 -- -----------------------------------------------------------------------------
+-- flight_recorder.archive_ring_samples() - Archive raw samples for forensics
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION flight_recorder.archive_ring_samples()
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_archive_activity BOOLEAN;
+    v_archive_locks BOOLEAN;
+    v_frequency_minutes INTEGER;
+    v_last_archive TIMESTAMPTZ;
+    v_next_archive_due TIMESTAMPTZ;
+    v_samples_to_archive INTEGER;
+    v_activity_rows INTEGER := 0;
+    v_lock_rows INTEGER := 0;
+BEGIN
+    -- Check if archival is enabled
+    v_enabled := COALESCE(
+        (SELECT value::boolean FROM flight_recorder.config WHERE key = 'archive_samples_enabled'),
+        true
+    );
+
+    IF NOT v_enabled THEN
+        RETURN;
+    END IF;
+
+    -- Get configuration
+    v_archive_activity := COALESCE(
+        (SELECT value::boolean FROM flight_recorder.config WHERE key = 'archive_activity_samples'),
+        true
+    );
+
+    v_archive_locks := COALESCE(
+        (SELECT value::boolean FROM flight_recorder.config WHERE key = 'archive_lock_samples'),
+        true
+    );
+
+    v_frequency_minutes := COALESCE(
+        (SELECT value::integer FROM flight_recorder.config WHERE key = 'archive_sample_frequency_minutes'),
+        15
+    );
+
+    -- Determine when we last archived
+    SELECT GREATEST(
+        COALESCE(MAX(captured_at), '1970-01-01'::timestamptz),
+        COALESCE((SELECT MAX(captured_at) FROM flight_recorder.lock_samples_archive), '1970-01-01'::timestamptz)
+    )
+    INTO v_last_archive
+    FROM flight_recorder.activity_samples_archive;
+
+    -- Check if it's time to archive again
+    v_next_archive_due := v_last_archive + (v_frequency_minutes || ' minutes')::interval;
+
+    IF now() < v_next_archive_due THEN
+        -- Not time yet
+        RETURN;
+    END IF;
+
+    -- Count how many samples we'll archive
+    SELECT count(DISTINCT slot_id)
+    INTO v_samples_to_archive
+    FROM flight_recorder.samples_ring
+    WHERE captured_at > v_last_archive;
+
+    IF v_samples_to_archive = 0 THEN
+        RETURN;
+    END IF;
+
+    -- Archive activity samples (full resolution, not aggregated)
+    IF v_archive_activity THEN
+        INSERT INTO flight_recorder.activity_samples_archive (
+            sample_id, captured_at, pid, usename, application_name, backend_type,
+            state, wait_event_type, wait_event, query_start, state_change, query_preview
+        )
+        SELECT
+            s.epoch_seconds AS sample_id,
+            s.captured_at,
+            a.pid,
+            a.usename,
+            a.application_name,
+            a.backend_type,
+            a.state,
+            a.wait_event_type,
+            a.wait_event,
+            a.query_start,
+            a.state_change,
+            a.query_preview
+        FROM flight_recorder.activity_samples_ring a
+        JOIN flight_recorder.samples_ring s ON s.slot_id = a.slot_id
+        WHERE s.captured_at > v_last_archive
+          AND a.pid IS NOT NULL;  -- Filter out NULL (unused) rows
+
+        GET DIAGNOSTICS v_activity_rows = ROW_COUNT;
+    END IF;
+
+    -- Archive lock samples (full resolution, not aggregated)
+    IF v_archive_locks THEN
+        INSERT INTO flight_recorder.lock_samples_archive (
+            sample_id, captured_at, blocked_pid, blocked_user, blocked_app,
+            blocked_query_preview, blocked_duration, blocking_pid, blocking_user,
+            blocking_app, blocking_query_preview, lock_type, locked_relation_oid
+        )
+        SELECT
+            s.epoch_seconds AS sample_id,
+            s.captured_at,
+            l.blocked_pid,
+            l.blocked_user,
+            l.blocked_app,
+            l.blocked_query_preview,
+            l.blocked_duration,
+            l.blocking_pid,
+            l.blocking_user,
+            l.blocking_app,
+            l.blocking_query_preview,
+            l.lock_type,
+            l.locked_relation_oid
+        FROM flight_recorder.lock_samples_ring l
+        JOIN flight_recorder.samples_ring s ON s.slot_id = l.slot_id
+        WHERE s.captured_at > v_last_archive
+          AND l.blocked_pid IS NOT NULL;  -- Filter out NULL (unused) rows
+
+        GET DIAGNOSTICS v_lock_rows = ROW_COUNT;
+    END IF;
+
+    RAISE NOTICE 'pg-flight-recorder: Archived raw samples (% samples, % activity rows, % lock rows)',
+        v_samples_to_archive, v_activity_rows, v_lock_rows;
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'TIER 1.5: Archive raw samples for high-resolution forensic analysis (default: every 15 minutes)';
+
+-- -----------------------------------------------------------------------------
 -- flight_recorder.cleanup_aggregates() - Clean up old aggregates
 -- -----------------------------------------------------------------------------
 
@@ -2229,15 +2433,24 @@ RETURNS VOID
 LANGUAGE plpgsql AS $$
 DECLARE
     v_aggregate_retention interval;
+    v_archive_retention interval;
     v_deleted_waits INTEGER;
     v_deleted_locks INTEGER;
     v_deleted_queries INTEGER;
+    v_deleted_activity_archive INTEGER;
+    v_deleted_lock_archive INTEGER;
 BEGIN
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
         '7 days'::interval
     );
 
+    v_archive_retention := COALESCE(
+        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'archive_retention_days')::interval,
+        '7 days'::interval
+    );
+
+    -- Clean up TIER 2 aggregates
     DELETE FROM flight_recorder.wait_event_aggregates
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_waits = ROW_COUNT;
@@ -2250,9 +2463,19 @@ BEGIN
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_queries = ROW_COUNT;
 
-    IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates',
-            v_deleted_waits, v_deleted_locks, v_deleted_queries;
+    -- Clean up TIER 1.5 archives
+    DELETE FROM flight_recorder.activity_samples_archive
+    WHERE captured_at < now() - v_archive_retention;
+    GET DIAGNOSTICS v_deleted_activity_archive = ROW_COUNT;
+
+    DELETE FROM flight_recorder.lock_samples_archive
+    WHERE captured_at < now() - v_archive_retention;
+    GET DIAGNOSTICS v_deleted_lock_archive = ROW_COUNT;
+
+    IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 OR
+       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive;
     END IF;
 END;
 $$;
@@ -4491,6 +4714,10 @@ BEGIN
         PERFORM cron.schedule('flight_recorder_flush', '*/5 * * * *', 'SELECT flight_recorder.flush_ring_to_aggregates()');
         v_scheduled := v_scheduled + 1;
 
+        -- Schedule archive (every 15 minutes) - archive raw samples for forensics
+        PERFORM cron.schedule('flight_recorder_archive', '*/15 * * * *', 'SELECT flight_recorder.archive_ring_samples()');
+        v_scheduled := v_scheduled + 1;
+
         -- Schedule cleanup (daily at 3 AM) - clean old aggregates and snapshots
         PERFORM cron.schedule('flight_recorder_cleanup', '0 3 * * *',
             'SELECT flight_recorder.cleanup_aggregates(); SELECT * FROM flight_recorder.cleanup(''30 days''::interval);');
@@ -4593,6 +4820,13 @@ BEGIN
         'flight_recorder_flush',
         '*/5 * * * *',
         'SELECT flight_recorder.flush_ring_to_aggregates()'
+    );
+
+    -- Schedule archive (every 15 minutes) - archive raw samples for forensics
+    PERFORM cron.schedule(
+        'flight_recorder_archive',
+        '*/15 * * * *',
+        'SELECT flight_recorder.archive_ring_samples()'
     );
 
     -- Schedule cleanup (daily at 3 AM) - clean old aggregates and snapshots

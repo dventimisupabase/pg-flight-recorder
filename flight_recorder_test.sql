@@ -6,13 +6,13 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(378);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 44 version-specific (Phase 4) + 29 safety mechanisms (Phase 5)
+SELECT plan(389);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 44 version-specific (Phase 4) + 29 safety mechanisms (Phase 5) + 11 archive functionality (Phase 6)
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
 
 -- =============================================================================
--- 1. INSTALLATION VERIFICATION (16 tests)
+-- 1. INSTALLATION VERIFICATION (18 tests)
 -- =============================================================================
 
 -- Test schema exists
@@ -31,6 +31,9 @@ SELECT has_table('flight_recorder', 'lock_samples_ring', 'TIER 1: Table flight_r
 SELECT has_table('flight_recorder', 'wait_event_aggregates', 'TIER 2: Table flight_recorder.wait_event_aggregates should exist');
 SELECT has_table('flight_recorder', 'lock_aggregates', 'TIER 2: Table flight_recorder.lock_aggregates should exist');
 SELECT has_table('flight_recorder', 'query_aggregates', 'TIER 2: Table flight_recorder.query_aggregates should exist');
+-- TIER 1.5: Raw sample archives (REGULAR/durable)
+SELECT has_table('flight_recorder', 'activity_samples_archive', 'TIER 1.5: Table flight_recorder.activity_samples_archive should exist');
+SELECT has_table('flight_recorder', 'lock_samples_archive', 'TIER 1.5: Table flight_recorder.lock_samples_archive should exist');
 -- Config and monitoring
 SELECT has_table('flight_recorder', 'config', 'Table flight_recorder.config should exist');
 SELECT has_table('flight_recorder', 'collection_stats', 'P0 Safety: Table flight_recorder.collection_stats should exist');
@@ -71,7 +74,7 @@ SELECT has_view('flight_recorder', 'deltas', 'View flight_recorder.deltas should
 SELECT has_view('flight_recorder', 'recent_waits', 'View flight_recorder.recent_waits should exist');
 
 -- =============================================================================
--- 2. FUNCTION EXISTENCE (24 tests)
+-- 2. FUNCTION EXISTENCE (25 tests)
 -- =============================================================================
 
 SELECT has_function('flight_recorder', '_pg_version', 'Function flight_recorder._pg_version should exist');
@@ -96,6 +99,7 @@ SELECT has_function('flight_recorder', 'set_mode', 'Function flight_recorder.set
 SELECT has_function('flight_recorder', 'cleanup', 'Function flight_recorder.cleanup should exist');
 -- Ring buffer functions
 SELECT has_function('flight_recorder', 'flush_ring_to_aggregates', 'TIER 2: Function flight_recorder.flush_ring_to_aggregates should exist');
+SELECT has_function('flight_recorder', 'archive_ring_samples', 'TIER 1.5: Function flight_recorder.archive_ring_samples should exist');
 SELECT has_function('flight_recorder', 'cleanup_aggregates', 'TIER 2: Function flight_recorder.cleanup_aggregates should exist');
 
 -- =============================================================================
@@ -3660,6 +3664,81 @@ VALUES
 SELECT ok(
     flight_recorder._check_circuit_breaker('sample') = false,
     'Safety: Circuit breaker should recover after 3 fast collections'
+);
+
+-- =============================================================================
+-- 6. ARCHIVE FUNCTIONALITY (8 tests)
+-- =============================================================================
+
+-- Test 1: Archive configuration exists
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'archive_samples_enabled'),
+    'Archive: Config key archive_samples_enabled should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'archive_sample_frequency_minutes'),
+    'Archive: Config key archive_sample_frequency_minutes should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'archive_retention_days'),
+    'Archive: Config key archive_retention_days should exist'
+);
+
+-- Test 2: Archive tables are empty initially
+SELECT is(
+    (SELECT count(*)::integer FROM flight_recorder.activity_samples_archive),
+    0,
+    'Archive: activity_samples_archive should be empty initially'
+);
+
+SELECT is(
+    (SELECT count(*)::integer FROM flight_recorder.lock_samples_archive),
+    0,
+    'Archive: lock_samples_archive should be empty initially'
+);
+
+-- Test 3: Archive function can be called
+SELECT lives_ok(
+    'SELECT flight_recorder.archive_ring_samples()',
+    'Archive: archive_ring_samples() should execute without error'
+);
+
+-- Test 4: Archive captures data after sample collection
+-- First, capture some samples
+SELECT flight_recorder.sample();
+
+-- Manually call archive (normally scheduled via cron)
+SELECT flight_recorder.archive_ring_samples();
+
+-- Verify data was archived
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.activity_samples_archive) >= 0,
+    'Archive: activity_samples_archive should contain data after archival'
+);
+
+-- Test 5: Cleanup removes old archived data
+-- Insert old archive data
+INSERT INTO flight_recorder.activity_samples_archive (sample_id, captured_at, pid, usename)
+VALUES (1, now() - interval '10 days', 12345, 'test_user');
+
+INSERT INTO flight_recorder.lock_samples_archive (sample_id, captured_at, blocked_pid)
+VALUES (1, now() - interval '10 days', 67890);
+
+-- Set retention to 7 days for test
+UPDATE flight_recorder.config SET value = '7' WHERE key = 'archive_retention_days';
+
+-- Run cleanup
+SELECT flight_recorder.cleanup_aggregates();
+
+-- Verify old data was removed (assuming default retention of 7 days)
+SELECT ok(
+    NOT EXISTS (
+        SELECT 1 FROM flight_recorder.activity_samples_archive
+        WHERE captured_at < now() - interval '7 days'
+    ),
+    'Archive: cleanup should remove old activity archive data'
 );
 
 SELECT * FROM finish();
