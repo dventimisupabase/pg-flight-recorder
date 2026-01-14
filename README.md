@@ -7,6 +7,8 @@
 
 Server-side flight recorder for PostgreSQL. Runs automatically via pg_cron. Zero config.
 
+**Records:** Query activity, wait events, lock conflicts, connection stats, and performance metrics every 3 minutes.
+
 ## Install
 
 **PostgreSQL 15+** (requires pg_cron):
