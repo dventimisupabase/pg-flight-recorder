@@ -663,6 +663,27 @@ CREATE INDEX IF NOT EXISTS lock_archive_blocking_pid_idx
 
 COMMENT ON TABLE flight_recorder.lock_samples_archive IS 'TIER 1.5: Raw lock samples for forensic analysis (15-min cadence, full blocking chains)';
 
+-- Wait samples archive - Raw wait event snapshots
+CREATE TABLE IF NOT EXISTS flight_recorder.wait_samples_archive (
+    id                  BIGSERIAL PRIMARY KEY,
+    sample_id           BIGINT NOT NULL,           -- Reference to collection cycle
+    captured_at         TIMESTAMPTZ NOT NULL,      -- When this sample was captured
+    backend_type        TEXT,
+    wait_event_type     TEXT,
+    wait_event          TEXT,
+    state               TEXT,
+    count               INTEGER                     -- Number of sessions in this wait state
+);
+
+CREATE INDEX IF NOT EXISTS wait_archive_captured_at_idx
+    ON flight_recorder.wait_samples_archive(captured_at);
+CREATE INDEX IF NOT EXISTS wait_archive_sample_id_idx
+    ON flight_recorder.wait_samples_archive(sample_id);
+CREATE INDEX IF NOT EXISTS wait_archive_wait_event_idx
+    ON flight_recorder.wait_samples_archive(wait_event_type, wait_event, captured_at);
+
+COMMENT ON TABLE flight_recorder.wait_samples_archive IS 'TIER 1.5: Raw wait event samples for forensic analysis (15-min cadence, full resolution)';
+
 -- -----------------------------------------------------------------------------
 -- Helper: Pretty-print bytes
 -- -----------------------------------------------------------------------------
@@ -775,7 +796,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('archive_sample_frequency_minutes', '15'), -- How often to archive (default: every 15 min)
     ('archive_retention_days', '7'),           -- How long to keep archived samples (default: 7 days)
     ('archive_activity_samples', 'true'),      -- Archive activity samples (PIDs, queries, sessions)
-    ('archive_lock_samples', 'true')           -- Archive lock samples (blocking chains, PIDs)
+    ('archive_lock_samples', 'true'),          -- Archive lock samples (blocking chains, PIDs)
+    ('archive_wait_samples', 'true')           -- Archive wait event samples (wait patterns)
 ON CONFLICT (key) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
@@ -2302,12 +2324,14 @@ DECLARE
     v_enabled BOOLEAN;
     v_archive_activity BOOLEAN;
     v_archive_locks BOOLEAN;
+    v_archive_waits BOOLEAN;
     v_frequency_minutes INTEGER;
     v_last_archive TIMESTAMPTZ;
     v_next_archive_due TIMESTAMPTZ;
     v_samples_to_archive INTEGER;
     v_activity_rows INTEGER := 0;
     v_lock_rows INTEGER := 0;
+    v_wait_rows INTEGER := 0;
 BEGIN
     -- Check if archival is enabled
     v_enabled := COALESCE(
@@ -2330,6 +2354,11 @@ BEGIN
         true
     );
 
+    v_archive_waits := COALESCE(
+        (SELECT value::boolean FROM flight_recorder.config WHERE key = 'archive_wait_samples'),
+        true
+    );
+
     v_frequency_minutes := COALESCE(
         (SELECT value::integer FROM flight_recorder.config WHERE key = 'archive_sample_frequency_minutes'),
         15
@@ -2338,7 +2367,8 @@ BEGIN
     -- Determine when we last archived
     SELECT GREATEST(
         COALESCE(MAX(captured_at), '1970-01-01'::timestamptz),
-        COALESCE((SELECT MAX(captured_at) FROM flight_recorder.lock_samples_archive), '1970-01-01'::timestamptz)
+        COALESCE((SELECT MAX(captured_at) FROM flight_recorder.lock_samples_archive), '1970-01-01'::timestamptz),
+        COALESCE((SELECT MAX(captured_at) FROM flight_recorder.wait_samples_archive), '1970-01-01'::timestamptz)
     )
     INTO v_last_archive
     FROM flight_recorder.activity_samples_archive;
@@ -2417,8 +2447,29 @@ BEGIN
         GET DIAGNOSTICS v_lock_rows = ROW_COUNT;
     END IF;
 
-    RAISE NOTICE 'pg-flight-recorder: Archived raw samples (% samples, % activity rows, % lock rows)',
-        v_samples_to_archive, v_activity_rows, v_lock_rows;
+    -- Archive wait samples (full resolution, not aggregated)
+    IF v_archive_waits THEN
+        INSERT INTO flight_recorder.wait_samples_archive (
+            sample_id, captured_at, backend_type, wait_event_type, wait_event, state, count
+        )
+        SELECT
+            s.epoch_seconds AS sample_id,
+            s.captured_at,
+            w.backend_type,
+            w.wait_event_type,
+            w.wait_event,
+            w.state,
+            w.count
+        FROM flight_recorder.wait_samples_ring w
+        JOIN flight_recorder.samples_ring s ON s.slot_id = w.slot_id
+        WHERE s.captured_at > v_last_archive
+          AND w.backend_type IS NOT NULL;  -- Filter out NULL (unused) rows
+
+        GET DIAGNOSTICS v_wait_rows = ROW_COUNT;
+    END IF;
+
+    RAISE NOTICE 'pg-flight-recorder: Archived raw samples (% samples, % activity rows, % lock rows, % wait rows)',
+        v_samples_to_archive, v_activity_rows, v_lock_rows, v_wait_rows;
 END;
 $$;
 
@@ -2439,6 +2490,7 @@ DECLARE
     v_deleted_queries INTEGER;
     v_deleted_activity_archive INTEGER;
     v_deleted_lock_archive INTEGER;
+    v_deleted_wait_archive INTEGER;
 BEGIN
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
@@ -2472,10 +2524,14 @@ BEGIN
     WHERE captured_at < now() - v_archive_retention;
     GET DIAGNOSTICS v_deleted_lock_archive = ROW_COUNT;
 
+    DELETE FROM flight_recorder.wait_samples_archive
+    WHERE captured_at < now() - v_archive_retention;
+    GET DIAGNOSTICS v_deleted_wait_archive = ROW_COUNT;
+
     IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 OR
-       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives',
-            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive;
+       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive;
     END IF;
 END;
 $$;

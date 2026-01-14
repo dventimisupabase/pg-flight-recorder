@@ -121,6 +121,7 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 
 - `activity_samples_archive` (raw activity samples: PIDs, queries, sessions)
 - `lock_samples_archive` (raw lock samples: blocking chains, PIDs)
+- `wait_samples_archive` (raw wait event samples: wait patterns with counts)
 
 **Characteristics:**
 
@@ -151,6 +152,7 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 - `archive_retention_days` - How long to keep archives (default: 7)
 - `archive_activity_samples` - Archive activity samples (default: true)
 - `archive_lock_samples` - Archive lock samples (default: true)
+- `archive_wait_samples` - Archive wait event samples (default: true)
 
 **Storage overhead:**
 
@@ -178,6 +180,15 @@ ORDER BY captured_at;
 SELECT * FROM flight_recorder.lock_samples_archive
 WHERE captured_at BETWEEN '2024-01-14 15:30' AND '2024-01-14 15:31'
 ORDER BY blocked_pid, blocking_pid;
+
+-- Analyze wait event patterns during specific period
+SELECT backend_type, wait_event_type, wait_event,
+       SUM(count) as total_waiters,
+       COUNT(*) as sample_count
+FROM flight_recorder.wait_samples_archive
+WHERE captured_at BETWEEN '2024-01-14 15:00' AND '2024-01-14 16:00'
+GROUP BY backend_type, wait_event_type, wait_event
+ORDER BY total_waiters DESC;
 ```
 
 ### TIER 3: Snapshots (Durable, Long Retention)

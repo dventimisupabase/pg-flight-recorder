@@ -6,13 +6,13 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(389);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 44 version-specific (Phase 4) + 29 safety mechanisms (Phase 5) + 11 archive functionality (Phase 6)
+SELECT plan(393);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 44 version-specific (Phase 4) + 29 safety mechanisms (Phase 5) + 15 archive functionality (Phase 6)
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
 
 -- =============================================================================
--- 1. INSTALLATION VERIFICATION (18 tests)
+-- 1. INSTALLATION VERIFICATION (19 tests)
 -- =============================================================================
 
 -- Test schema exists
@@ -34,6 +34,7 @@ SELECT has_table('flight_recorder', 'query_aggregates', 'TIER 2: Table flight_re
 -- TIER 1.5: Raw sample archives (REGULAR/durable)
 SELECT has_table('flight_recorder', 'activity_samples_archive', 'TIER 1.5: Table flight_recorder.activity_samples_archive should exist');
 SELECT has_table('flight_recorder', 'lock_samples_archive', 'TIER 1.5: Table flight_recorder.lock_samples_archive should exist');
+SELECT has_table('flight_recorder', 'wait_samples_archive', 'TIER 1.5: Table flight_recorder.wait_samples_archive should exist');
 -- Config and monitoring
 SELECT has_table('flight_recorder', 'config', 'Table flight_recorder.config should exist');
 SELECT has_table('flight_recorder', 'collection_stats', 'P0 Safety: Table flight_recorder.collection_stats should exist');
@@ -3667,7 +3668,7 @@ SELECT ok(
 );
 
 -- =============================================================================
--- 6. ARCHIVE FUNCTIONALITY (8 tests)
+-- 6. ARCHIVE FUNCTIONALITY (12 tests)
 -- =============================================================================
 
 -- Test 1: Archive configuration exists
@@ -3686,6 +3687,11 @@ SELECT ok(
     'Archive: Config key archive_retention_days should exist'
 );
 
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'archive_wait_samples'),
+    'Archive: Config key archive_wait_samples should exist'
+);
+
 -- Test 2: Archive tables are empty initially
 SELECT is(
     (SELECT count(*)::integer FROM flight_recorder.activity_samples_archive),
@@ -3697,6 +3703,12 @@ SELECT is(
     (SELECT count(*)::integer FROM flight_recorder.lock_samples_archive),
     0,
     'Archive: lock_samples_archive should be empty initially'
+);
+
+SELECT is(
+    (SELECT count(*)::integer FROM flight_recorder.wait_samples_archive),
+    0,
+    'Archive: wait_samples_archive should be empty initially'
 );
 
 -- Test 3: Archive function can be called
@@ -3726,6 +3738,9 @@ VALUES (1, now() - interval '10 days', 12345, 'test_user');
 INSERT INTO flight_recorder.lock_samples_archive (sample_id, captured_at, blocked_pid)
 VALUES (1, now() - interval '10 days', 67890);
 
+INSERT INTO flight_recorder.wait_samples_archive (sample_id, captured_at, backend_type, wait_event_type, wait_event, count)
+VALUES (1, now() - interval '10 days', 'client backend', 'Lock', 'relation', 5);
+
 -- Set retention to 7 days for test
 UPDATE flight_recorder.config SET value = '7' WHERE key = 'archive_retention_days';
 
@@ -3739,6 +3754,22 @@ SELECT ok(
         WHERE captured_at < now() - interval '7 days'
     ),
     'Archive: cleanup should remove old activity archive data'
+);
+
+SELECT ok(
+    NOT EXISTS (
+        SELECT 1 FROM flight_recorder.lock_samples_archive
+        WHERE captured_at < now() - interval '7 days'
+    ),
+    'Archive: cleanup should remove old lock archive data'
+);
+
+SELECT ok(
+    NOT EXISTS (
+        SELECT 1 FROM flight_recorder.wait_samples_archive
+        WHERE captured_at < now() - interval '7 days'
+    ),
+    'Archive: cleanup should remove old wait archive data'
 );
 
 SELECT * FROM finish();
