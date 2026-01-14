@@ -4322,7 +4322,13 @@ BEGIN
             ('default', 'snapshot_based_collection', 'true'),
             ('default', 'retention_snapshots_days', '30'),
             ('default', 'aggregate_retention_days', '7'),
-            
+            ('default', 'archive_samples_enabled', 'true'),
+            ('default', 'archive_sample_frequency_minutes', '15'),
+            ('default', 'archive_retention_days', '7'),
+            ('default', 'archive_activity_samples', 'true'),
+            ('default', 'archive_lock_samples', 'true'),
+            ('default', 'archive_wait_samples', 'true'),
+
             -- Profile: production_safe
             ('production_safe', 'sample_interval_seconds', '300'),
             ('production_safe', 'adaptive_sampling', 'true'),
@@ -4337,7 +4343,13 @@ BEGIN
             ('production_safe', 'lock_timeout_ms', '50'),
             ('production_safe', 'retention_snapshots_days', '30'),
             ('production_safe', 'aggregate_retention_days', '7'),
-            
+            ('production_safe', 'archive_samples_enabled', 'true'),
+            ('production_safe', 'archive_sample_frequency_minutes', '30'),
+            ('production_safe', 'archive_retention_days', '14'),
+            ('production_safe', 'archive_activity_samples', 'true'),
+            ('production_safe', 'archive_lock_samples', 'true'),
+            ('production_safe', 'archive_wait_samples', 'false'),
+
             -- Profile: development
             ('development', 'sample_interval_seconds', '180'),
             ('development', 'adaptive_sampling', 'false'),
@@ -4349,7 +4361,13 @@ BEGIN
             ('development', 'snapshot_based_collection', 'true'),
             ('development', 'retention_snapshots_days', '7'),
             ('development', 'aggregate_retention_days', '3'),
-            
+            ('development', 'archive_samples_enabled', 'true'),
+            ('development', 'archive_sample_frequency_minutes', '15'),
+            ('development', 'archive_retention_days', '3'),
+            ('development', 'archive_activity_samples', 'true'),
+            ('development', 'archive_lock_samples', 'true'),
+            ('development', 'archive_wait_samples', 'true'),
+
             -- Profile: troubleshooting
             ('troubleshooting', 'sample_interval_seconds', '60'),
             ('troubleshooting', 'adaptive_sampling', 'false'),
@@ -4363,7 +4381,13 @@ BEGIN
             ('troubleshooting', 'statements_top_n', '50'),
             ('troubleshooting', 'retention_snapshots_days', '7'),
             ('troubleshooting', 'aggregate_retention_days', '3'),
-            
+            ('troubleshooting', 'archive_samples_enabled', 'true'),
+            ('troubleshooting', 'archive_sample_frequency_minutes', '5'),
+            ('troubleshooting', 'archive_retention_days', '7'),
+            ('troubleshooting', 'archive_activity_samples', 'true'),
+            ('troubleshooting', 'archive_lock_samples', 'true'),
+            ('troubleshooting', 'archive_wait_samples', 'true'),
+
             -- Profile: minimal_overhead
             ('minimal_overhead', 'sample_interval_seconds', '300'),
             ('minimal_overhead', 'adaptive_sampling', 'true'),
@@ -4379,7 +4403,13 @@ BEGIN
             ('minimal_overhead', 'statements_enabled', 'false'),
             ('minimal_overhead', 'retention_snapshots_days', '7'),
             ('minimal_overhead', 'aggregate_retention_days', '3'),
-            
+            ('minimal_overhead', 'archive_samples_enabled', 'false'),
+            ('minimal_overhead', 'archive_sample_frequency_minutes', '30'),
+            ('minimal_overhead', 'archive_retention_days', '3'),
+            ('minimal_overhead', 'archive_activity_samples', 'false'),
+            ('minimal_overhead', 'archive_lock_samples', 'false'),
+            ('minimal_overhead', 'archive_wait_samples', 'false'),
+
             -- Profile: high_ddl
             ('high_ddl', 'sample_interval_seconds', '180'),
             ('high_ddl', 'adaptive_sampling', 'true'),
@@ -4393,7 +4423,13 @@ BEGIN
             ('high_ddl', 'lock_timeout_ms', '50'),
             ('high_ddl', 'check_ddl_before_collection', 'true'),
             ('high_ddl', 'retention_snapshots_days', '30'),
-            ('high_ddl', 'aggregate_retention_days', '7')
+            ('high_ddl', 'aggregate_retention_days', '7'),
+            ('high_ddl', 'archive_samples_enabled', 'true'),
+            ('high_ddl', 'archive_sample_frequency_minutes', '15'),
+            ('high_ddl', 'archive_retention_days', '7'),
+            ('high_ddl', 'archive_activity_samples', 'true'),
+            ('high_ddl', 'archive_lock_samples', 'true'),
+            ('high_ddl', 'archive_wait_samples', 'true')
         ) AS t(profile, key, value)
         WHERE profile = p_profile_name
     ),
