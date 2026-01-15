@@ -1822,9 +1822,10 @@ BEGIN
 
             v_active_pct := (v_active_count::numeric / NULLIF(v_max_connections, 0)) * 100;
 
-            IF v_active_pct > v_load_threshold_pct THEN
+            -- Use >= for comparison to handle 0% threshold correctly (should always trigger)
+            IF v_active_pct >= v_load_threshold_pct THEN
                 PERFORM flight_recorder._record_collection_skip('sample',
-                    format('Load shedding: high load (%s active / %s max = %s%% > %s%% threshold)',
+                    format('Load shedding: high load (%s active / %s max = %s%% >= %s%% threshold)',
                            v_active_count, v_max_connections, round(v_active_pct, 1), v_load_threshold_pct));
                 PERFORM set_config('statement_timeout', '0', true);
                 RETURN v_captured_at;
