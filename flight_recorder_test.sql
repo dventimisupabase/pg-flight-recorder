@@ -575,10 +575,10 @@ SELECT ok(
     'P2: Auto mode trips threshold config should exist'
 );
 
--- Test P2: Auto mode defaults to enabled (A-GRADE safety improvement)
+-- Test P2: Auto mode defaults to enabled
 SELECT ok(
     (SELECT value FROM flight_recorder.config WHERE key = 'auto_mode_enabled') = 'true',
-    'P2: Auto mode should be enabled by default (A-GRADE safety)'
+    'P2: Auto mode should be enabled by default'
 );
 
 -- Test P2: Configurable retention config entries exist
