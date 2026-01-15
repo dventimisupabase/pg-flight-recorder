@@ -5,27 +5,33 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 ## Table of Contents
 
 **Part I: Fundamentals**
+
 - [Overview](#overview)
 - [Core Concepts](#core-concepts)
 
 **Part II: Installation & Configuration**
+
 - [Installation](#installation)
 - [Configuration Profiles](#configuration-profiles)
 - [Advanced Configuration](#advanced-configuration)
 
 **Part III: Usage**
+
 - [Functions Reference](#functions-reference)
 - [Views Reference](#views-reference)
 - [Common Workflows](#common-workflows)
 
 **Part IV: Safety & Operations**
+
 - [Safety Mechanisms](#safety-mechanisms)
 - [Catalog Lock Behavior](#catalog-lock-behavior)
 
 **Part V: Capacity Planning**
+
 - [Capacity Planning](#capacity-planning)
 
 **Part VI: Reference Material**
+
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
 - [Testing and Benchmarking](#testing-and-benchmarking)
@@ -33,7 +39,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 ---
 
-# Part I: Fundamentals
+## Part I: Fundamentals
 
 ## Overview
 
@@ -96,6 +102,7 @@ Low-overhead, high-frequency sampling using a fixed 120-slot circular buffer.
 | `lock_samples_ring` | 12,000 | Lock contention (120 slots × 100 rows) |
 
 Characteristics:
+
 - **UNLOGGED tables** eliminate WAL overhead (data lost on crash—acceptable for telemetry)
 - **Pre-populated rows** with UPDATE-only pattern achieve 100% HOT updates (zero dead tuples)
 - **Modular arithmetic** (`epoch / interval % 120`) auto-overwrites old slots
@@ -146,6 +153,7 @@ slot_id = (epoch_seconds / sample_interval_seconds) % 120
 ```
 
 With 120 slots:
+
 - At 180s intervals: 120 × 180s = 6 hours retention
 - At 300s intervals: 120 × 300s = 10 hours retention
 
@@ -154,6 +162,7 @@ With 120 slots:
 **Why UPDATE-only pattern?** Child tables use `UPDATE ... SET col = NULL` to clear slots, then `INSERT ... ON CONFLICT DO UPDATE`. This achieves 100% HOT (Heap-Only Tuple) updates, eliminating dead tuples and autovacuum pressure.
 
 **Storage optimization:**
+
 - Master table: `fillfactor=70` (30% free space for HOT)
 - Child tables: `fillfactor=90` (10% free space for HOT)
 
@@ -191,7 +200,7 @@ The system can auto-switch modes based on load (see [Adaptive Mode](#adaptive-mo
 
 ---
 
-# Part II: Installation & Configuration
+## Part II: Installation & Configuration
 
 ## Installation
 
@@ -400,7 +409,7 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 
 ---
 
-# Part III: Usage
+## Part III: Usage
 
 ## Functions Reference
 
@@ -462,6 +471,7 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `capacity_dashboard` | Resource utilization and headroom |
 
 **Dynamic retention functions** return data matching current mode's retention:
+
 - `recent_waits_current()`
 - `recent_activity_current()`
 - `recent_locks_current()`
@@ -486,15 +496,15 @@ ORDER BY 3 DESC;
 
 ### Incident Response
 
-1. Switch to troubleshooting mode for detailed data:
+**Step 1:** Switch to troubleshooting mode for detailed data:
 
 ```sql
 SELECT flight_recorder.apply_profile('troubleshooting');
 ```
 
-2. Collect data for 10-15 minutes during the incident.
+**Step 2:** Collect data for 10-15 minutes during the incident.
 
-3. Analyze:
+**Step 3:** Analyze:
 
 ```sql
 -- What happened in the last hour?
@@ -513,7 +523,7 @@ SELECT * FROM flight_recorder.wait_summary(
 SELECT * FROM flight_recorder.activity_at('2024-01-15 14:30:00');
 ```
 
-4. Switch back to normal collection:
+**Step 4:** Switch back to normal collection:
 
 ```sql
 SELECT flight_recorder.apply_profile('default');
@@ -554,7 +564,7 @@ Returns health status with recommendations for each component.
 
 ---
 
-# Part IV: Safety & Operations
+## Part IV: Safety & Operations
 
 ## Safety Mechanisms
 
@@ -574,6 +584,7 @@ Flight Recorder includes multiple protections to minimize observer effect.
 Overhead is roughly constant regardless of workload—the question is whether your system has ~25ms of headroom every 3 minutes.
 
 **Validated environments:**
+
 - Development laptops (M-series, Intel)
 - Supabase Micro (t4g.nano, 2 core ARM, 1GB RAM): 32ms median, 0.018% CPU
 
@@ -671,6 +682,7 @@ UPDATE flight_recorder.config SET value = '12000' WHERE key = 'schema_size_criti
 Detects when pg_cron jobs are deleted, disabled, or broken.
 
 **Required jobs:**
+
 - `flight_recorder_sample` — Ring buffer sampling
 - `flight_recorder_snapshot` — System stats
 - `flight_recorder_flush` — Ring buffer → aggregates
@@ -705,6 +717,7 @@ ORDER BY started_at DESC;
 ### Graceful Degradation
 
 Each collection section is wrapped in exception handlers:
+
 - Wait events fail → activity samples still collected
 - Lock detection fails → progress tracking continues
 - Partial data is better than no data during incidents
@@ -725,6 +738,7 @@ Flight Recorder acquires AccessShareLock on system catalogs during collection. T
 ### Lock Timeout Behavior
 
 Default `lock_timeout` = 100ms:
+
 - If catalog locked by DDL > 100ms: collection fails with timeout error
 - If collection starts before DDL: DDL waits up to 100ms behind flight recorder
 - Circuit breaker trips after 3 lock timeout failures in 15 minutes
@@ -740,6 +754,7 @@ Default `lock_timeout` = 100ms:
 Validated: DDL blocking is negligible with snapshot-based collection.
 
 **Test results** (Supabase Micro, 202 DDL operations):
+
 - 0% blocking rate
 - 14 operations concurrent with collection—no delays
 
@@ -758,7 +773,7 @@ SELECT flight_recorder.apply_profile('high_ddl');
 
 ---
 
-# Part V: Capacity Planning
+## Part V: Capacity Planning
 
 ## Capacity Planning
 
@@ -767,6 +782,7 @@ Flight Recorder tracks resource utilization to answer: "Do I have the right amou
 ### Overview
 
 Capacity planning uses data already collected (every 5 minutes) with no additional overhead. It provides:
+
 - Resource utilization across 6 dimensions
 - Headroom assessment for right-sizing
 - Trend analysis for growth patterns
@@ -857,6 +873,7 @@ healthy (< 60%) → warning (60-80%) → critical (> 80%)
 ```
 
 **When to act:**
+
 - **healthy** — Monitor periodically
 - **warning** — Plan capacity increases within 30-60 days
 - **critical** — Immediate action needed
@@ -919,7 +936,7 @@ ORDER BY utilization_pct;
 
 ---
 
-# Part VI: Reference Material
+## Part VI: Reference Material
 
 ## Troubleshooting Guide
 
@@ -1120,6 +1137,7 @@ cd benchmark
 ```
 
 This measures:
+
 - CPU time per collection (mean, p50, p95, p99)
 - I/O operations per collection
 - Sustained CPU % at different intervals
