@@ -173,7 +173,6 @@ Modes control collection intensity. See [Sample Intervals](#sample-intervals) fo
 | Mode | Locks | Activity | Use Case |
 |------|-------|----------|----------|
 | `normal` | Yes | Full (25 rows) | Default, recommended |
-| `light` | Yes | Full (25 rows) | Same as normal |
 | `emergency` | No | Limited | System stressed |
 
 ```sql
@@ -325,7 +324,7 @@ SELECT * FROM flight_recorder.config;
 | `circuit_breaker_threshold_ms` | 1000 | Max collection duration before skip |
 | `circuit_breaker_enabled` | true | Enable circuit breaker |
 | `auto_mode_enabled` | true | Auto-adjust collection mode |
-| `auto_mode_connections_threshold` | 60 | % connections to trigger light mode |
+| `auto_mode_connections_threshold` | 60 | % connections to trigger emergency mode |
 | `section_timeout_ms` | 250 | Per-section query timeout |
 | `lock_timeout_ms` | 100 | Max wait for catalog locks |
 | `skip_locks_threshold` | 50 | Skip lock collection if > N blocked |
@@ -359,7 +358,6 @@ Single authoritative reference for sample timing:
 | Mode | Interval | Slots | Retention | Collections/Day |
 |------|----------|-------|-----------|-----------------|
 | `normal` | 180s | 120 | 6 hours | 480 |
-| `light` | 180s | 120 | 6 hours | 480 |
 | `emergency` | 300s | 120 | 10 hours | 288 |
 
 Formula: `retention = slots × interval` (120 × 180s = 21,600s = 6 hours)
@@ -395,7 +393,7 @@ Safety thresholds control when collection skips or degrades:
 | `load_shedding_active_pct` | 70 | Active connections exceed % of max |
 | `load_throttle_xact_threshold` | 1000 | Transactions/sec exceeded |
 | `load_throttle_blk_threshold` | 10000 | Block I/O/sec exceeded |
-| `auto_mode_connections_threshold` | 60 | % to trigger light mode |
+| `auto_mode_connections_threshold` | 60 | % to trigger emergency mode |
 
 Adjust for your environment:
 
@@ -431,7 +429,7 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 |----------|---------|
 | `enable()` | Start collection (schedules pg_cron jobs) |
 | `disable()` | Stop all collection |
-| `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity |
+| `set_mode('normal'/'emergency')` | Adjust collection intensity |
 | `get_mode()` | Show current mode and settings |
 | `cleanup(interval)` | Delete old data (default: 7 days) |
 | `validate_config()` | Validate configuration settings |
@@ -643,10 +641,8 @@ Automatically adjusts collection intensity:
 
 | Transition | Trigger |
 |------------|---------|
-| Normal → Light | Connections reach 60% of max |
-| Any → Emergency | Circuit breaker trips 3× in 10 minutes |
-| Emergency → Light | 10 minutes without trips |
-| Light → Normal | Load drops below threshold |
+| Normal → Emergency | Connections reach 60% of max, or circuit breaker trips 3× in 10 minutes |
+| Emergency → Normal | 10 minutes without trips and load drops below threshold |
 
 Enabled by default. Disable:
 
@@ -997,7 +993,7 @@ FROM flight_recorder.collection_stats
 WHERE started_at > now() - interval '1 hour'
 GROUP BY collection_type;
 
--- If consistently slow, switch to lighter mode
+-- If consistently slow, switch to emergency mode
 SELECT flight_recorder.set_mode('emergency');
 
 -- Or increase timeout
