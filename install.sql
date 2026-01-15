@@ -1760,7 +1760,7 @@ BEGIN
     BEGIN
         SELECT count(*), min(pid) INTO v_running_count, v_running_pid
         FROM pg_stat_activity
-        WHERE query LIKE '%flight_recorder.sample()%'
+        WHERE query ~ 'SELECT\s+flight_recorder\.sample\(\)'  -- Regex: match actual SELECT statement, not scripts containing the function
           AND state = 'active'
           AND pid != pg_backend_pid()
           AND backend_type = 'client backend';
@@ -2653,7 +2653,7 @@ BEGIN
     BEGIN
         SELECT count(*), min(pid) INTO v_running_count, v_running_pid
         FROM pg_stat_activity
-        WHERE query LIKE '%flight_recorder.snapshot()%'
+        WHERE query ~ 'SELECT\s+flight_recorder\.snapshot\(\)'  -- Regex: match actual SELECT statement, not scripts containing the function
           AND state = 'active'
           AND pid != pg_backend_pid()
           AND backend_type = 'client backend';
