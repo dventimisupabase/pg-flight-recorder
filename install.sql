@@ -4440,6 +4440,13 @@ BEGIN
             ('default', 'archive_activity_samples', 'true'),
             ('default', 'archive_lock_samples', 'true'),
             ('default', 'archive_wait_samples', 'true'),
+            ('default', 'capacity_planning_enabled', 'true'),
+            ('default', 'capacity_thresholds_warning_pct', '60'),
+            ('default', 'capacity_thresholds_critical_pct', '80'),
+            ('default', 'capacity_forecast_window_days', '90'),
+            ('default', 'snapshot_retention_days_extended', '90'),
+            ('default', 'collect_database_size', 'true'),
+            ('default', 'collect_connection_metrics', 'true'),
 
             -- Profile: production_safe
             ('production_safe', 'sample_interval_seconds', '300'),
@@ -4461,6 +4468,13 @@ BEGIN
             ('production_safe', 'archive_activity_samples', 'true'),
             ('production_safe', 'archive_lock_samples', 'true'),
             ('production_safe', 'archive_wait_samples', 'false'),
+            ('production_safe', 'capacity_planning_enabled', 'true'),
+            ('production_safe', 'capacity_thresholds_warning_pct', '60'),
+            ('production_safe', 'capacity_thresholds_critical_pct', '80'),
+            ('production_safe', 'capacity_forecast_window_days', '90'),
+            ('production_safe', 'snapshot_retention_days_extended', '90'),
+            ('production_safe', 'collect_database_size', 'false'),
+            ('production_safe', 'collect_connection_metrics', 'true'),
 
             -- Profile: development
             ('development', 'sample_interval_seconds', '180'),
@@ -4479,6 +4493,13 @@ BEGIN
             ('development', 'archive_activity_samples', 'true'),
             ('development', 'archive_lock_samples', 'true'),
             ('development', 'archive_wait_samples', 'true'),
+            ('development', 'capacity_planning_enabled', 'true'),
+            ('development', 'capacity_thresholds_warning_pct', '60'),
+            ('development', 'capacity_thresholds_critical_pct', '80'),
+            ('development', 'capacity_forecast_window_days', '30'),
+            ('development', 'snapshot_retention_days_extended', '30'),
+            ('development', 'collect_database_size', 'true'),
+            ('development', 'collect_connection_metrics', 'true'),
 
             -- Profile: troubleshooting
             ('troubleshooting', 'sample_interval_seconds', '60'),
@@ -4499,6 +4520,13 @@ BEGIN
             ('troubleshooting', 'archive_activity_samples', 'true'),
             ('troubleshooting', 'archive_lock_samples', 'true'),
             ('troubleshooting', 'archive_wait_samples', 'true'),
+            ('troubleshooting', 'capacity_planning_enabled', 'true'),
+            ('troubleshooting', 'capacity_thresholds_warning_pct', '50'),
+            ('troubleshooting', 'capacity_thresholds_critical_pct', '70'),
+            ('troubleshooting', 'capacity_forecast_window_days', '30'),
+            ('troubleshooting', 'snapshot_retention_days_extended', '30'),
+            ('troubleshooting', 'collect_database_size', 'true'),
+            ('troubleshooting', 'collect_connection_metrics', 'true'),
 
             -- Profile: minimal_overhead
             ('minimal_overhead', 'sample_interval_seconds', '300'),
@@ -4521,6 +4549,13 @@ BEGIN
             ('minimal_overhead', 'archive_activity_samples', 'false'),
             ('minimal_overhead', 'archive_lock_samples', 'false'),
             ('minimal_overhead', 'archive_wait_samples', 'false'),
+            ('minimal_overhead', 'capacity_planning_enabled', 'true'),
+            ('minimal_overhead', 'capacity_thresholds_warning_pct', '70'),
+            ('minimal_overhead', 'capacity_thresholds_critical_pct', '85'),
+            ('minimal_overhead', 'capacity_forecast_window_days', '30'),
+            ('minimal_overhead', 'snapshot_retention_days_extended', '30'),
+            ('minimal_overhead', 'collect_database_size', 'false'),
+            ('minimal_overhead', 'collect_connection_metrics', 'true'),
 
             -- Profile: high_ddl
             ('high_ddl', 'sample_interval_seconds', '180'),
@@ -4541,7 +4576,14 @@ BEGIN
             ('high_ddl', 'archive_retention_days', '7'),
             ('high_ddl', 'archive_activity_samples', 'true'),
             ('high_ddl', 'archive_lock_samples', 'true'),
-            ('high_ddl', 'archive_wait_samples', 'true')
+            ('high_ddl', 'archive_wait_samples', 'true'),
+            ('high_ddl', 'capacity_planning_enabled', 'true'),
+            ('high_ddl', 'capacity_thresholds_warning_pct', '60'),
+            ('high_ddl', 'capacity_thresholds_critical_pct', '80'),
+            ('high_ddl', 'capacity_forecast_window_days', '90'),
+            ('high_ddl', 'snapshot_retention_days_extended', '90'),
+            ('high_ddl', 'collect_database_size', 'true'),
+            ('high_ddl', 'collect_connection_metrics', 'true')
         ) AS t(profile, key, value)
         WHERE profile = p_profile_name
     ),
