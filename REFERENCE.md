@@ -1,402 +1,796 @@
 # pg-flight-recorder Reference
 
-Complete documentation for pg-flight-recorder.
+Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 ## Table of Contents
 
-**Quick Start:**
+**Part I: Fundamentals**
+- [Overview](#overview)
+- [Core Concepts](#core-concepts)
 
-- [Configuration Profiles](#configuration-profiles) - **Start here** for easy configuration
-- [Functions](#functions) - Query and control functions
-- [Safety Features](#safety-features) - Built-in protections
+**Part II: Installation & Configuration**
+- [Installation](#installation)
+- [Configuration Profiles](#configuration-profiles)
+- [Advanced Configuration](#advanced-configuration)
 
-**Architecture:**
+**Part III: Usage**
+- [Functions Reference](#functions-reference)
+- [Views Reference](#views-reference)
+- [Common Workflows](#common-workflows)
 
-- [How It Works](#how-it-works) - Overview
-- [Three-Tier Architecture](#three-tier-architecture) - Data storage model
-- [Collection Modes](#collection-modes) - Sampling frequencies
+**Part IV: Safety & Operations**
+- [Safety Mechanisms](#safety-mechanisms)
+- [Catalog Lock Behavior](#catalog-lock-behavior)
 
-**Capacity Planning:**
+**Part V: Capacity Planning**
+- [Capacity Planning](#capacity-planning)
 
-- [Capacity Planning](#capacity-planning) - Right-sizing and resource assessment
-- [Using capacity_summary()](#using-capacity_summary) - Analyze resource utilization
-- [Using capacity_dashboard](#using-capacity_dashboard) - At-a-glance capacity view
+**Part VI: Reference Material**
+- [Troubleshooting Guide](#troubleshooting-guide)
+- [Anomaly Detection Reference](#anomaly-detection-reference)
+- [Testing and Benchmarking](#testing-and-benchmarking)
+- [Project Structure](#project-structure)
 
-**Advanced:**
+---
 
-- [Configuration](#configuration) - Individual parameters (advanced users)
-- [Catalog Lock Contention](#catalog-lock-contention) - DDL interaction
-- [Diagnostic Patterns](#diagnostic-patterns) - Common troubleshooting scenarios
-- [Testing](#testing) - Running the test suite
-- [Benchmarking](#benchmarking) - Measuring overhead and performance
+# Part I: Fundamentals
 
-## Requirements
+## Overview
+
+### Purpose and Scope
+
+pg-flight-recorder continuously samples PostgreSQL system state, storing data in a three-tier architecture optimized for minimal overhead and flexible retention. Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
+
+### Requirements
 
 - PostgreSQL 15, 16, or 17
 - `pg_cron` extension (1.4.1+ recommended)
-- Superuser privileges
+- Superuser privileges for installation
 - Optional: `pg_stat_statements` for query analysis
 
-## How It Works
+### How It Works
 
-Flight Recorder uses `pg_cron` to run five collection types:
+Flight Recorder uses pg_cron to run five collection jobs:
 
-1. **Samples** (adaptive frequency): Ring buffer - wait events, active sessions, locks
-   - Normal/Light: every 180 seconds (4-hour rolling window)
-   - Emergency: every 300 seconds (10-hour rolling window)
-2. **Flush** (every 5 minutes): Ring buffer → aggregates (durable storage)
-3. **Archive** (every 15 minutes): Ring buffer → raw sample archives (high-resolution forensics)
-4. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
-5. **Cleanup** (daily at 3 AM): Remove old aggregates, archives, and snapshots
+| Job | Frequency | Purpose |
+|-----|-----------|---------|
+| **Sample** | Adaptive (see [Sample Intervals](#sample-intervals)) | Captures wait events, active sessions, locks to ring buffer |
+| **Flush** | Every 5 minutes | Moves ring buffer data to durable aggregates |
+| **Archive** | Every 15 minutes | Preserves raw samples for forensic analysis |
+| **Snapshot** | Every 5 minutes | Records cumulative system stats (WAL, checkpoints, I/O) |
+| **Cleanup** | Daily at 3 AM | Removes data beyond retention period |
 
-The ring buffer provides low-overhead, adaptive-frequency sampling using a fixed 120-slot circular buffer with modular arithmetic. Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
+Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
 
-## Three-Tier Architecture
+## Core Concepts
 
-Flight Recorder uses a three-tier data architecture optimized for minimal overhead and maximum retention flexibility:
+### Three-Tier Data Architecture
 
-### TIER 1: Ring Buffers (High-Frequency, Short Retention)
+Flight Recorder organizes data into three tiers optimized for different access patterns:
 
-**Purpose:** Low-overhead, adaptive-frequency sampling with 4-10 hour rolling window
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ TIER 1: Ring Buffers (UNLOGGED)                                         │
+│   High-frequency sampling, 6-10 hour retention, auto-overwrites         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ TIER 1.5: Raw Archives (LOGGED)                                         │
+│   Periodic raw sample snapshots, 7-day retention, forensic detail       │
+├─────────────────────────────────────────────────────────────────────────┤
+│ TIER 2: Aggregates (LOGGED)                                             │
+│   Summarized data, 7-day retention, pattern analysis                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│ TIER 3: Snapshots (LOGGED)                                              │
+│   Cumulative stats, 30-day retention, trend analysis                    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-**Tables:**
+**TIER 1: Ring Buffers**
 
-- `samples_ring` (master, 120 fixed slots, UNLOGGED)
-- `wait_samples_ring` (12,000 pre-populated rows: 120 slots × 100 rows)
-- `activity_samples_ring` (3,000 pre-populated rows: 120 slots × 25 rows)
-- `lock_samples_ring` (12,000 pre-populated rows: 120 slots × 100 rows)
+Low-overhead, high-frequency sampling using a fixed 120-slot circular buffer.
 
-**Characteristics:**
+| Table | Rows | Purpose |
+|-------|------|---------|
+| `samples_ring` | 120 | Master slot tracker |
+| `wait_samples_ring` | 12,000 | Wait events (120 slots × 100 rows) |
+| `activity_samples_ring` | 3,000 | Active sessions (120 slots × 25 rows) |
+| `lock_samples_ring` | 12,000 | Lock contention (120 slots × 100 rows) |
 
-- **UNLOGGED tables** - No WAL overhead, don't survive crashes (intentional trade-off)
-- **Adaptive intervals** - Slot rotation: `(epoch / sample_interval_seconds) % 120`
-  - Normal/Light mode: 180s intervals = 120 slots × 180s = 6 hours retention
-  - Emergency mode: 300s intervals = 120 slots × 300s = 10 hours retention
-- **Pre-populated rows** - 27,000 total rows allocated at installation (master + children)
-- **UPSERT pattern** - samples_ring master uses HOT updates (90%+ ratio, minimal bloat)
-- **UPDATE-only pattern** - Child tables cleared via `UPDATE ... SET col = NULL`, then `INSERT ... ON CONFLICT DO UPDATE` (zero DELETEs, 100% HOT updates, eliminates dead tuples)
-- **Ring buffer self-cleans** - New data overwrites old slots automatically via modular arithmetic
-- **Zero autovacuum pressure** - No dead tuples generated, only HOT updates
+Characteristics:
+- **UNLOGGED tables** eliminate WAL overhead (data lost on crash—acceptable for telemetry)
+- **Pre-populated rows** with UPDATE-only pattern achieve 100% HOT updates (zero dead tuples)
+- **Modular arithmetic** (`epoch / interval % 120`) auto-overwrites old slots
+- Query via: `recent_waits`, `recent_activity`, `recent_locks` views
 
-**Optimization:**
+**TIER 1.5: Raw Archives**
 
-- `fillfactor=70` on master (30% free space for HOT updates)
-- `fillfactor=90` on children (10% free space for HOT updates)
-- No aggressive autovacuum needed (UPDATE-only pattern eliminates dead tuples)
+Periodic preservation of raw samples for forensic analysis beyond ring buffer retention.
 
-**Query with:**
+| Table | Purpose |
+|-------|---------|
+| `activity_samples_archive` | PIDs, queries, session details |
+| `lock_samples_archive` | Complete blocking chains |
+| `wait_samples_archive` | Wait patterns with counts |
 
-- `recent_waits`, `recent_activity`, `recent_locks` views (static 10-hour window, covers all modes)
-- `recent_waits_current()`, `recent_activity_current()`, `recent_locks_current()` functions (dynamic retention based on current mode)
-- `activity_at(timestamp)` function (specific moment)
+Preserves details that aggregates lose: specific PIDs, exact timestamps, complete blocking chains. Query directly for forensic analysis.
 
-### TIER 2: Aggregates (Durable, Medium Retention)
+**TIER 2: Aggregates**
 
-**Purpose:** Flushed ring buffer data for longer retention and historical analysis
+Durable summaries of ring buffer data for medium-term analysis.
 
-**Tables:**
+| Table | Purpose |
+|-------|---------|
+| `wait_event_aggregates` | Wait patterns over 5-minute windows |
+| `lock_aggregates` | Lock contention patterns |
+| `query_aggregates` | Query execution patterns |
 
-- `wait_event_aggregates` (wait event patterns over 5-minute windows)
-- `lock_aggregates` (lock contention patterns)
-- `query_aggregates` (query execution patterns)
+Query via: `wait_summary(start, end)` function.
 
-**Characteristics:**
+**TIER 3: Snapshots**
 
-- **Durable (LOGGED)** - Survives crashes
-- **Flushed every 5 minutes** - Ring buffer → aggregates
-- **7-day default retention** - Configurable via `aggregate_retention_days`
-- **Aggregated data** - Summarizes ring buffer samples (e.g., avg/max waiters, occurrence counts)
+Point-in-time cumulative statistics for long-term trends.
 
-**How flush works:**
+| Table | Purpose |
+|-------|---------|
+| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O |
+| `replication_snapshots` | pg_stat_replication, replication slots |
+| `statement_snapshots` | pg_stat_statements top queries |
 
-1. Find min/max timestamp in ring buffer (since last flush)
-2. Aggregate samples by dimensions (backend_type, wait_event, etc.)
-3. INSERT aggregated rows into durable tables
-4. Ring buffer continues (not cleared - provides 2-hour recent window)
+Query via: `compare(start, end)`, `statement_compare(start, end)`, `deltas` view.
 
-**Query with:**
+### Ring Buffer Mechanism
 
-- `wait_summary(start, end)` function (aggregate wait events over time)
-- Direct SQL on aggregate tables for custom analysis
+The ring buffer uses modular arithmetic for slot rotation:
 
-### TIER 1.5: Raw Sample Archives (Durable, High-Resolution Forensics)
+```
+slot_id = (epoch_seconds / sample_interval_seconds) % 120
+```
 
-**Purpose:** Periodic snapshots of raw samples for high-resolution forensic analysis beyond ring buffer retention
+With 120 slots:
+- At 180s intervals: 120 × 180s = 6 hours retention
+- At 300s intervals: 120 × 300s = 10 hours retention
 
-**Tables:**
+**Why UNLOGGED tables?** Eliminates WAL overhead. Telemetry data lost on crash is acceptable—the system recovers and resumes collection.
 
-- `activity_samples_archive` (raw activity samples: PIDs, queries, sessions)
-- `lock_samples_archive` (raw lock samples: blocking chains, PIDs)
-- `wait_samples_archive` (raw wait event samples: wait patterns with counts)
+**Why UPDATE-only pattern?** Child tables use `UPDATE ... SET col = NULL` to clear slots, then `INSERT ... ON CONFLICT DO UPDATE`. This achieves 100% HOT (Heap-Only Tuple) updates, eliminating dead tuples and autovacuum pressure.
 
-**Characteristics:**
+**Storage optimization:**
+- Master table: `fillfactor=70` (30% free space for HOT)
+- Child tables: `fillfactor=90` (10% free space for HOT)
 
-- **Durable (LOGGED)** - Survives crashes
-- **Archived every 15 minutes** - Configurable via `archive_sample_frequency_minutes`
-- **7-day default retention** - Configurable via `archive_retention_days`
-- **Full resolution** - Not aggregated, preserves all details (PIDs, exact timestamps, complete blocking chains)
-- **Slower cadence** - Archives less frequently than flush (15 min vs 5 min) to minimize overhead
+### Collection Modes
 
-**What's preserved (that aggregates lose):**
+Modes control collection intensity. See [Sample Intervals](#sample-intervals) for timing details.
 
-- **Specific PIDs** - Can answer "what was PID 12345 doing at 3:42 PM?"
-- **Exact timestamps** - Precise timing within archived period
-- **Complete blocking chains** - Full lock dependency graphs with all participants
-- **Session details** - Individual session characteristics and queries
-
-**How archival works:**
-
-1. Checks when last archive was created
-2. If enough time has passed (default: 15 minutes), copies raw samples from ring buffers
-3. Uses `sample_id` (epoch_seconds) to group related samples
-4. Filters out NULL rows (unused pre-allocated slots)
-
-**Configuration:**
-
-- `archive_samples_enabled` - Enable/disable archival (default: true)
-- `archive_sample_frequency_minutes` - How often to archive (default: 15)
-- `archive_retention_days` - How long to keep archives (default: 7)
-- `archive_activity_samples` - Archive activity samples (default: true)
-- `archive_lock_samples` - Archive lock samples (default: true)
-- `archive_wait_samples` - Archive wait event samples (default: true)
-
-**Storage overhead:**
-
-- ~1-5 MB/day for typical workloads
-- 7-day retention: ~7-35 MB
-- 30-day retention: ~30-150 MB
-
-**Use cases:**
-
-- "What was PID X doing 2 days ago at specific time?"
-- "Show me the exact blocking chain during that incident"
-- "Was this specific session blocking others?"
-- Forensic analysis requiring full resolution beyond 6-10 hour ring buffer window
-
-**Query directly from:**
+| Mode | Locks | Activity | Use Case |
+|------|-------|----------|----------|
+| `normal` | Yes | Full (25 rows) | Default, recommended |
+| `light` | Yes | Full (25 rows) | Same as normal |
+| `emergency` | No | Limited | System stressed |
 
 ```sql
--- Find what PID 12345 was doing around 2024-01-14 15:30
-SELECT * FROM flight_recorder.activity_samples_archive
-WHERE pid = 12345
-  AND captured_at BETWEEN '2024-01-14 15:25' AND '2024-01-14 15:35'
-ORDER BY captured_at;
-
--- Reconstruct blocking chain at specific time
-SELECT * FROM flight_recorder.lock_samples_archive
-WHERE captured_at BETWEEN '2024-01-14 15:30' AND '2024-01-14 15:31'
-ORDER BY blocked_pid, blocking_pid;
-
--- Analyze wait event patterns during specific period
-SELECT backend_type, wait_event_type, wait_event,
-       SUM(count) as total_waiters,
-       COUNT(*) as sample_count
-FROM flight_recorder.wait_samples_archive
-WHERE captured_at BETWEEN '2024-01-14 15:00' AND '2024-01-14 16:00'
-GROUP BY backend_type, wait_event_type, wait_event
-ORDER BY total_waiters DESC;
-```
-
-### TIER 3: Snapshots (Durable, Long Retention)
-
-**Purpose:** Point-in-time cumulative statistics for long-term trends
-
-**Tables:**
-
-- `snapshots` (pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O)
-- `replication_snapshots` (pg_stat_replication, replication slots)
-- `statement_snapshots` (pg_stat_statements top queries)
-
-**Characteristics:**
-
-- **Durable (LOGGED)** - Survives crashes
-- **Every 5 minutes** - Cumulative stats (counters since PostgreSQL start)
-- **30-day default retention** - Configurable via `retention_snapshots_days`
-- **Delta analysis** - Compare two snapshots to see changes over time
-
-**Query with:**
-
-- `compare(start, end)` function (snapshot-over-snapshot deltas)
-- `statement_compare(start, end)` function (query performance changes)
-- `deltas` view (recent snapshot changes)
-
-### Data Flow
-
-```
-Adaptive:  sample() → Ring Buffer (TIER 1)
-           - Normal/Light: Every 180s (3 minutes)
-           - Emergency: Every 300s (5 minutes)
-Every 5m:  flush_ring_to_aggregates() → Ring Buffer → Aggregates (TIER 2)
-Every 5m:  snapshot() → Snapshots (TIER 3)
-Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 data
-```
-
-### Architecture Benefits
-
-1. **Ring buffer minimizes write overhead** - UNLOGGED, small tables, HOT updates
-2. **Aggregates provide medium-term analysis** - 7 days of summarized data
-3. **Snapshots capture long-term trends** - 30 days of cumulative stats
-4. **Tiered retention** - Keep high-frequency data short, summaries longer
-5. **Crash resilience where it matters** - Aggregates and snapshots are durable; ring buffer is ephemeral by design
-
-## Functions
-
-### Analysis
-
-| Function                           | Purpose                                                 |
-|------------------------------------|---------------------------------------------------------|
-| `compare(start, end)`              | Compare system stats between time points                |
-| `wait_summary(start, end)`      | Aggregate wait events over time period                  |
-| `activity_at(timestamp)`        | What was happening at specific moment                   |
-| `anomaly_report(start, end)`    | Auto-detect 6 issue types                               |
-| `summary_report(start, end)`    | Comprehensive diagnostic report                         |
-| `statement_compare(start, end)` | Compare query performance (requires pg_stat_statements) |
-| `capacity_summary(time_window)` | Analyze resource utilization and headroom               |
-
-### Control
-
-| Function                                 | Purpose                                   |
-|------------------------------------------|-------------------------------------------|
-| `enable()`                               | Start collection (schedules pg_cron jobs) |
-| `disable()`                              | Stop all collection immediately           |
-| `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity               |
-| `get_mode()`                             | Show current mode and settings            |
-| `cleanup(interval)`                      | Delete old data (default: 7 days)         |
-| `validate_config()`                      | Validate configuration settings           |
-
-### Health & Monitoring
-
-| Function                       | Purpose                                       |
-|--------------------------------|-----------------------------------------------|
-| `preflight_check()`            | **Pre-installation validation (run first)**   |
-| `quarterly_review()`           | **90-day health check (run every 3 months)**  |
-| `health_check()`               | Component status overview                     |
-| `ring_buffer_health()`         | Ring buffer XID age, dead tuples, HOT updates |
-| `performance_report(interval)` | Flight recorder's own performance             |
-| `check_alerts(interval)`       | Active alerts (if enabled)                    |
-| `config_recommendations()`     | Optimization suggestions                      |
-| `export_json(start, end)`      | AI-friendly data export                       |
-
-### Internal (Scheduled via pg_cron)
-
-| Function                       | Purpose                                       |
-|--------------------------------|-----------------------------------------------|
-| `snapshot()`                   | Collect system stats snapshot                |
-| `sample()`                     | Collect ring buffer sample                   |
-| `flush_ring_to_aggregates()`   | Flush ring buffer to durable aggregates      |
-| `archive_ring_samples()`       | Archive raw samples for forensic analysis    |
-| `cleanup_aggregates()`         | Clean old aggregate and archive data         |
-
-**"Set and Forget" Workflow:**
-
-1. Before installation: `SELECT * FROM flight_recorder.preflight_check();`
-2. Every 3 months: `SELECT * FROM flight_recorder.quarterly_review();`
-3. Both functions provide clear GO/NO-GO status with actionable recommendations.
-
-## Views
-
-| View                 | Purpose                                     |
-|----------------------|---------------------------------------------|
-| `recent_waits`       | Wait events (last 10 hours, static window covers all modes) |
-| `recent_activity`    | Active sessions (last 10 hours, static window) |
-| `recent_locks`       | Lock contention (last 10 hours, static window) |
-| `recent_replication` | Replication lag (last 2 hours, from snapshots) |
-| `deltas`             | Snapshot-over-snapshot changes              |
-| `capacity_dashboard` | At-a-glance resource utilization and headroom assessment |
-
-**Dynamic Retention Functions** (use these for mode-aware retention):
-
-- `recent_waits_current()` - Returns waits with retention matching current mode (6-10 hours)
-- `recent_activity_current()` - Returns activity with mode-aware retention
-- `recent_locks_current()` - Returns locks with mode-aware retention
-
-## Collection Modes
-
-Modes control **what** is collected and **how often**. Ultra-conservative 180s intervals with proactive throttling.
-
-| Mode        | Interval | Locks | Activity Detail | Use Case                     |
-|-------------|----------|-------|-----------------|------------------------------|
-| `normal`    | 180s     | Yes   | Full (25 rows)  | Default (recommended)        |
-| `light`     | 180s     | Yes   | Full (25 rows)  | Same as normal               |
-| `emergency` | 300s     | No    | Limited         | System stressed (2 sections) |
-
-```sql
-SELECT flight_recorder.set_mode('light');
+-- Check current mode
 SELECT * FROM flight_recorder.get_mode();
 
--- Ring buffer uses 180s intervals + proactive throttling (480 collections/day)
--- Emergency mode uses 300s intervals for 40% overhead reduction
+-- Change mode
+SELECT flight_recorder.set_mode('emergency');
 ```
 
-## Anomaly Detection
+The system can auto-switch modes based on load (see [Adaptive Mode](#adaptive-mode)).
 
-`anomaly_report()` auto-detects:
+### Glossary
 
-| Type                       | Meaning                                     |
-|----------------------------|---------------------------------------------|
-| `CHECKPOINT_DURING_WINDOW` | Checkpoint occurred (I/O spike)             |
-| `FORCED_CHECKPOINT`        | WAL exceeded max_wal_size                   |
-| `BUFFER_PRESSURE`          | Backends writing directly to disk           |
-| `BACKEND_FSYNC`            | Backends doing fsync (bgwriter overwhelmed) |
-| `TEMP_FILE_SPILLS`         | Queries spilling to disk (work_mem too low) |
-| `LOCK_CONTENTION`          | Sessions blocked on locks                   |
+| Term | Definition |
+|------|------------|
+| **HOT updates** | Heap-Only Tuple updates that modify row data without updating indexes, reducing I/O and bloat |
+| **wait_event** | PostgreSQL's classification of what a backend is waiting for (Lock, IO, CPU, etc.) |
+| **pg_cron** | PostgreSQL extension that schedules and executes jobs within the database |
+| **AccessShareLock** | Lightest lock level, acquired by SELECT statements; blocks only ACCESS EXCLUSIVE |
+| **fillfactor** | Table storage parameter controlling how full pages are packed; free space enables HOT updates |
+| **UNLOGGED** | Tables that skip WAL writes for performance; contents lost on crash |
+| **Ring buffer** | Fixed-size circular data structure that automatically overwrites oldest entries |
+
+---
+
+# Part II: Installation & Configuration
+
+## Installation
+
+### Basic Installation
+
+```bash
+psql -f install.sql
+```
+
+This creates the `flight_recorder` schema with all tables, functions, and views. Collection starts automatically via pg_cron jobs.
+
+### Pre-flight Validation
+
+Run before installation to check prerequisites:
+
+```sql
+SELECT * FROM flight_recorder.preflight_check();
+```
+
+Returns GO/NO-GO status with actionable recommendations.
+
+### Enabling and Disabling
+
+```sql
+-- Start collection (schedules pg_cron jobs)
+SELECT flight_recorder.enable();
+
+-- Stop all collection
+SELECT flight_recorder.disable();
+```
+
+### Uninstallation
+
+```sql
+SELECT flight_recorder.disable();
+DROP SCHEMA flight_recorder CASCADE;
+```
+
+Or use the uninstall script:
+
+```bash
+psql -f uninstall.sql
+```
+
+## Configuration Profiles
+
+Profiles provide pre-configured settings for common use cases. Start here instead of tuning individual parameters.
+
+### Profile Comparison
+
+| Profile | Interval | Overhead | Collectors | Safety | Retention | Archive |
+|---------|----------|----------|------------|--------|-----------|---------|
+| `default` | 180s | 0.013% | All | Balanced | 30d/7d | 15min/7d |
+| `production_safe` | 300s | 0.008% | Wait/activity | Aggressive | 30d/7d | 30min/14d |
+| `development` | 180s | 0.013% | All | Balanced | 7d/3d | 15min/3d |
+| `troubleshooting` | 60s | 0.04% | All + top 50 | Lenient | 7d/3d | 5min/7d |
+| `minimal_overhead` | 300s | 0.008% | Wait/activity | Very aggressive | 7d/3d | Disabled |
+| `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d | 15min/7d |
+
+### Profile Commands
+
+```sql
+-- List available profiles
+SELECT * FROM flight_recorder.list_profiles();
+
+-- Preview changes before applying
+SELECT * FROM flight_recorder.explain_profile('production_safe')
+WHERE will_change = true;
+
+-- Apply a profile
+SELECT * FROM flight_recorder.apply_profile('production_safe');
+
+-- Check which profile matches current config
+SELECT * FROM flight_recorder.get_current_profile();
+```
+
+### Choosing a Profile
+
+**`default`** — General-purpose monitoring. Start here.
+
+**`production_safe`** — Production with strict SLAs. 40% less overhead, aggressive safety thresholds, locks disabled.
+
+**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention.
+
+**`troubleshooting`** — Active incidents. High-frequency collection (60s), lenient safety thresholds. **Temporary use only**—switch back after incident.
+
+**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint, archives disabled.
+
+**`high_ddl`** — Multi-tenant SaaS, frequent schema changes. Pre-checks for DDL locks, fast lock timeout.
+
+### Combining Profiles with Overrides
+
+```sql
+-- Apply profile as base
+SELECT flight_recorder.apply_profile('production_safe');
+
+-- Override specific settings
+UPDATE flight_recorder.config SET value = '450' WHERE key = 'sample_interval_seconds';
+
+-- Verify result
+SELECT * FROM flight_recorder.get_current_profile();
+```
+
+## Advanced Configuration
+
+All settings stored in `flight_recorder.config`:
+
+```sql
+SELECT * FROM flight_recorder.config;
+```
+
+### Configuration Reference
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `sample_interval_seconds` | 180 | Ring buffer sample frequency |
+| `statements_interval_minutes` | 15 | pg_stat_statements collection interval |
+| `statements_top_n` | 20 | Number of top queries to capture |
+| `snapshot_based_collection` | true | Use temp table snapshot (reduces catalog locks) |
+| `adaptive_sampling` | true | Skip collection when system idle |
+| `adaptive_sampling_idle_threshold` | 5 | Skip if < N active connections |
+| `circuit_breaker_threshold_ms` | 1000 | Max collection duration before skip |
+| `circuit_breaker_enabled` | true | Enable circuit breaker |
+| `auto_mode_enabled` | true | Auto-adjust collection mode |
+| `auto_mode_connections_threshold` | 60 | % connections to trigger light mode |
+| `section_timeout_ms` | 250 | Per-section query timeout |
+| `lock_timeout_ms` | 100 | Max wait for catalog locks |
+| `skip_locks_threshold` | 50 | Skip lock collection if > N blocked |
+| `skip_activity_conn_threshold` | 100 | Skip activity if > N active connections |
+| `load_shedding_enabled` | true | Skip during high connection load |
+| `load_shedding_active_pct` | 70 | Skip if active connections > N% of max |
+| `load_throttle_enabled` | true | Skip during I/O/transaction pressure |
+| `load_throttle_xact_threshold` | 1000 | Skip if transactions > N/sec |
+| `load_throttle_blk_threshold` | 10000 | Skip if block I/O > N/sec |
+| `schema_size_warning_mb` | 5000 | Log warning at this schema size |
+| `schema_size_critical_mb` | 10000 | Auto-disable at this schema size |
+
+### Retention Settings
+
+Single authoritative reference for all retention periods:
+
+| Setting | Default | Tier | Purpose |
+|---------|---------|------|---------|
+| `aggregate_retention_days` | 7 | TIER 2 | Aggregated summaries |
+| `archive_retention_days` | 7 | TIER 1.5 | Raw sample archives |
+| `retention_snapshots_days` | 30 | TIER 3 | System stat snapshots |
+| `retention_statements_days` | 30 | TIER 3 | Query snapshots |
+| `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
+
+Ring buffer (TIER 1) self-cleans via slot overwrite—no retention setting needed.
+
+### Sample Intervals
+
+Single authoritative reference for sample timing:
+
+| Mode | Interval | Slots | Retention | Collections/Day |
+|------|----------|-------|-----------|-----------------|
+| `normal` | 180s | 120 | 6 hours | 480 |
+| `light` | 180s | 120 | 6 hours | 480 |
+| `emergency` | 300s | 120 | 10 hours | 288 |
+
+Formula: `retention = slots × interval` (120 × 180s = 21,600s = 6 hours)
+
+### Archive Settings
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `archive_samples_enabled` | true | Enable periodic raw sample archival |
+| `archive_sample_frequency_minutes` | 15 | How often to archive |
+| `archive_activity_samples` | true | Archive activity samples |
+| `archive_lock_samples` | true | Archive lock samples |
+| `archive_wait_samples` | true | Archive wait event samples |
+
+### Capacity Planning Settings
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `capacity_planning_enabled` | true | Enable capacity metrics collection |
+| `capacity_thresholds_warning_pct` | 60 | Warning threshold |
+| `capacity_thresholds_critical_pct` | 80 | Critical threshold |
+| `capacity_forecast_window_days` | 90 | Forecast window for projections |
+| `collect_database_size` | true | Collect db_size_bytes |
+| `collect_connection_metrics` | true | Collect connection metrics |
+
+### Threshold Tuning
+
+Safety thresholds control when collection skips or degrades:
+
+| Threshold | Default | Trigger |
+|-----------|---------|---------|
+| `circuit_breaker_threshold_ms` | 1000 | Collection took too long |
+| `load_shedding_active_pct` | 70 | Active connections exceed % of max |
+| `load_throttle_xact_threshold` | 1000 | Transactions/sec exceeded |
+| `load_throttle_blk_threshold` | 10000 | Block I/O/sec exceeded |
+| `auto_mode_connections_threshold` | 60 | % to trigger light mode |
+
+Adjust for your environment:
+
+```sql
+-- More conservative (earlier skipping)
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'load_shedding_active_pct';
+
+-- More aggressive (later skipping)
+UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active_pct';
+```
+
+---
+
+# Part III: Usage
+
+## Functions Reference
+
+### Analysis Functions
+
+| Function | Purpose |
+|----------|---------|
+| `compare(start, end)` | Compare system stats between two timestamps |
+| `wait_summary(start, end)` | Aggregate wait events over time period |
+| `activity_at(timestamp)` | What was happening at a specific moment |
+| `anomaly_report(start, end)` | Auto-detect 6 issue types |
+| `summary_report(start, end)` | Comprehensive diagnostic report |
+| `statement_compare(start, end)` | Compare query performance (requires pg_stat_statements) |
+| `capacity_summary(time_window)` | Analyze resource utilization and headroom |
+
+### Control Functions
+
+| Function | Purpose |
+|----------|---------|
+| `enable()` | Start collection (schedules pg_cron jobs) |
+| `disable()` | Stop all collection |
+| `set_mode('normal'/'light'/'emergency')` | Adjust collection intensity |
+| `get_mode()` | Show current mode and settings |
+| `cleanup(interval)` | Delete old data (default: 7 days) |
+| `validate_config()` | Validate configuration settings |
+
+### Health & Monitoring Functions
+
+| Function | Purpose |
+|----------|---------|
+| `preflight_check()` | Pre-installation validation |
+| `quarterly_review()` | 90-day health check |
+| `health_check()` | Component status overview |
+| `ring_buffer_health()` | Ring buffer XID age, dead tuples, HOT updates |
+| `performance_report(interval)` | Flight recorder's own performance |
+| `check_alerts(interval)` | Active alerts (if enabled) |
+| `config_recommendations()` | Optimization suggestions |
+| `export_json(start, end)` | AI-friendly data export |
+
+### Internal Functions (pg_cron scheduled)
+
+| Function | Purpose |
+|----------|---------|
+| `snapshot()` | Collect system stats snapshot |
+| `sample()` | Collect ring buffer sample |
+| `flush_ring_to_aggregates()` | Flush ring buffer to durable aggregates |
+| `archive_ring_samples()` | Archive raw samples for forensic analysis |
+| `cleanup_aggregates()` | Clean old aggregate and archive data |
+
+## Views Reference
+
+| View | Purpose |
+|------|---------|
+| `recent_waits` | Wait events (10-hour window, covers all modes) |
+| `recent_activity` | Active sessions (10-hour window) |
+| `recent_locks` | Lock contention (10-hour window) |
+| `recent_replication` | Replication lag (2 hours, from snapshots) |
+| `deltas` | Snapshot-over-snapshot changes |
+| `capacity_dashboard` | Resource utilization and headroom |
+
+**Dynamic retention functions** return data matching current mode's retention:
+- `recent_waits_current()`
+- `recent_activity_current()`
+- `recent_locks_current()`
+
+## Common Workflows
+
+### Daily Monitoring
+
+```sql
+-- Quick health check
+SELECT * FROM flight_recorder.health_check();
+
+-- Capacity overview
+SELECT * FROM flight_recorder.capacity_dashboard;
+
+-- Recent activity summary
+SELECT backend_type, wait_event_type, count(*)
+FROM flight_recorder.recent_waits
+GROUP BY 1, 2
+ORDER BY 3 DESC;
+```
+
+### Incident Response
+
+1. Switch to troubleshooting mode for detailed data:
+
+```sql
+SELECT flight_recorder.apply_profile('troubleshooting');
+```
+
+2. Collect data for 10-15 minutes during the incident.
+
+3. Analyze:
+
+```sql
+-- What happened in the last hour?
+SELECT * FROM flight_recorder.anomaly_report(
+    now() - interval '1 hour',
+    now()
+);
+
+-- Detailed wait analysis
+SELECT * FROM flight_recorder.wait_summary(
+    now() - interval '1 hour',
+    now()
+);
+
+-- What was happening at a specific moment?
+SELECT * FROM flight_recorder.activity_at('2024-01-15 14:30:00');
+```
+
+4. Switch back to normal collection:
+
+```sql
+SELECT flight_recorder.apply_profile('default');
+```
+
+### Performance Analysis
+
+```sql
+-- Compare two time periods
+SELECT * FROM flight_recorder.compare(
+    '2024-01-15 10:00',
+    '2024-01-15 11:00'
+);
+
+-- Query performance changes (requires pg_stat_statements)
+SELECT * FROM flight_recorder.statement_compare(
+    '2024-01-15 10:00',
+    '2024-01-15 11:00'
+)
+WHERE mean_exec_time_delta_ms > 100
+ORDER BY mean_exec_time_delta_ms DESC;
+
+-- Recent snapshot deltas
+SELECT * FROM flight_recorder.deltas
+ORDER BY captured_at DESC
+LIMIT 10;
+```
+
+### Quarterly Review
+
+Run every 90 days:
+
+```sql
+SELECT * FROM flight_recorder.quarterly_review();
+```
+
+Returns health status with recommendations for each component.
+
+---
+
+# Part IV: Safety & Operations
+
+## Safety Mechanisms
+
+Flight Recorder includes multiple protections to minimize observer effect.
+
+### Observer Effect Overview
+
+**Measured overhead** (PostgreSQL 17.6, typical workload):
+
+| Metric | Value |
+|--------|-------|
+| Median collection time | 23ms |
+| P95 | 31ms |
+| P99 | 86ms |
+| Sustained CPU at 180s intervals | 0.013% |
+
+Overhead is roughly constant regardless of workload—the question is whether your system has ~25ms of headroom every 3 minutes.
+
+**Validated environments:**
+- Development laptops (M-series, Intel)
+- Supabase Micro (t4g.nano, 2 core ARM, 1GB RAM): 32ms median, 0.018% CPU
+
+Run `./benchmark/measure_absolute.sh` to measure in your environment.
+
+### Load Protection
+
+**Load Shedding** — Skips collection when connections are high:
+
+| Condition | Action |
+|-----------|--------|
+| Active connections > 70% of max_connections | Skip collection |
+| Configurable via `load_shedding_active_pct` | |
+
+**Load Throttling** — Skips during sustained heavy workload:
+
+| Condition | Action |
+|-----------|--------|
+| Transactions > 1,000/sec | Skip collection |
+| Block I/O > 10,000/sec | Skip collection |
+| Uses pg_stat_database rates | |
+
+Both enabled by default. Disable if needed:
+
+```sql
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'load_shedding_enabled';
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'load_throttle_enabled';
+```
+
+**pg_stat_statements Protection** — Skips when hash table utilization > 80% to prevent statement evictions.
+
+### Circuit Breaker
+
+Automatic protection when collections run slow:
+
+| Setting | Value |
+|---------|-------|
+| Threshold | 1000ms (configurable) |
+| Window | 15-minute moving average |
+| Action | Skip next collection |
+| Recovery | Auto-resume when system recovers |
+
+```sql
+-- View recent collection performance
+SELECT collection_type, started_at, duration_ms, success, skipped
+FROM flight_recorder.collection_stats
+ORDER BY started_at DESC LIMIT 10;
+
+-- Adjust threshold
+UPDATE flight_recorder.config SET value = '2000' WHERE key = 'circuit_breaker_threshold_ms';
+```
+
+### Adaptive Mode
+
+Automatically adjusts collection intensity:
+
+| Transition | Trigger |
+|------------|---------|
+| Normal → Light | Connections reach 60% of max |
+| Any → Emergency | Circuit breaker trips 3× in 10 minutes |
+| Emergency → Light | 10 minutes without trips |
+| Light → Normal | Load drops below threshold |
+
+Enabled by default. Disable:
+
+```sql
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'auto_mode_enabled';
+```
+
+### Storage Management
+
+**Schema size limits:**
+
+| Size | Action |
+|------|--------|
+| < 5GB | Normal operation |
+| 5-8GB | Proactive cleanup (5-day retention) |
+| 8-10GB | Warning state |
+| > 10GB | Aggressive cleanup (3-day), then disable if still over |
+| < 8GB (when disabled) | Auto-re-enable |
+
+The 2GB hysteresis (disable at 10GB, re-enable at 8GB) prevents flapping.
+
+```sql
+-- Check current storage status
+SELECT * FROM flight_recorder._check_schema_size();
+
+-- Adjust thresholds
+UPDATE flight_recorder.config SET value = '6000' WHERE key = 'schema_size_warning_mb';
+UPDATE flight_recorder.config SET value = '12000' WHERE key = 'schema_size_critical_mb';
+```
+
+### Job Health Monitoring
+
+Detects when pg_cron jobs are deleted, disabled, or broken.
+
+**Required jobs:**
+- `flight_recorder_sample` — Ring buffer sampling
+- `flight_recorder_snapshot` — System stats
+- `flight_recorder_flush` — Ring buffer → aggregates
+- `flight_recorder_cleanup` — Old data removal
+
+```sql
+-- Check job health
+SELECT * FROM flight_recorder.health_check()
+WHERE component = 'pg_cron Jobs';
+
+-- View jobs directly
+SELECT jobid, jobname, schedule, active
+FROM cron.job
+WHERE jobname LIKE 'flight_recorder%';
+
+-- Recreate missing jobs
+SELECT flight_recorder.enable();
+```
+
+### Job Deduplication
+
+Prevents job queue buildup during slow collections or outages. Each collection checks for already-running jobs and skips if found.
+
+```sql
+-- View deduplication skips
+SELECT started_at, collection_type, skipped_reason
+FROM flight_recorder.collection_stats
+WHERE skipped = true AND skipped_reason LIKE '%Job deduplication%'
+ORDER BY started_at DESC;
+```
+
+### Graceful Degradation
+
+Each collection section is wrapped in exception handlers:
+- Wait events fail → activity samples still collected
+- Lock detection fails → progress tracking continues
+- Partial data is better than no data during incidents
+
+## Catalog Lock Behavior
+
+Flight Recorder acquires AccessShareLock on system catalogs during collection. This is the lightest lock level and generally harmless.
+
+### System Views Accessed
+
+| View | Acquired By | Frequency |
+|------|-------------|-----------|
+| `pg_stat_activity` | sample(), snapshot() | Sample: adaptive, Snapshot: 5min |
+| `pg_stat_replication` | snapshot() | Every 5min |
+| `pg_locks` | sample() | Adaptive (if locks enabled) |
+| `pg_stat_statements` | snapshot() | Every 15min (if enabled) |
+
+### Lock Timeout Behavior
+
+Default `lock_timeout` = 100ms:
+- If catalog locked by DDL > 100ms: collection fails with timeout error
+- If collection starts before DDL: DDL waits up to 100ms behind flight recorder
+- Circuit breaker trips after 3 lock timeout failures in 15 minutes
+
+### Catalog Lock Minimization
+
+**Snapshot-based collection** (enabled by default): Creates temp table copy of `pg_stat_activity` once per sample. All sections query the temp table instead of hitting the catalog 3 times. Reduces catalog locks from 3 to 1 per sample (67% reduction).
+
+**OID storage**: Stores relation OIDs instead of names in lock_samples_ring, avoiding pg_class joins during collection. Name resolution happens at query time.
+
+### High-DDL Environments
+
+Validated: DDL blocking is negligible with snapshot-based collection.
+
+**Test results** (Supabase Micro, 202 DDL operations):
+- 0% blocking rate
+- 14 operations concurrent with collection—no delays
+
+If you experience DDL issues (frequent `lock_timeout` errors, circuit breaker trips):
+
+```sql
+-- Reduce lock timeout
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
+
+-- Use emergency mode during high-DDL periods
+SELECT flight_recorder.set_mode('emergency');
+
+-- Or apply high_ddl profile
+SELECT flight_recorder.apply_profile('high_ddl');
+```
+
+---
+
+# Part V: Capacity Planning
 
 ## Capacity Planning
 
-Flight Recorder now includes comprehensive capacity planning features to answer: **"Do I have the right amount of resources?"**
+Flight Recorder tracks resource utilization to answer: "Do I have the right amount of resources?"
 
 ### Overview
 
-Capacity planning extends the existing forensic capabilities with:
-
-- **Resource utilization tracking** across 6 dimensions
-- **Headroom assessment** for right-sizing decisions
-- **Trend analysis** to identify growth patterns
-- **Traffic light status** (healthy/warning/critical) for each resource
-- **Actionable recommendations** for addressing issues
-
-**Key principle:** Uses data already collected (every 5 minutes) with no additional overhead.
+Capacity planning uses data already collected (every 5 minutes) with no additional overhead. It provides:
+- Resource utilization across 6 dimensions
+- Headroom assessment for right-sizing
+- Trend analysis for growth patterns
+- Traffic light status (healthy/warning/critical)
+- Actionable recommendations
 
 ### Metrics Tracked
 
-Flight Recorder collects these capacity metrics in every snapshot:
+| Metric | Source | Purpose |
+|--------|--------|---------|
+| `xact_commit` | pg_stat_database | Committed transactions |
+| `xact_rollback` | pg_stat_database | Rolled back transactions |
+| `blks_read` | pg_stat_database | Blocks read from disk |
+| `blks_hit` | pg_stat_database | Blocks found in cache |
+| `connections_active` | pg_stat_activity | Non-idle connections |
+| `connections_total` | pg_stat_activity | All connections |
+| `connections_max` | max_connections | Configured limit |
+| `db_size_bytes` | pg_class.relpages | Database size (statistical estimate) |
 
-| Metric                | Source                  | What It Measures                          |
-|-----------------------|-------------------------|-------------------------------------------|
-| `xact_commit`         | pg_stat_database        | Committed transactions (cumulative)       |
-| `xact_rollback`       | pg_stat_database        | Rolled back transactions (cumulative)     |
-| `blks_read`           | pg_stat_database        | Blocks read from disk (cumulative)        |
-| `blks_hit`            | pg_stat_database        | Blocks found in cache (cumulative)        |
-| `connections_active`  | pg_stat_activity        | Active connections (non-idle)             |
-| `connections_total`   | pg_stat_activity        | Total connections (including idle)        |
-| `connections_max`     | max_connections setting | Configured connection limit               |
-| `db_size_bytes`       | pg_class.relpages       | Database size in bytes (statistical estimate, 95-99% accurate) |
-
-**Storage overhead:** ~40 bytes per snapshot = 11.5 KB/day (~0.5% increase)
-
-**Historical data:** Existing snapshots will have NULL values for capacity metrics (handled gracefully)
+Storage overhead: ~40 bytes per snapshot = 11.5 KB/day.
 
 ### Using capacity_summary()
 
-Analyzes resource utilization over a time window and provides status/recommendations.
-
-**Function signature:**
-
-```sql
-flight_recorder.capacity_summary(
-    p_time_window INTERVAL DEFAULT interval '24 hours'
-) RETURNS TABLE(
-    metric TEXT,
-    current_usage TEXT,
-    provisioned_capacity TEXT,
-    utilization_pct NUMERIC,
-    headroom_pct NUMERIC,
-    status TEXT,
-    recommendation TEXT
-)
-```
-
-**Example:**
+Analyzes resource utilization over a time window:
 
 ```sql
 -- Last 24 hours (default)
@@ -411,1310 +805,221 @@ SELECT * FROM flight_recorder.capacity_summary(interval '1 hour');
 
 **Output columns:**
 
-- `metric` - Resource dimension (connections, memory_shared_buffers, memory_work_mem, io_buffer_cache, storage_growth, transaction_rate)
-- `current_usage` - Human-readable current usage (e.g., "45 connections")
-- `provisioned_capacity` - Configured capacity (e.g., "100 max connections")
-- `utilization_pct` - Percentage of capacity used (0-100+)
-- `headroom_pct` - Available capacity remaining (can be negative if over-provisioned)
-- `status` - Traffic light: `healthy`, `warning`, `critical`, or `insufficient_data`
-- `recommendation` - Actionable advice (increase settings, investigate, monitor, etc.)
+| Column | Purpose |
+|--------|---------|
+| `metric` | Resource dimension |
+| `current_usage` | Human-readable current usage |
+| `provisioned_capacity` | Configured capacity |
+| `utilization_pct` | Percentage of capacity used |
+| `headroom_pct` | Available capacity remaining |
+| `status` | healthy / warning / critical / insufficient_data |
+| `recommendation` | Actionable advice |
 
 **Metrics analyzed:**
 
-1. **connections** - Active/total connections vs max_connections
-   - Status based on peak active connections vs max_connections
-   - Warning: ≥60% utilization
-   - Critical: ≥80% utilization
-   - Recommendation: Increase max_connections or investigate connection pooling
-
-2. **memory_shared_buffers** - Shared buffer pressure
-   - Monitors "backends writing buffers" events (backends bypassing bgwriter)
-   - Indicates shared_buffers exhaustion
-   - Warning: >1,000 backend buffer writes
-   - Critical: >10,000 backend buffer writes
-   - Recommendation: Increase shared_buffers or investigate write patterns
-
-3. **memory_work_mem** - Work memory adequacy
-   - Tracks temporary file spills to disk (queries exceeding work_mem)
-   - Warning: >100 MB temp file writes
-   - Critical: >1 GB temp file writes
-   - Recommendation: Increase work_mem or optimize queries
-
-4. **io_buffer_cache** - Buffer cache efficiency
-   - Buffer cache hit ratio: blks_hit / (blks_hit + blks_read) × 100
-   - Warning: <95% hit ratio
-   - Critical: <90% hit ratio
-   - Recommendation: Increase shared_buffers, investigate query patterns, or check disk I/O
-
-5. **storage_growth** - Database growth rate
-   - Linear regression of database size over time window
-   - Projects growth rate (MB/day)
-   - Warning: Growth rate detected (informational)
-   - Recommendation: Shows projected size at 30/60/90 days
-
-6. **transaction_rate** - Transaction throughput trends
-   - Tracks commits + rollbacks per second over time
-   - Uses linear regression to detect trends
-   - Status based on trend direction (increasing/stable/decreasing)
-   - Recommendation: Monitor for capacity planning
-
-**Status thresholds (configurable):**
-
-- `healthy` - Utilization < 60% (default)
-- `warning` - Utilization 60-80% (default)
-- `critical` - Utilization > 80% (default)
-- `insufficient_data` - <2 snapshots in time window
-
-**Handling insufficient data:**
-
-If fewer than 2 snapshots exist in the time window, returns:
-
-```
-metric: insufficient_data
-status: insufficient_data
-recommendation: "Need at least 2 snapshots for analysis. Wait 10 minutes or choose longer time window."
-```
-
-**Example output:**
-
-```sql
-SELECT * FROM flight_recorder.capacity_summary(interval '7 days');
-
--- Example results:
-┌────────────────────────┬────────────────┬─────────────────────┬─────────────────┬──────────────┬───────────┬──────────────────────────────────┐
-│ metric                 │ current_usage  │ provisioned_capacity│ utilization_pct │ headroom_pct │ status    │ recommendation                   │
-├────────────────────────┼────────────────┼─────────────────────┼─────────────────┼──────────────┼───────────┼──────────────────────────────────┤
-│ connections            │ 45 active      │ 100 max             │ 45.0            │ 55.0         │ healthy   │ Connection usage is healthy      │
-│ memory_shared_buffers  │ 1.2k writes    │ Low pressure        │ 12.0            │ 88.0         │ healthy   │ Shared buffer usage is healthy   │
-│ memory_work_mem        │ 50 MB spilled  │ Acceptable          │ 50.0            │ 50.0         │ healthy   │ work_mem usage is acceptable     │
-│ io_buffer_cache        │ 98.5% hit      │ >95% target         │ 98.5            │ 1.5          │ healthy   │ Cache hit ratio is excellent     │
-│ storage_growth         │ +125 MB/day    │ -                   │ -               │ -            │ warning   │ Growing 125 MB/day. In 30d: +4GB│
-│ transaction_rate       │ 850 TPS (avg)  │ Stable trend        │ -               │ -            │ healthy   │ Transaction rate is stable       │
-└────────────────────────┴────────────────┴─────────────────────┴─────────────────┴──────────────┴───────────┴──────────────────────────────────┘
-```
+| Metric | Warning | Critical | Issue |
+|--------|---------|----------|-------|
+| `connections` | ≥60% | ≥80% | Connection exhaustion |
+| `memory_shared_buffers` | >1k writes | >10k writes | Backends bypassing bgwriter |
+| `memory_work_mem` | >100 MB spilled | >1 GB spilled | Queries exceeding work_mem |
+| `io_buffer_cache` | <95% hit | <90% hit | Working set exceeds shared_buffers |
+| `storage_growth` | Growth detected | — | Informational |
+| `transaction_rate` | Trend-based | — | Throughput changes |
 
 ### Using capacity_dashboard
 
-At-a-glance view aggregating all capacity metrics with composite scores.
-
-**View structure:**
+At-a-glance view for monitoring:
 
 ```sql
 SELECT * FROM flight_recorder.capacity_dashboard;
 ```
 
-**Columns:**
+| Column | Purpose |
+|--------|---------|
+| `last_updated` | Most recent snapshot |
+| `overall_status` | Worst status across all dimensions |
+| `critical_issues` | Array of warnings |
+| `connections_status` | Connection status |
+| `connections_utilization_pct` | Connection % |
+| `memory_status` | Overall memory status |
+| `memory_pressure_score` | 0-100 composite score |
+| `io_status` | I/O and cache status |
+| `storage_growth_mb_per_day` | Growth rate |
 
-- `last_updated` - Timestamp of most recent snapshot
-- `connections_status` - Status for connections (healthy/warning/critical)
-- `connections_utilization_pct` - Connection utilization percentage
-- `connections_headroom` - Remaining connection capacity
-- `memory_status` - Overall memory status (worst of shared_buffers + work_mem)
-- `memory_pressure_score` - Composite memory pressure (0-100, weighted average)
-- `io_status` - I/O and cache status
-- `io_saturation_pct` - I/O saturation percentage (inverse of cache hit ratio)
-- `storage_status` - Storage growth status
-- `storage_utilization_pct` - Not applicable for growth metric
-- `storage_growth_mb_per_day` - Database growth rate (MB/day)
-- `overall_status` - Worst status across all dimensions
-- `critical_issues` - Array of warnings for critical/warning metrics
-
-**Composite memory_pressure_score calculation:**
-
-```
-memory_pressure_score = (shared_buffers_utilization × 0.6) + (work_mem_utilization × 0.4)
-```
-
-Weights reflect that shared_buffers exhaustion is typically more critical than work_mem spills.
-
-**Example:**
-
-```sql
-SELECT
-    last_updated,
-    overall_status,
-    connections_utilization_pct,
-    memory_pressure_score,
-    io_status,
-    storage_growth_mb_per_day,
-    critical_issues
-FROM flight_recorder.capacity_dashboard;
-
--- Example output:
-┌─────────────────────────┬────────────────┬──────────────────────────┬──────────────────────┬───────────┬──────────────────────────┬──────────────────────────────────────┐
-│ last_updated            │ overall_status │ connections_utilization  │ memory_pressure_score│ io_status │ storage_growth_mb_per_day│ critical_issues                      │
-├─────────────────────────┼────────────────┼──────────────────────────┼──────────────────────┼───────────┼──────────────────────────┼──────────────────────────────────────┤
-│ 2024-01-15 14:35:00     │ warning        │ 45.0                     │ 28.4                 │ healthy   │ 125.3                    │ {storage: growing 125MB/day}         │
-└─────────────────────────┴────────────────┴──────────────────────────┴──────────────────────┴───────────┴──────────────────────────┴──────────────────────────────────────┘
-```
-
-**Interpretation:**
-
-- `overall_status = warning` - At least one metric is in warning state
-- `critical_issues` - Lists specific concerns (review capacity_summary() for details)
-- Use this view for monitoring dashboards and alerts
+Memory pressure score: `(shared_buffers_utilization × 0.6) + (work_mem_utilization × 0.4)`
 
 ### Interpreting Results
 
-**Status Progression:**
+**Status progression:**
 
 ```
 healthy (< 60%) → warning (60-80%) → critical (> 80%)
 ```
 
 **When to act:**
-
-- **healthy** - No action needed, monitor periodically
-- **warning** - Review trends, plan capacity increases within 30-60 days
-- **critical** - Immediate action needed, risk of resource exhaustion
+- **healthy** — Monitor periodically
+- **warning** — Plan capacity increases within 30-60 days
+- **critical** — Immediate action needed
 
 **Common patterns:**
 
-1. **High connection utilization + low memory pressure**
-   - Likely: Many idle connections
-   - Action: Implement connection pooling (PgBouncer, pgpool)
-
-2. **Low connection utilization + high memory pressure**
-   - Likely: Individual queries are memory-intensive
-   - Action: Optimize queries, increase work_mem, or add shared_buffers
-
-3. **High I/O saturation + low cache hit ratio**
-   - Likely: Working set exceeds shared_buffers
-   - Action: Increase shared_buffers or optimize query access patterns
-
-4. **Steady storage growth + stable transaction rate**
-   - Likely: Normal business growth
-   - Action: Plan storage expansion based on growth rate
-
-5. **Sudden storage growth + increasing transaction rate**
-   - Likely: New feature launch or seasonal spike
-   - Action: Investigate data retention policies, consider partitioning
-
-**Forecasting example:**
-
-```sql
--- Storage growth forecast
-SELECT
-    metric,
-    current_usage,
-    recommendation
-FROM flight_recorder.capacity_summary(interval '30 days')
-WHERE metric = 'storage_growth';
-
--- Example output:
--- metric: storage_growth
--- current_usage: +4.2 GB over 30 days
--- recommendation: "Growing 140 MB/day. Projected: 30d: +4.2GB, 60d: +8.4GB, 90d: +12.6GB"
-```
-
-### Configuration
-
-Capacity planning configuration keys (all in `flight_recorder.config` table):
-
-```sql
-SELECT * FROM flight_recorder.config
-WHERE key LIKE 'capacity_%';
-```
-
-| Key                                   | Default | Purpose                                    |
-|---------------------------------------|---------|---------------------------------------------|
-| `capacity_planning_enabled`           | true    | Enable/disable capacity metrics collection  |
-| `capacity_thresholds_warning_pct`     | 60      | Warning threshold (percentage)              |
-| `capacity_thresholds_critical_pct`    | 80      | Critical threshold (percentage)             |
-| `capacity_forecast_window_days`       | 90      | Forecast window for growth projections      |
-| `snapshot_retention_days_extended`    | 90      | Extended retention for capacity analysis    |
-| `collect_database_size`               | true    | Collect db_size_bytes (fast statistical estimate from pg_class.relpages) |
-| `collect_connection_metrics`          | true    | Collect connection and transaction metrics  |
-
-**Adjust thresholds:**
-
-```sql
--- More conservative thresholds (earlier warnings)
-UPDATE flight_recorder.config SET value = '50' WHERE key = 'capacity_thresholds_warning_pct';
-UPDATE flight_recorder.config SET value = '70' WHERE key = 'capacity_thresholds_critical_pct';
-
--- More aggressive thresholds (later warnings)
-UPDATE flight_recorder.config SET value = '70' WHERE key = 'capacity_thresholds_warning_pct';
-UPDATE flight_recorder.config SET value = '90' WHERE key = 'capacity_thresholds_critical_pct';
-```
-
-**Disable database size collection** (rarely needed - statistical estimate is very cheap):
-
-```sql
--- Disable database size collection
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collect_database_size';
-```
-
-**Disable capacity planning entirely:**
-
-```sql
--- Stop collecting capacity metrics
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'capacity_planning_enabled';
-```
+| Pattern | Likely Cause | Action |
+|---------|--------------|--------|
+| High connection + low memory | Many idle connections | Connection pooling |
+| Low connection + high memory | Memory-intensive queries | Optimize queries, increase work_mem |
+| High I/O + low cache hit | Working set > shared_buffers | Increase shared_buffers |
+| Steady storage growth | Normal growth | Plan storage expansion |
+| Sudden growth + rising TPS | Feature launch, spike | Review retention policies |
 
 ### Practical Examples
 
-**Use Case 1: Sizing a new production instance**
+**Sizing a new production instance:**
 
 ```sql
--- Run in staging for 7 days with similar load
-SELECT
-    metric,
-    utilization_pct,
-    status,
-    recommendation
+-- Run in staging with similar load for 7 days
+SELECT metric, utilization_pct, status, recommendation
 FROM flight_recorder.capacity_summary(interval '7 days')
 ORDER BY utilization_pct DESC NULLS LAST;
 
--- Provision production with 2x headroom for critical resources
--- Example: If staging shows 40% connection utilization, provision 2x connections
+-- Provision production with 2× headroom for critical resources
 ```
 
-**Use Case 2: Identifying growth trends**
+**Storage growth forecast:**
 
 ```sql
--- 30-day analysis
-SELECT * FROM flight_recorder.capacity_summary(interval '30 days')
-WHERE metric = 'storage_growth';
-
--- Compare multiple time windows
-SELECT '7d' as window, * FROM flight_recorder.capacity_summary(interval '7 days')
-WHERE metric = 'storage_growth'
-UNION ALL
-SELECT '30d' as window, * FROM flight_recorder.capacity_summary(interval '30 days')
+SELECT metric, current_usage, recommendation
+FROM flight_recorder.capacity_summary(interval '30 days')
 WHERE metric = 'storage_growth';
 ```
 
-**Use Case 3: Pre-incident detection**
+**Pre-incident detection:**
 
 ```sql
--- Monitor dashboard view daily
-SELECT
-    overall_status,
-    critical_issues,
-    memory_pressure_score,
-    connections_utilization_pct
+-- Monitor daily
+SELECT overall_status, critical_issues, memory_pressure_score
 FROM flight_recorder.capacity_dashboard;
-
--- Alert on critical status
--- (Integrate with your monitoring system)
 ```
 
-**Use Case 4: Post-incident right-sizing**
+**Post-incident right-sizing:**
 
 ```sql
 -- Analyze peak usage during incident
-SELECT * FROM flight_recorder.capacity_summary(
-    interval '2 hours'  -- Incident window
-)
+SELECT * FROM flight_recorder.capacity_summary(interval '2 hours')
 WHERE status IN ('warning', 'critical');
-
--- Identify which resources were constrained
--- Increase those specific resources by 50-100%
 ```
 
-**Use Case 5: Cost optimization**
+**Cost optimization (find over-provisioned resources):**
 
 ```sql
--- Identify over-provisioned resources
-SELECT
-    metric,
-    utilization_pct,
-    headroom_pct,
-    recommendation
+SELECT metric, utilization_pct, headroom_pct
 FROM flight_recorder.capacity_summary(interval '30 days')
-WHERE utilization_pct < 30  -- Less than 30% utilized
+WHERE utilization_pct < 30
 ORDER BY utilization_pct;
-
--- Consider downsizing resources with consistent low utilization
 ```
 
-### Troubleshooting
+---
 
-**"insufficient_data" status:**
+# Part VI: Reference Material
 
-**Cause:** <2 snapshots in time window
+## Troubleshooting Guide
 
-**Solutions:**
+### Common Issues
+
+**"insufficient_data" status in capacity_summary:**
+
+Cause: < 2 snapshots in time window.
 
 ```sql
--- Wait 10 minutes for data collection
--- Or choose longer time window
+-- Wait 10 minutes, or use longer window
 SELECT * FROM flight_recorder.capacity_summary(interval '24 hours');
 
--- Check snapshot collection is running
+-- Verify snapshots are being collected
 SELECT count(*) FROM flight_recorder.snapshots
 WHERE captured_at > now() - interval '1 hour';
 -- Should return 12+ (collected every 5 minutes)
 
--- Verify collection is enabled
+-- Check collection status
 SELECT * FROM flight_recorder.health_check()
 WHERE component = 'Collection Status';
 ```
 
 **NULL values in capacity columns:**
 
-**Cause:** Historical snapshots before capacity planning was enabled
+Cause: Historical snapshots before capacity planning was enabled.
 
-**Impact:** Gracefully handled with COALESCE, may show "insufficient_data" for older time windows
+Impact: Gracefully handled. May show "insufficient_data" for older time windows.
 
-**Solution:** Wait for new data to accumulate (7+ days for meaningful trends)
-
-**Unexpected utilization percentages:**
-
-**Cause:** Cumulative statistics reset (pg_stat_reset() called)
-
-**Impact:** Deltas may be negative or incorrect for one time window
-
-**Solution:** capacity_summary() filters negative deltas automatically, will self-correct after next valid snapshot
-
-**Query performance:**
-
-**Typical execution time:** <500ms p95 for 30-day analysis
-
-**If slower:**
-
-```sql
--- Check snapshot table size
-SELECT count(*) FROM flight_recorder.snapshots;
-
--- Check retention settings
-SELECT * FROM flight_recorder.config
-WHERE key = 'retention_snapshots_days';
-
--- Consider reducing retention if table is very large (>100k rows)
-UPDATE flight_recorder.config SET value = '14' WHERE key = 'retention_snapshots_days';
-```
+Solution: Wait for new data (7+ days for meaningful trends).
 
 **Capacity metrics not collected:**
 
 ```sql
--- Verify capacity planning is enabled
+-- Verify enabled
 SELECT * FROM flight_recorder.config WHERE key = 'capacity_planning_enabled';
--- Should return: value = 'true'
 
--- Check for collection errors
+-- Check for errors
 SELECT * FROM flight_recorder.collection_stats
-WHERE success = false
-  AND started_at > now() - interval '1 hour'
+WHERE success = false AND started_at > now() - interval '1 hour'
 ORDER BY started_at DESC;
 
--- Manually trigger snapshot to test
+-- Test manually
 SELECT flight_recorder.snapshot();
 
--- Check if new capacity columns were populated
-SELECT
-    xact_commit,
-    connections_active,
-    connections_total,
-    db_size_bytes
+-- Verify columns populated
+SELECT xact_commit, connections_active, db_size_bytes
 FROM flight_recorder.snapshots
-ORDER BY captured_at DESC
-LIMIT 1;
--- Should return non-NULL values
+ORDER BY captured_at DESC LIMIT 1;
 ```
 
-**capacity_dashboard shows NULL:**
-
-**Cause:** Insufficient data or disabled capacity planning
-
-**Solution:**
+**Collection timing out:**
 
 ```sql
--- Test capacity_summary directly
-SELECT * FROM flight_recorder.capacity_summary(interval '24 hours');
+-- Check recent performance
+SELECT collection_type, avg(duration_ms), max(duration_ms)
+FROM flight_recorder.collection_stats
+WHERE started_at > now() - interval '1 hour'
+GROUP BY collection_type;
 
--- If returns "insufficient_data", wait for data collection
--- If returns actual metrics, dashboard will populate on next snapshot
-```
-
-### Integration with Existing Features
-
-**Combine with anomaly detection:**
-
-```sql
--- Detect capacity issues + anomalies
-SELECT 'CAPACITY' as source, metric as type, status as severity, recommendation as details
-FROM flight_recorder.capacity_summary(interval '24 hours')
-WHERE status IN ('warning', 'critical')
-UNION ALL
-SELECT 'ANOMALY' as source, anomaly_type as type, 'critical' as severity, details
-FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:00');
-```
-
-**Combine with performance analysis:**
-
-```sql
--- Correlate slow queries with resource constraints
-WITH capacity AS (
-    SELECT * FROM flight_recorder.capacity_summary(interval '1 hour')
-),
-slow_queries AS (
-    SELECT * FROM flight_recorder.statement_compare(
-        '2024-01-15 10:00',
-        '2024-01-15 11:00'
-    )
-    WHERE mean_exec_time_delta_ms > 100
-)
-SELECT
-    sq.query,
-    sq.mean_exec_time_delta_ms,
-    c.metric,
-    c.status
-FROM slow_queries sq
-CROSS JOIN capacity c
-WHERE c.status IN ('warning', 'critical');
-```
-
-**Profile-based configuration:**
-
-Capacity planning is enabled in all default profiles:
-
-- `default` - Full capacity tracking
-- `production_safe` - Full capacity tracking
-- `development` - Full capacity tracking
-- `troubleshooting` - Full capacity tracking
-- `minimal_overhead` - Capacity tracking enabled (adds negligible overhead)
-- `high_ddl` - Full capacity tracking
-
-**No additional configuration needed** - works out of the box.
-
-## Safety Features
-
-### Observer Effect
-
-Flight recorder has measurable overhead. **Ultra-conservative 180s default + proactive throttling minimizes impact.**
-
-**Measured Overhead** (PostgreSQL 17.6, 23MB database, 79 tables, Darwin arm64):
-
-Validated over 315 collections across 30 minutes:
-
-```
-Collection execution time: 23ms (median/P50)
-Mean: 24.9ms ± 11.5ms (stddev)
-P95: 31ms (95% complete within this time)
-P99: 86ms (99% complete within this time)
-Range: 19-145ms (outliers <1%)
-I/O per collection: ~4,084 blocks (mostly cached reads)
-
-At 180s intervals:
-  Sustained CPU: 0.013% (23ms / 180,000ms)
-  Peak impact: Brief 23ms spike every 3 minutes
-  Collections/day: 480
-
-Stability: EXCELLENT
-  - No drift or degradation over 30 minutes
-  - Consistent 21-27ms across time periods
-  - 99% of collections complete within 86ms
-```
-
-**Supabase Micro Instance** (t4g.nano, 2 core ARM, 1GB RAM, PostgreSQL 17.6):
-
-Validated over 59 collections across 10 minutes:
-
-```
-Collection execution time: 32ms (median/P50)
-Mean: 36.6ms ± 23.3ms (stddev)
-P95: 46ms (95% complete within this time)
-P99: 118ms (99% complete within this time)
-I/O per collection: ~5,381 blocks (mostly cached reads)
-
-At 180s intervals:
-  Sustained CPU: 0.018% (32ms / 180,000ms)
-  Peak impact: Brief 32ms spike every 3 minutes
-
-Headroom Assessment:
-  ✓ Supabase free tier: SAFE - only 32ms every 3 minutes
-  ✓ Resource-constrained systems: VALIDATED - works great even on 2 core/1GB
-```
-
-**Your mileage may vary.** Run `./benchmark/measure_absolute.sh` to measure in your environment.
-
-| Mode | Interval | Collections/Day | Sections | Timeout | Measured Cost* | Notes |
-|------|----------|-----------------|----------|---------|----------------|-------|
-| **Normal** | 180s | 480 | 3 | 1000ms | 0.013% CPU | Ultra-conservative + proactive throttling |
-| **Light** | 180s | 480 | 3 | 1000ms | 0.013% CPU | Same as normal |
-| **Emergency** | 300s | 288 | 2 | 1000ms | 0.008% CPU | Wait events, activity only (locks disabled) |
-
-\* Sustained CPU percentage on reference environment. Actual execution cost is ~23ms per collection (measured from 315 real collections).
-
-**Additional Resource Costs:**
-
-- **Catalog locks**: 1 AccessShareLock per sample (480x/day vs original 1440x/day = 67% reduction)
-- **Lock timeout**: 100ms - fails fast if catalogs are locked
-- **Statement timeout**: 1000ms (reduced from 2000ms for tighter safety margin)
-- **Memory**: 2MB work_mem per collection (configurable)
-- **Storage**: ~2-3 GB for 7 days retention (UNLOGGED, no WAL overhead)
-- **pg_stat_statements**: 20 queries × 96 snapshots/day = 1,920 rows/day
-
-**Target Environments:**
-
-- ✓ Staging/dev (always-on monitoring recommended)
-- ✓ Production troubleshooting (enable during incidents, disable after)
-- ✓ Production always-on (ultra-conservative with proactive throttling, test in staging first)
-- ⚠ Resource-constrained databases (< 4 CPU cores, < 8GB RAM - monitor overhead)
-- ⚠ High-DDL workloads (frequent schema changes - load throttling helps but monitor)
-
-**Reducing Overhead:**
-
-```sql
--- Switch to light mode (disables progress tracking)
-SELECT flight_recorder.set_mode('light');
-
--- Switch to emergency mode (disables locks and progress)
+-- If consistently slow, switch to lighter mode
 SELECT flight_recorder.set_mode('emergency');
 
--- Stop completely
-SELECT flight_recorder.disable();
-
--- Validate your configuration
-SELECT * FROM flight_recorder.validate_config();
-```
-
-### Observer Effect Prevention
-
-Flight recorder is designed to minimize impact on the database it monitors:
-
-**Load Shedding**
-
-- Automatically skips collection when active connections > 70% of max_connections
-- Proactive protection against observer effect during high load
-- Configurable threshold via `load_shedding_active_pct` config
-- Enabled by default (set `load_shedding_enabled = 'false'` to disable)
-
-**Load Throttling**
-
-- **Transaction rate monitoring**: Skips when commits+rollbacks > 1,000/sec
-- **I/O pressure detection**: Skips when block reads+writes > 10,000/sec  
-- Prevents observer effect amplification during sustained heavy workloads
-- Uses pg_stat_database metrics (cumulative rates since stats_reset)
-- Configurable via `load_throttle_xact_threshold` and `load_throttle_blk_threshold`
-- Enabled by default (set `load_throttle_enabled = 'false'` to disable)
-
-**pg_stat_statements Overhead Protection**
-
-- Automatically skips collection when hash table utilization > 80%
-- Prevents statement evictions and hash table churn during collection
-- Monitors pg_stat_statements_info (PG14+) for dealloc count
-- Reduces observer effect on query tracking system itself
-- Always enabled when pg_stat_statements extension is available
-
-**UNLOGGED Tables**
-
-- 9 telemetry tables use UNLOGGED to eliminate WAL overhead
-- Only `config` (small config data) uses WAL
-- Data lost on crash is acceptable for telemetry
-
-**Per-Section Timeouts**
-
-- Each collection section has independent 250ms timeout (configurable)
-- Total statement timeout: 1000ms (reduced from 2000ms for tighter safety)
-- Prevents any single query from monopolizing resources
-- Timeout resets between sections and at function end
-
-**O(n) Lock Detection**
-
-- Uses `pg_blocking_pids()` instead of O(n^2) self-join on `pg_locks`
-- Scales linearly with connection count
-
-**Result Limits**
-
-- Lock samples: 100 max
-- Active sessions: 25 max
-- Statement snapshots: 20 max (configurable)
-
-### Circuit Breaker
-
-Automatic protection when collections run slow:
-
-```sql
--- View collection performance
-SELECT collection_type, started_at, duration_ms, success, skipped
-FROM flight_recorder.collection_stats
-ORDER BY started_at DESC LIMIT 10;
-```
-
-- Threshold: 1000ms (configurable)
-- Window: 15 minutes moving average
-- Auto-skips next collection if threshold exceeded
-- Auto-resumes when system recovers
-
-```sql
--- Configure
+-- Or increase timeout
 UPDATE flight_recorder.config SET value = '2000' WHERE key = 'circuit_breaker_threshold_ms';
 ```
 
-### Adaptive Mode
-
-Automatically adjusts collection intensity based on system load:
-
-- **Normal → Light**: When connections reach 60% of max_connections
-- **Any → Emergency**: When circuit breaker trips 3 times in 10 minutes
-- **Emergency → Light**: After 10 minutes without trips
-- **Light → Normal**: When load drops below threshold
-
-Enabled by default (`auto_mode_enabled = 'true'`).
-
-### Schema Size Limits
-
-- Warning at 5GB: Logs warning, continues
-- Critical at 10GB: Auto-disables collection
-- Check status: `SELECT * FROM flight_recorder._check_schema_size();`
-
-### Graceful Degradation
-
-Each collection section wrapped in exception handlers:
-
-- Wait events fail → activity samples still collected
-- Lock detection fails → progress tracking continues
-- Partial data better than no data during incidents
-
-### Job Deduplication
-
-**NEW**: Prevents pg_cron job queue buildup during slow collections or outages.
-
-**Problem:**
-
-- If `sample()` or `snapshot()` takes longer than the scheduled interval, pg_cron queues up the next job
-- During recovery from outages, multiple jobs can pile up
-- Result: Amplified observer effect during stress periods
-
-**Solution:**
-Each collection checks for already-running jobs before starting:
-
-- Queries `pg_stat_activity` for active `flight_recorder.sample()` or `flight_recorder.snapshot()` calls
-- If duplicate detected, skips this cycle and logs to `collection_stats`
-- Prevents queue buildup with zero configuration required
-
-**How to Monitor:**
+**Lock timeout errors:**
 
 ```sql
--- View job deduplication skips
-SELECT started_at, collection_type, skipped_reason
-FROM flight_recorder.collection_stats
-WHERE skipped = true
-  AND skipped_reason LIKE '%Job deduplication%'
-ORDER BY started_at DESC;
-```
-
-**Behavior:**
-
-- Automatic (no configuration needed)
-- Minimal overhead (~1ms per collection to check pg_stat_activity)
-- Logged as skipped collection with reason: "Job deduplication: N job(s) already running (PID: X)"
-
-### Auto-Recovery from Storage Breach
-
-**NEW**: Self-healing storage management with proactive cleanup.
-
-**Problem (previous behavior):**
-
-- At 10GB: Flight recorder disables collection
-- Requires manual intervention to re-enable
-- Monitoring stays offline indefinitely
-
-**Solution (upgraded):**
-
-Automatic storage management with hysteresis:
-
-| Size Range | Action | Result |
-|------------|--------|--------|
-| < 5GB | Normal operation | No action |
-| 5-8GB | Proactive cleanup (5 days retention) | Prevents reaching 10GB |
-| 8-10GB | Warning state | Continue monitoring |
-| > 10GB (when enabled) | 1. Try aggressive cleanup (3 days)<br>2. Disable only if still > 10GB | Self-healing |
-| < 8GB (when disabled) | Auto-re-enable | Recovery |
-
-**2GB Hysteresis:** Disable at 10GB, re-enable at 8GB (prevents flapping)
-
-**How to Monitor:**
-
-```sql
--- Check current storage status
-SELECT * FROM flight_recorder._check_schema_size();
-
--- Monitor auto-recovery events
-SELECT schema_size_mb, status, action_taken
-FROM flight_recorder._check_schema_size()
-WHERE status IN ('RECOVERED', 'CRITICAL');
-```
-
-**Configuration:**
-
-No configuration needed - works automatically. To adjust thresholds:
-
-```sql
--- Change warning threshold (default 5000 MB)
-UPDATE flight_recorder.config
-SET value = '6000'
-WHERE key = 'schema_size_warning_mb';
-
--- Change critical threshold (default 10000 MB)
-UPDATE flight_recorder.config
-SET value = '12000'
-WHERE key = 'schema_size_critical_mb';
-```
-
-**Manual Override:**
-
-```sql
--- Force enable even if over threshold
-SELECT flight_recorder.enable();
-
--- Force disable
-SELECT flight_recorder.disable();
-```
-
-### pg_cron Job Health Monitoring
-
-**NEW**: Detects silent failures when pg_cron jobs are deleted, disabled, or broken.
-
-**Problem (previous behavior):**
-
-- If pg_cron jobs are manually deleted/disabled, flight recorder fails silently
-- No alerting when collection stops due to missing jobs
-- Manual investigation required to diagnose
-
-**Solution (upgraded):**
-
-Automatic health checks for all 4 required pg_cron jobs:
-
-- `flight_recorder_sample` (adaptive frequency: 180s normal/light, 300s emergency - ring buffer)
-- `flight_recorder_snapshot` (every 5 minutes - system stats)
-- `flight_recorder_flush` (every 5 minutes - ring buffer → aggregates)
-- `flight_recorder_cleanup` (daily at 3 AM - old data cleanup)
-
-**Health Checks:**
-
-1. **Real-time:** `health_check()` function
-
-```sql
-SELECT * FROM flight_recorder.health_check()
-WHERE component = 'pg_cron Jobs';
--- Returns: OK, WARNING, or CRITICAL with specific missing/inactive jobs
-```
-
-1. **Quarterly Review:** `quarterly_review()` function (run every 90 days)
-
-```sql
-SELECT * FROM flight_recorder.quarterly_review()
-WHERE component LIKE '%pg_cron%';
--- Metric 7: Verifies all 4 jobs exist and are active
-```
-
-**Status Levels:**
-
-- **OK**: All 4 jobs exist and are active
-- **CRITICAL**: Jobs missing or inactive (specific jobs listed)
-- **ERROR**: Failed to check pg_cron (extension issue)
-
-**Recovery:**
-
-```sql
--- If jobs are missing or inactive
-SELECT flight_recorder.enable();
--- Recreates all 4 jobs
-```
-
-**How to Monitor:**
-
-```sql
--- Check all jobs manually
-SELECT jobid, jobname, schedule, active
-FROM cron.job
-WHERE jobname LIKE 'flight_recorder%'
-ORDER BY jobname;
-
--- View health status
-SELECT * FROM flight_recorder.health_check();
-
--- 90-day health report
-SELECT * FROM flight_recorder.quarterly_review();
-```
-
-## Configuration Profiles
-
-**Simplified Configuration:** Instead of managing 41+ individual parameters, use configuration profiles for common use cases.
-
-### Quick Start
-
-```sql
--- See available profiles
-SELECT * FROM flight_recorder.list_profiles();
-
--- Preview what a profile will change (without applying)
-SELECT * FROM flight_recorder.explain_profile('production_safe');
-
--- Apply a profile
-SELECT * FROM flight_recorder.apply_profile('production_safe');
-
--- Check which profile matches your current configuration
-SELECT * FROM flight_recorder.get_current_profile();
-```
-
-### Available Profiles
-
-#### `default` - Balanced Configuration
-
-**Use case:** General purpose monitoring for most environments
-
-**Key settings:**
-
-- Sample interval: 180s (every 3 minutes, 6h retention)
-- All safety features enabled (load shedding, throttling, circuit breaker)
-- Adaptive sampling enabled (skips when idle)
-- All collectors enabled (locks, progress, statements)
-- Archive: Enabled, 15-min frequency, 7-day retention, all types
-- Overhead: ~0.013% CPU sustained
-
-**When to use:**
-
-- First-time installation (this is the default)
-- Staging and development environments
-- General production monitoring
-
-```sql
-SELECT flight_recorder.apply_profile('default');
-```
-
-#### `production_safe` - Ultra-Conservative for Production
-
-**Use case:** Production always-on monitoring with maximum safety margins
-
-**Key settings:**
-
-- Sample interval: 300s (every 5 minutes, 10h retention) - 40% less overhead
-- Aggressive load shedding (60% vs 70% connection threshold)
-- Stricter circuit breaker (800ms vs 1000ms)
-- Locks and progress disabled (reduces catalog contention)
-- Faster lock timeout (50ms vs 100ms)
-- Archive: Enabled, 30-min frequency, 14-day retention, waits disabled
-- Overhead: ~0.008% CPU sustained
-
-**When to use:**
-
-- Production databases with strict SLAs
-- Systems running near capacity
-- Risk-averse deployments
-
-```sql
-SELECT flight_recorder.apply_profile('production_safe');
-```
-
-#### `development` - Balanced for Staging/Dev
-
-**Use case:** Active development and testing environments
-
-**Key settings:**
-
-- Sample interval: 180s (every 3 minutes, 6h retention)
-- Adaptive sampling **disabled** (always collect, even when idle)
-- All collectors enabled
-- Shorter retention (7 days snapshots, 3 days aggregates)
-- Archive: Enabled, 15-min frequency, 3-day retention, all types
-- Overhead: ~0.013% CPU sustained
-
-**When to use:**
-
-- Development databases
-- Staging environments
-- Testing and QA systems
-
-```sql
-SELECT flight_recorder.apply_profile('development');
-```
-
-#### `troubleshooting` - Aggressive Collection During Incidents
-
-**Use case:** Active incident response requiring detailed data
-
-**Key settings:**
-
-- Sample interval: 60s (every minute, 2h retention) - high frequency
-- Load shedding and throttling **disabled** (collect even under load)
-- All collectors enabled
-- More lenient circuit breaker (2000ms)
-- Collects top 50 queries (vs 20)
-- Archive: Enabled, 5-min frequency (aggressive), 7-day retention, all types
-- Overhead: ~0.04% CPU sustained
-
-**When to use:**
-
-- Active performance incidents
-- Debugging intermittent issues
-- Root cause analysis
-- **Temporary use only** - switch back after incident
-
-```sql
--- Enable during incident
-SELECT flight_recorder.apply_profile('troubleshooting');
-
--- Collect data for 10-15 minutes
-
--- Switch back to normal
-SELECT flight_recorder.apply_profile('default');
-```
-
-#### `minimal_overhead` - Absolute Minimum Footprint
-
-**Use case:** Resource-constrained systems, replicas, or minimal monitoring needs
-
-**Key settings:**
-
-- Sample interval: 300s (every 5 minutes, 10h retention)
-- Very aggressive load shedding (50% connection threshold)
-- Higher idle threshold (10 vs 5 connections)
-- Strict circuit breaker (500ms)
-- Locks, progress, and statements **disabled**
-- Archive: **Disabled** entirely (minimum overhead mode)
-- Overhead: ~0.008% CPU sustained
-
-**When to use:**
-
-- Replicas (monitoring followers)
-- Resource-constrained systems (< 4 CPU cores, < 8GB RAM)
-- Cost-sensitive deployments
-- Systems where even minimal overhead is unacceptable
-
-```sql
-SELECT flight_recorder.apply_profile('minimal_overhead');
-```
-
-#### `high_ddl` - Optimized for Frequent Schema Changes
-
-**Use case:** Multi-tenant SaaS or systems with high DDL frequency
-
-**Key settings:**
-
-- Sample interval: 180s (every 3 minutes, 6h retention)
-- Snapshot-based collection (critical for DDL safety)
-- Lock timeout strategy: `skip_if_locked` (pre-checks for DDL locks)
-- Very fast lock timeout (50ms)
-- Pre-collection DDL lock checks enabled
-- All collectors enabled
-- Archive: Enabled, 15-min frequency, 7-day retention, all types
-- Overhead: ~0.013% CPU sustained
-
-**When to use:**
-
-- Multi-tenant SaaS with per-tenant schemas
-- Systems with >10 DDL operations per hour
-- Migration-heavy workloads
-- Schema evolution during deployments
-
-```sql
-SELECT flight_recorder.apply_profile('high_ddl');
-```
-
-### Profile Comparison Table
-
-| Profile | Sample Interval | Overhead | Collectors | Safety | Retention | Archive |
-|---------|----------------|----------|------------|--------|-----------|---------|
-| `default` | 180s | 0.013% | All | Balanced | 30d/7d | 15min/7d (all) |
-| `production_safe` | 300s | 0.008% | Wait/activity only | Aggressive | 30d/7d | 30min/14d (no waits) |
-| `development` | 180s | 0.013% | All | Balanced | 7d/3d | 15min/3d (all) |
-| `troubleshooting` | 60s | 0.04% | All + top 50 queries | Lenient | 7d/3d | 5min/7d (all) |
-| `minimal_overhead` | 300s | 0.008% | Wait/activity only | Very aggressive | 7d/3d | Disabled |
-| `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d | 15min/7d (all) |
-
-### Advanced Usage
-
-**Check current configuration match:**
-
-```sql
--- See which profile you're closest to
-SELECT * FROM flight_recorder.get_current_profile();
-
--- Example output:
--- closest_profile | match_percentage | differences | recommendation
--- ----------------+------------------+-------------+----------------
--- production_safe | 85.7             | {enable_locks, lock_timeout_ms} | Configuration is close to "production_safe" profile
-```
-
-**Preview changes before applying:**
-
-```sql
--- See exactly what will change
-SELECT * FROM flight_recorder.explain_profile('production_safe')
-WHERE will_change = true
-ORDER BY setting_key;
-
--- Example output:
--- setting_key           | current_value | profile_value | will_change | description
--- ----------------------+---------------+---------------+-------------+-------------
--- enable_locks          | true          | false         | true        | Disable lock collection
--- lock_timeout_ms       | 100           | 50            | true        | Faster lock timeout
--- sample_interval_seconds| 180          | 300           | true        | Sample every 5 minutes
-```
-
-**Combine profiles with manual overrides:**
-
-```sql
--- Apply profile as base
-SELECT flight_recorder.apply_profile('production_safe');
-
--- Override specific settings
-UPDATE flight_recorder.config SET value = '450' WHERE key = 'sample_interval_seconds';
-UPDATE flight_recorder.config SET value = '14' WHERE key = 'retention_snapshots_days';
-
--- Verify
-SELECT * FROM flight_recorder.get_current_profile();
--- Shows: "Configuration is partially based on 'production_safe' profile"
-```
-
-### Recommended Workflow
-
-**Initial deployment:**
-
-1. Install with defaults: `psql -f install.sql`
-2. Optionally apply environment-specific profile
-3. Monitor for 24-48 hours
-4. Adjust if needed
-
-**Production rollout:**
-
-1. Test in staging with `development` profile
-2. Deploy to production with `production_safe` profile
-3. Monitor collection stats: `SELECT * FROM flight_recorder.health_check();`
-4. After 1 week, consider upgrading to `default` if overhead is acceptable
-
-**Incident response:**
-
-1. Switch to `troubleshooting` profile during active incident
-2. Collect detailed data for 10-15 minutes
-3. Switch back to previous profile after incident
-4. Analyze collected data at leisure
-
-**Cost optimization:**
-
-1. Start with `default` profile
-2. If overhead is concern, try `production_safe`
-3. If still too much, use `minimal_overhead`
-4. Monitor with `SELECT * FROM flight_recorder.performance_report('1 day');`
-
-## Configuration
-
-**Advanced users:** Direct access to all configuration parameters.
-
-All settings in `flight_recorder.config`:
-
-```sql
-SELECT * FROM flight_recorder.config;
-```
-
-Key settings:
-
-| Key                                 | Default | Purpose                                        |
-|-------------------------------------|---------|------------------------------------------------|
-| `circuit_breaker_threshold_ms`      | 1000    | Max collection duration                        |
-| `circuit_breaker_enabled`           | true    | Enable/disable circuit breaker                 |
-| `auto_mode_enabled`                 | true    | Auto-adjust collection mode                    |
-| `auto_mode_connections_threshold`   | 60      | % connections to trigger light mode            |
-| `section_timeout_ms`                | 250     | Per-section query timeout                      |
-| `lock_timeout_ms`                   | 100     | Max wait for catalog locks                     |
-| `skip_locks_threshold`              | 50      | Skip lock collection if > N blocked            |
-| `skip_activity_conn_threshold`      | 100     | Skip activity if > N active conns              |
-| `sample_interval_seconds`           | 180     | Adaptive frequency (180s default)              |
-| `statements_interval_minutes`       | 15      | pg_stat_statements collection interval         |
-| `statements_top_n`                  | 20      | Number of top queries to capture               |
-| `snapshot_based_collection`         | true    | Use temp table snapshot (reduces catalog locks)|
-| `adaptive_sampling`                 | false   | Skip collection when system idle               |
-| `adaptive_sampling_idle_threshold`  | 5       | Skip if < N active connections                 |
-| `load_shedding_enabled`             | true    | Skip during high load                          |
-| `load_shedding_active_pct`          | 70      | Skip if active conn > N% max                   |
-| `load_throttle_enabled`             | true    | Skip during I/O/txn pressure                   |
-| `load_throttle_xact_threshold`      | 1000    | Skip if commits+rollbacks > N/sec              |
-| `load_throttle_blk_threshold`       | 10000   | Skip if block I/O > N/sec                      |
-| `schema_size_warning_mb`            | 5000    | Warning threshold                              |
-| `schema_size_critical_mb`           | 10000   | Auto-disable threshold                         |
-| `retention_samples_days`            | 7       | Sample retention (legacy, ring buffers self-clean) |
-| `aggregate_retention_days`          | 7       | TIER 2 aggregate retention                     |
-| `retention_snapshots_days`          | 30      | TIER 3 snapshot retention                      |
-| `retention_statements_days`         | 30      | pg_stat_statements snapshot retention          |
-| `retention_collection_stats_days`   | 30      | Collection performance stats retention         |
-| `archive_samples_enabled`           | true    | Enable periodic raw sample archival            |
-| `archive_sample_frequency_minutes`  | 15      | How often to archive raw samples (TIER 1.5)    |
-| `archive_retention_days`            | 7       | TIER 1.5 archive retention                     |
-| `archive_activity_samples`          | true    | Archive activity samples (PIDs, sessions)      |
-| `archive_lock_samples`              | true    | Archive lock samples (blocking chains)         |
-| `archive_wait_samples`              | true    | Archive wait event samples                     |
-| `capacity_planning_enabled`         | true    | Enable capacity metrics collection             |
-| `capacity_thresholds_warning_pct`   | 60      | Warning threshold for capacity metrics         |
-| `capacity_thresholds_critical_pct`  | 80      | Critical threshold for capacity metrics        |
-| `capacity_forecast_window_days`     | 90      | Forecast window for growth projections         |
-| `snapshot_retention_days_extended`  | 90      | Extended retention for capacity analysis       |
-| `collect_database_size`             | true    | Collect db_size_bytes (fast statistical estimate) |
-| `collect_connection_metrics`        | true    | Collect connection and transaction metrics     |
-
-## Catalog Lock Contention
-
-Every collection acquires AccessShareLock on system catalogs (pg_stat_activity, pg_locks, etc.). This is generally harmless.
-
-**Catalog Lock Minimization:**
-
-- **Snapshot-based collection** (enabled by default): Creates temp table copy of `pg_stat_activity` once, then all sections query the temp table instead of the catalog. Reduces catalog locks from 3 to 1 per sample (67% reduction).
-- **OID storage**: Stores relation OIDs instead of names in `lock_samples_ring.locked_relation_oid`, avoiding `pg_class` joins during collection. Name resolution happens at query time in views using `::regclass` cast.
-
-### System Views Accessed
-
-| System View            | Lock Target          | Acquired By         | Frequency  |
-|------------------------|----------------------|---------------------|------------|
-| `pg_stat_activity`     | pg_stat_activity     | sample() + snapshot() | sample(): 180-300s (adaptive), snapshot(): 5min |
-| `pg_stat_replication`  | pg_stat_replication  | snapshot()          | Every 5min |
-| `pg_locks`             | pg_locks             | sample()            | 180-300s (adaptive, if locks enabled) |
-| `pg_stat_statements`   | pg_stat_statements   | snapshot()          | Every 15min (if enabled) |
-| `::regclass` casts     | pg_class             | Views (query-time)  | On demand (OID→name conversion) |
-
-### Lock Timeout Behavior
-
-Default `lock_timeout` = 100ms:
-
-- **If catalog is locked by DDL > 100ms**: Collection fails with lock timeout error
-- **If collection starts before DDL**: DDL operation waits up to 100ms behind flight recorder
-- **Circuit breaker**: After 3 lock timeout failures in 15 minutes, auto-switches to emergency mode
-
-### High-DDL Workloads
-
-**✓ VALIDATED: DDL blocking is negligible with snapshot-based collection**
-
-**Test Results** (Supabase Micro, PostgreSQL 17.6, 180s intervals):
-
-- 202 DDL operations (ALTER TABLE, CREATE INDEX, DROP, VACUUM)
-- **0% blocking rate** - No DDL operations delayed
-- Mean DDL duration: 1.61ms (unchanged whether concurrent with collection or not)
-- 14 operations ran concurrently with collection - no delays observed
-
-**Conclusion:** Snapshot-based collection (enabled by default) eliminates catalog lock contention. DDL operations complete normally even when concurrent with flight_recorder collection.
-
-**If You Experience DDL Issues:**
-
-Multi-tenant SaaS with *extremely* high DDL rates may see symptoms:
-
-- `collection_stats` shows frequent `lock_timeout` errors
-- Circuit breaker trips repeatedly
-- Auto-mode switches to emergency mode
-
-**Mitigations:**
-
-```sql
--- Option 1: Reduce lock_timeout further (fail even faster)
-UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
-
--- Option 2: Use emergency mode during high-DDL periods
-SELECT flight_recorder.set_mode('emergency');
-
--- Option 3: Disable during maintenance windows
-SELECT flight_recorder.disable();
-```
-
-**Check for lock failures:**
-
-```sql
-SELECT
-    collection_type,
-    count(*) AS lock_failures,
-    max(started_at) AS last_failure
+-- Check lock failures
+SELECT collection_type, count(*) as failures, max(started_at)
 FROM flight_recorder.collection_stats
 WHERE error_message LIKE '%lock_timeout%'
   AND started_at > now() - interval '1 hour'
 GROUP BY collection_type;
+
+-- Reduce lock timeout
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
 ```
 
-**Run DDL Impact Test:**
-
-```bash
-cd benchmark
-./measure_ddl_impact.sh 300 180  # 5 min test
-```
-
-## Advanced Optimizations
-
-Flight recorder includes advanced features to reduce overhead and catalog lock contention. Some are enabled by default, others are opt-in.
-
-### Snapshot-Based Collection (Phase 5B)
-
-**Purpose:** Reduce catalog locks from 3 to 1 per sample
-
-**How it works:** Creates a temp table snapshot of `pg_stat_activity` once per sample, then all sections query from the snapshot instead of querying the catalog 3 separate times.
-
-**Status:** ✓ Enabled by default
-
-**Impact:**
-
-- Catalog locks: 3 → 1 per sample (67% reduction)
-- Overhead: Negligible (temp table is ~100KB for 100 connections)
-- Consistency: All sections see same snapshot (more accurate)
-
-**To disable (not recommended):**
+**Load shedding skipping too often:**
 
 ```sql
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'snapshot_based_collection';
+-- Check skip reasons
+SELECT skipped_reason, count(*)
+FROM flight_recorder.collection_stats
+WHERE skipped = true AND started_at > now() - interval '24 hours'
+GROUP BY skipped_reason
+ORDER BY count(*) DESC;
+
+-- Adjust threshold
+UPDATE flight_recorder.config SET value = '80' WHERE key = 'load_shedding_active_pct';
 ```
 
-### Adaptive Sampling
+### Diagnostic Patterns
 
-**Purpose:** Reduce average overhead by skipping collection when system is idle
-
-**How it works:** Before each sample, checks active connection count. If fewer than threshold (default: 5), skips collection entirely.
-
-**Status:** ✓ Enabled by default
-
-**Impact:**
-
-- Overhead during idle: ~0% (skips collection)
-- Overhead during busy: 0.013-0.018% (unchanged)
-- Average overhead: Reduced 40-60% for workloads with idle periods
-
-**Trade-offs:**
-
-- May miss the *start* of an incident (first sample after idle period)
-- Non-uniform sampling (gaps in data during idle periods)
-- For 24/7 high-load systems, this provides no benefit (rarely idle)
-
-**To disable (if you need uniform sampling):**
+**Lock contention (batch slower than expected):**
 
 ```sql
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'adaptive_sampling';
-```
-
-**Adjust threshold:**
-
-```sql
--- Skip if < N active connections (default: 5)
-UPDATE flight_recorder.config SET value = '10' WHERE key = 'adaptive_sampling_idle_threshold';
-```
-
-### Ring Buffer Architecture
-
-**Ring buffer samples at fixed 60-second intervals** for consistent slot rotation. The 2-hour rolling window (120 slots) provides low-overhead, high-frequency sampling with <0.1% CPU overhead.
-
-To reduce overhead further, use `set_mode('emergency')` to disable lock collection while maintaining wait events and activity monitoring.
-
-### pg_stat_statements Tuning
-
-**Purpose:** Reduce memory pressure on pg_stat_statements hash table
-
-**Configure:**
-
-```sql
--- Collection interval (default: every 15 minutes)
-UPDATE flight_recorder.config SET value = '15' WHERE key = 'statements_interval_minutes';
-
--- Number of top queries to capture (default: 20)
-UPDATE flight_recorder.config SET value = '20' WHERE key = 'statements_top_n';
-```
-
-**Impact:**
-
-- Default: 20 queries × 96 snapshots/day = 1,920 rows/day
-- Old default: 50 queries × 288 snapshots/day = 14,400 rows/day (87% reduction)
-
-## Diagnostic Patterns
-
-### Lock Contention
-
-```sql
--- Symptoms: batch 10x slower than expected
 SELECT * FROM flight_recorder.recent_locks
 WHERE captured_at BETWEEN '...' AND '...';
 
@@ -1722,47 +1027,76 @@ SELECT * FROM flight_recorder.wait_summary('...', '...')
 WHERE wait_event_type = 'Lock';
 ```
 
-### Buffer Pressure
+**Buffer pressure (backends writing directly to disk):**
 
 ```sql
--- Symptoms: compare() shows bgw_buffers_backend_delta > 0
 SELECT * FROM flight_recorder.compare('...', '...');
--- Look for: backends writing directly = shared_buffers exhausted
+-- Look for: bgw_buffers_backend_delta > 0
 ```
 
-### Checkpoint Issues
+**Checkpoint issues (I/O spikes, slow commits):**
 
 ```sql
--- Symptoms: I/O spikes, slow commits
 SELECT * FROM flight_recorder.compare('...', '...');
 -- Look for: checkpoint_occurred = true, high ckpt_write_time_ms
 ```
 
-### Work_mem Exhaustion
+**work_mem exhaustion (slow sorts/joins):**
 
 ```sql
--- Symptoms: slow sorts/joins
 SELECT * FROM flight_recorder.compare('...', '...');
 -- Look for: temp_files_delta > 0, large temp_bytes_delta
 ```
 
-## Testing
+### Error Messages
 
-Run tests locally with Docker (supports PostgreSQL 15, 16, 17, 18):
+| Error | Cause | Resolution |
+|-------|-------|------------|
+| `lock_timeout` | Catalog locked by DDL | Reduce lock_timeout_ms or wait |
+| `statement_timeout` | Collection taking too long | Increase circuit_breaker_threshold_ms |
+| `Job deduplication` | Previous job still running | Normal during slow periods |
+| `Load shedding` | High connection count | Normal, adjust threshold if needed |
+| `Schema size critical` | > 10GB stored | Reduce retention, check cleanup job |
+
+## Anomaly Detection Reference
+
+`anomaly_report()` auto-detects these issue types:
+
+| Type | Meaning | Investigation |
+|------|---------|---------------|
+| `CHECKPOINT_DURING_WINDOW` | Checkpoint occurred (I/O spike) | Check checkpoint_completion_target |
+| `FORCED_CHECKPOINT` | WAL exceeded max_wal_size | Increase max_wal_size or checkpoint frequency |
+| `BUFFER_PRESSURE` | Backends writing directly to disk | Increase shared_buffers |
+| `BACKEND_FSYNC` | Backends doing fsync (bgwriter overwhelmed) | Tune bgwriter settings |
+| `TEMP_FILE_SPILLS` | Queries spilling to disk | Increase work_mem or optimize queries |
+| `LOCK_CONTENTION` | Sessions blocked on locks | Review blocking queries, add indexes |
+
+```sql
+SELECT * FROM flight_recorder.anomaly_report(
+    '2024-01-15 10:00',
+    '2024-01-15 11:00'
+);
+```
+
+## Testing and Benchmarking
+
+### Running Tests
+
+Run tests locally with Docker (supports PostgreSQL 15, 16, 17):
 
 ```bash
 # Test on PostgreSQL 16 (default)
 ./test.sh
 
 # Test on specific version
-./test.sh 15   # PostgreSQL 15
-./test.sh 17   # PostgreSQL 17
+./test.sh 15
+./test.sh 17
 
-# Test on all versions
-./test.sh all  # Tests 118 pgTAP tests on PG 15, 16, 17
+# Test all versions
+./test.sh all
 ```
 
-Or against your own PostgreSQL 15+ instance:
+Or against your own PostgreSQL instance:
 
 ```bash
 psql -f install.sql
@@ -1770,191 +1104,60 @@ psql -c "CREATE EXTENSION pgtap;"
 pg_prove -U postgres -d postgres flight_recorder_test.sql
 ```
 
-**Note:** VACUUM warnings during tests are expected (tests run in transactions).
+VACUUM warnings during tests are expected (tests run in transactions).
 
-## Benchmarking
+### Benchmarking Approach
 
-### Philosophy: No Benchmarketing
+Flight Recorder's overhead is roughly constant regardless of workload. The cost of `SELECT * FROM pg_stat_activity` doesn't scale with your TPS—it's an absolute cost.
 
-We are committed to honest, reproducible performance measurement based on a key insight:
+**The right question:** Does your system have ~25ms of headroom every 180 seconds?
 
-**The observer effect of flight recorder is roughly constant.**
-
-Running `SELECT * FROM pg_stat_activity` takes ~X milliseconds whether your database is idle or processing 10,000 TPS. The cost doesn't scale with load - it's an absolute cost.
-
-### What We Measure: Absolute Costs (Not Relative Impact)
-
-Traditional benchmarking asks: "Does this feature reduce TPS by 2%?"
-
-We ask instead: **"Does your system have X milliseconds of CPU headroom every 180 seconds?"**
-
-This reframes the question correctly:
-
-- ✓ Measure: Collection takes 150ms of CPU time
-- ✓ Calculate: At 180s intervals = 0.08% sustained CPU
-- ✓ Assess: Do you have 150ms spare capacity every 3 minutes?
-- ✗ ~~Measure TPS degradation under synthetic load~~ (not meaningful)
-
-### Why This Approach Is Better
-
-**The Math:**
-
-If one collection = 150ms:
-
-- At 180s intervals = 150ms / 180,000ms = **0.083% sustained CPU**
-- At 120s intervals = 150ms / 120,000ms = **0.125% sustained CPU**
-- At 60s intervals = 150ms / 60,000ms = **0.250% sustained CPU**
-
-This is **constant** regardless of your workload.
-
-**It's About Headroom:**
-
-The question isn't "will this slow down my database?" but rather:
-
-- On a tiny system (1 vCPU): Is 150ms every 180s too much?
-- On a loaded system (95% CPU): Will brief 150ms spikes cause problems?
-- On a large idle system: Obviously fine (plenty of headroom)
-
-**Two regimes matter:**
-
-1. **Tiny systems** - Constrained headroom even at idle
-2. **Heavily loaded systems** - Constrained headroom despite size
-
-### Running Benchmarks
-
-**Primary Benchmark: Absolute Costs (Run on any laptop):**
+**Measure absolute costs:**
 
 ```bash
 cd benchmark
 ./measure_absolute.sh 100  # 100 iterations
 ```
 
-**Measures:**
-
+This measures:
 - CPU time per collection (mean, p50, p95, p99)
 - I/O operations per collection
-- Memory usage during collection
-- Sustained CPU % at different intervals (60s, 120s, 180s)
+- Sustained CPU % at different intervals
 
-**Output Example** (MacBook Pro M-series, PostgreSQL 17.6):
+**Reference measurements:**
 
-```
-Actual Collection Execution (from 315 real collections over 30 minutes):
-  Median: 23.0 ms (P50)
-  Mean:   24.9 ms ± 11.5 ms (stddev)
-  P95:    31.0 ms, P99: 86.4 ms
+| Environment | Median | P95 | Sustained CPU |
+|-------------|--------|-----|---------------|
+| MacBook Pro (M-series) | 23ms | 31ms | 0.013% |
+| Supabase Micro (t4g.nano) | 32ms | 46ms | 0.018% |
 
-Sustained CPU Impact at 180s intervals:
-  0.013% sustained + brief 23ms spike every 3 min
+### Measuring Overhead
 
-Headroom Assessment:
-  ✓ 1 vCPU system: SAFE - only 23ms every 3 minutes
-  ✓ 2+ vCPU system: SAFE - negligible impact
-```
+**Decision framework:**
 
-**Supabase Micro validation** (t4g.nano, 2 core ARM, 1GB RAM):
+| Collection Time | Recommendation |
+|-----------------|----------------|
+| < 100ms | Safe everywhere |
+| 100-200ms | Safe on 2+ vCPU, test on 1 vCPU |
+| > 200ms | Investigate (database size? config?) |
 
-```
-Actual Collection Execution (59 collections over 10 minutes):
-  Median: 32.0 ms (P50)
-  Mean: 36.6 ms ± 23.3 ms
+**Tiny systems (1 vCPU, < 2GB RAM):** Test in staging for 24 hours before production.
 
-Sustained CPU Impact at 180s intervals:
-  0.018% sustained + brief 32ms spike every 3 min
+**Always-on production:** Start with `production_safe` profile, monitor, upgrade if comfortable.
 
-Result: SAFE even on smallest Supabase tier
-```
-
-**No need for:**
-
-- ✗ Expensive cloud hardware
-- ✗ Complex workload simulation
-- ✗ Hours of runtime
-- ✗ Statistical comparison of TPS degradation
-
-Just measure the actual cost directly.
-
-### Validation Workflow
-
-**1. Measure on laptop (5 minutes):**
-
-```bash
-./benchmark/measure_absolute.sh
-```
-
-**2. Test in staging:**
+**Measure in your environment:**
 
 ```sql
--- Install and monitor
-\i install.sql
-SELECT * FROM flight_recorder.preflight_check();
-```
+-- Check recent collection performance
+SELECT * FROM flight_recorder.performance_report('1 day');
 
-Watch for:
-
-- Collections timing out (check logs)
-- CPU spikes correlating with collections
-- Load shedding/throttling messages (normal under load)
-
-**3. Production rollout (gradual):**
-
-Start conservative, then relax if comfortable:
-
-```sql
--- Start with emergency mode (300s intervals)
-SELECT flight_recorder.apply_profile('production_safe');
-
--- Monitor for 24 hours, then upgrade if desired
-SELECT flight_recorder.apply_profile('default');  -- 180s intervals
-```
-
-### Decision Framework
-
-```
-Do you have absolute cost measurements?
-├─ No  → Run ./benchmark/measure_absolute.sh first
-└─ Yes → What's the mean collection time?
-         ├─ <100ms → Safe everywhere
-         ├─ 100-200ms → Safe on 2+ vCPU, test on 1 vCPU
-         └─ >200ms → Investigate why (database size? Config?)
-
-Is this a tiny system (1 vCPU, <2GB RAM)?
-├─ Yes → Test in staging for 24h before production
-└─ No  → Safe to deploy
-
-Is this always-on production?
-├─ Yes → Start with emergency mode, monitor, upgrade if comfortable
-└─ No  → Normal mode is fine (troubleshooting/staging)
-```
-
-### FAQ
-
-**Q: Do I need expensive hardware to benchmark?**
-A: No. Absolute costs are constant. Run on your laptop in 5 minutes.
-
-**Q: Do I need to simulate production load?**
-A: No. Collection cost doesn't depend on your workload. Load shedding/throttling handle that.
-
-**Q: What if my collection time is 500ms?**
-A: Investigate: How many tables? How many connections? Slow disk? Consider emergency mode (300s intervals).
-
-**Q: Should I measure on RDS/Cloud?**
-A: Useful to see if cloud overhead differs from local, but not required. The tool works the same everywhere.
-
-**Q: How often should I re-measure?**
-A: After major changes: significantly more tables (10x growth), PostgreSQL version upgrade, or hardware changes. Otherwise, costs are stable.
-
-## Uninstall
-
-```sql
-SELECT flight_recorder.disable();  -- Stop cron jobs
-DROP SCHEMA flight_recorder CASCADE;
-```
-
-Or use `uninstall.sql`:
-
-```bash
-psql -f uninstall.sql
+-- View collection stats
+SELECT collection_type,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) as p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) as p95
+FROM flight_recorder.collection_stats
+WHERE started_at > now() - interval '1 day'
+GROUP BY collection_type;
 ```
 
 ## Project Structure
@@ -1963,9 +1166,12 @@ psql -f uninstall.sql
 pg-flight-recorder/
 ├── install.sql                  # Installation script
 ├── uninstall.sql                # Uninstall script
-├── flight_recorder_test.sql     # pgTAP tests (118 tests)
+├── flight_recorder_test.sql     # pgTAP tests
 ├── docker-compose.yml           # PostgreSQL + pg_cron for testing
-├── test.sh                      # Test runner script
-├── README.md                    # Quick start
-└── REFERENCE.md                 # This file (full documentation)
+├── test.sh                      # Test runner
+├── README.md                    # Quick start guide
+├── REFERENCE.md                 # This file
+└── benchmark/
+    ├── measure_absolute.sh      # Overhead measurement
+    └── measure_ddl_impact.sh    # DDL interaction testing
 ```
