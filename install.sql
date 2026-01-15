@@ -37,6 +37,7 @@
 --      - Replication lag: per-replica write_lag, flush_lag, replay_lag
 --      - Temp files: cumulative temp files and bytes (work_mem spills)
 --      - pg_stat_io (PG16+): I/O by backend type
+--      - Capacity: transactions, I/O, connections, database size (for right-sizing)
 --
 -- QUICK START
 -- -----------
@@ -75,6 +76,10 @@
 --       Remove old flight recorder data.
 --       Returns: (deleted_snapshots, deleted_samples)
 --
+--   flight_recorder.capacity_summary(time_window DEFAULT '24 hours')
+--       Analyze resource utilization across 6 dimensions for capacity planning.
+--       Returns: metric, current_usage, utilization_pct, status, recommendation
+--
 -- VIEWS
 -- -----
 --   flight_recorder.deltas
@@ -101,6 +106,11 @@
 --       Replication lag from last 10 hours.
 --       Columns: captured_at, application_name, state, sync_state,
 --                replay_lag_bytes, replay_lag_pretty, write_lag, flush_lag, replay_lag
+--
+--   flight_recorder.capacity_dashboard
+--       At-a-glance capacity planning dashboard.
+--       Columns: connections_status, memory_status, io_status, storage_status,
+--                utilization percentages, memory_pressure_score, critical_issues
 --
 -- INTERPRETING RESULTS
 -- --------------------
@@ -6884,6 +6894,10 @@ BEGIN
     RAISE NOTICE '  2. Query any time window to diagnose performance:';
     RAISE NOTICE '     SELECT * FROM flight_recorder.compare(''2024-12-16 14:00'', ''2024-12-16 15:00'');';
     RAISE NOTICE '     SELECT * FROM flight_recorder.wait_summary(''2024-12-16 14:00'', ''2024-12-16 15:00'');';
+    RAISE NOTICE '';
+    RAISE NOTICE '  3. Check capacity and right-sizing:';
+    RAISE NOTICE '     SELECT * FROM flight_recorder.capacity_dashboard;';
+    RAISE NOTICE '     SELECT * FROM flight_recorder.capacity_summary(interval ''7 days'');';
     RAISE NOTICE '';
     RAISE NOTICE 'Views for recent activity:';
     RAISE NOTICE '  - flight_recorder.deltas            (snapshot deltas incl. temp files)';
