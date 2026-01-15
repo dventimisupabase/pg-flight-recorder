@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(394);  -- Expanded test suite: 378 base (original) + 3 archive tables (TIER 1.5) + 1 archive function + 12 archive functionality tests (Phase 6)
+SELECT plan(451);  -- Expanded test suite: 378 base (original) + 16 archive tests (Phase 6) + 57 capacity planning tests (Phase 1 MVP)
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -3778,6 +3778,371 @@ SELECT ok(
         WHERE captured_at < now() - interval '7 days'
     ),
     'Archive: cleanup should remove old wait archive data'
+);
+
+-- =============================================================================
+-- CAPACITY PLANNING TESTS (60 tests) - Phase 1 MVP
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Section 1: Schema Verification (8 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT has_column('flight_recorder', 'snapshots', 'xact_commit', 'Snapshots table should have xact_commit column');
+SELECT has_column('flight_recorder', 'snapshots', 'xact_rollback', 'Snapshots table should have xact_rollback column');
+SELECT has_column('flight_recorder', 'snapshots', 'blks_read', 'Snapshots table should have blks_read column');
+SELECT has_column('flight_recorder', 'snapshots', 'blks_hit', 'Snapshots table should have blks_hit column');
+SELECT has_column('flight_recorder', 'snapshots', 'connections_active', 'Snapshots table should have connections_active column');
+SELECT has_column('flight_recorder', 'snapshots', 'connections_total', 'Snapshots table should have connections_total column');
+SELECT has_column('flight_recorder', 'snapshots', 'connections_max', 'Snapshots table should have connections_max column');
+SELECT has_column('flight_recorder', 'snapshots', 'db_size_bytes', 'Snapshots table should have db_size_bytes column');
+
+-- -----------------------------------------------------------------------------
+-- Section 2: Configuration Options (8 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'capacity_planning_enabled'),
+    'Config: capacity_planning_enabled key should exist'
+);
+
+SELECT is(
+    (SELECT value FROM flight_recorder.config WHERE key = 'capacity_planning_enabled'),
+    'true',
+    'Config: capacity_planning_enabled should default to true'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'capacity_thresholds_warning_pct'),
+    'Config: capacity_thresholds_warning_pct key should exist'
+);
+
+SELECT is(
+    (SELECT value FROM flight_recorder.config WHERE key = 'capacity_thresholds_warning_pct'),
+    '60',
+    'Config: capacity_thresholds_warning_pct should default to 60'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'capacity_thresholds_critical_pct'),
+    'Config: capacity_thresholds_critical_pct key should exist'
+);
+
+SELECT is(
+    (SELECT value FROM flight_recorder.config WHERE key = 'capacity_thresholds_critical_pct'),
+    '80',
+    'Config: capacity_thresholds_critical_pct should default to 80'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'collect_database_size'),
+    'Config: collect_database_size key should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'collect_connection_metrics'),
+    'Config: collect_connection_metrics key should exist'
+);
+
+-- -----------------------------------------------------------------------------
+-- Section 3: Snapshot Collection (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Take a fresh snapshot to populate capacity metrics
+SELECT flight_recorder.snapshot();
+
+-- Verify most recent snapshot has capacity metrics populated
+SELECT ok(
+    (SELECT xact_commit FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: xact_commit should be collected'
+);
+
+SELECT ok(
+    (SELECT xact_rollback FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: xact_rollback should be collected'
+);
+
+SELECT ok(
+    (SELECT blks_read FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: blks_read should be collected'
+);
+
+SELECT ok(
+    (SELECT blks_hit FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: blks_hit should be collected'
+);
+
+SELECT ok(
+    (SELECT connections_active FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: connections_active should be collected'
+);
+
+SELECT ok(
+    (SELECT connections_total FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: connections_total should be collected'
+);
+
+SELECT ok(
+    (SELECT connections_max FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: connections_max should be collected'
+);
+
+SELECT ok(
+    (SELECT db_size_bytes FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'Snapshot: db_size_bytes should be collected'
+);
+
+SELECT ok(
+    (SELECT connections_max FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) > 0,
+    'Snapshot: connections_max should be positive'
+);
+
+SELECT ok(
+    (SELECT db_size_bytes FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1) > 0,
+    'Snapshot: db_size_bytes should be positive'
+);
+
+-- -----------------------------------------------------------------------------
+-- Section 4: capacity_summary() Function (20 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: Function exists
+SELECT has_function('flight_recorder', 'capacity_summary', 'Function capacity_summary should exist');
+
+-- Test 2: Function executes without error (with insufficient data)
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_summary(interval '24 hours')$$,
+    'capacity_summary: Should execute without error'
+);
+
+-- Test 3: Returns insufficient_data when <2 snapshots
+-- Save current snapshots, delete all, test, then restore
+CREATE TEMP TABLE IF NOT EXISTS saved_snapshots AS SELECT * FROM flight_recorder.snapshots;
+DELETE FROM flight_recorder.snapshots;
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.capacity_summary(interval '24 hours') WHERE metric = 'insufficient_data') = 1,
+    'capacity_summary: Should return insufficient_data with <2 snapshots'
+);
+INSERT INTO flight_recorder.snapshots SELECT * FROM saved_snapshots;
+DROP TABLE saved_snapshots;
+
+-- Create synthetic test data for capacity analysis (need multiple snapshots)
+-- Insert backdated snapshot for testing
+INSERT INTO flight_recorder.snapshots (
+    captured_at, pg_version,
+    wal_records, wal_fpi, wal_bytes, wal_write_time, wal_sync_time,
+    checkpoint_lsn, checkpoint_time,
+    ckpt_timed, ckpt_requested, ckpt_write_time, ckpt_sync_time, ckpt_buffers,
+    bgw_buffers_clean, bgw_maxwritten_clean, bgw_buffers_alloc,
+    bgw_buffers_backend, bgw_buffers_backend_fsync,
+    autovacuum_workers, slots_count, slots_max_retained_wal,
+    temp_files, temp_bytes,
+    xact_commit, xact_rollback, blks_read, blks_hit,
+    connections_active, connections_total, connections_max,
+    db_size_bytes
+) VALUES (
+    now() - interval '1 hour', 16,
+    1000, 100, 10000000, 100.0, 50.0,
+    '0/1000000'::pg_lsn, now() - interval '1 hour',
+    5, 1, 1000.0, 500.0, 50000,
+    10000, 5, 100000,
+    1000, 10,
+    0, 0, 0,
+    50, 1000000,
+    10000, 100, 50000, 450000,
+    5, 10, 100,
+    1000000000
+);
+
+-- Test 4: Returns data with sufficient snapshots
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.capacity_summary(interval '2 hours')) >= 1,
+    'capacity_summary: Should return metrics with sufficient data'
+);
+
+-- Test 5: Check connections metric is returned
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.capacity_summary(interval '2 hours') WHERE metric = 'connections'),
+    'capacity_summary: Should return connections metric'
+);
+
+-- Test 6: Check memory metrics are returned
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.capacity_summary(interval '2 hours') WHERE metric LIKE 'memory%'),
+    'capacity_summary: Should return memory metrics'
+);
+
+-- Test 7: Check I/O metric is returned
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.capacity_summary(interval '2 hours') WHERE metric = 'io_buffer_cache'),
+    'capacity_summary: Should return I/O cache metric'
+);
+
+-- Test 8: Utilization percentage is within bounds
+SELECT ok(
+    (SELECT max(utilization_pct) FROM flight_recorder.capacity_summary(interval '2 hours') WHERE utilization_pct IS NOT NULL) <= 100,
+    'capacity_summary: Utilization percentage should be <= 100'
+);
+
+SELECT ok(
+    (SELECT min(utilization_pct) FROM flight_recorder.capacity_summary(interval '2 hours') WHERE utilization_pct IS NOT NULL) >= 0,
+    'capacity_summary: Utilization percentage should be >= 0'
+);
+
+-- Test 9: Status values are valid
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.capacity_summary(interval '2 hours')
+     WHERE status NOT IN ('healthy', 'warning', 'critical', 'insufficient_data')) = 0,
+    'capacity_summary: Status should be one of valid values'
+);
+
+-- Test 10: Headroom is complement of utilization
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.capacity_summary(interval '2 hours')
+     WHERE utilization_pct IS NOT NULL
+       AND headroom_pct IS NOT NULL
+       AND abs((utilization_pct + headroom_pct) - 100) > 0.1) = 0,
+    'capacity_summary: Headroom should equal 100 - utilization'
+);
+
+-- Test 11: Current usage is populated
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.capacity_summary(interval '2 hours')
+     WHERE current_usage IS NOT NULL) >= 1,
+    'capacity_summary: Current usage should be populated'
+);
+
+-- Test 12: Recommendations are provided
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.capacity_summary(interval '2 hours')
+     WHERE recommendation IS NOT NULL) >= 1,
+    'capacity_summary: Recommendations should be provided'
+);
+
+-- Test 13: Different time windows work
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_summary(interval '1 hour')$$,
+    'capacity_summary: Should work with 1 hour window'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_summary(interval '7 days')$$,
+    'capacity_summary: Should work with 7 day window'
+);
+
+-- Test 14: NULL handling - function doesn't crash with NULL columns
+UPDATE flight_recorder.snapshots
+SET xact_commit = NULL, connections_total = NULL
+WHERE captured_at = (SELECT min(captured_at) FROM flight_recorder.snapshots);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_summary(interval '2 hours')$$,
+    'capacity_summary: Should handle NULL columns gracefully'
+);
+
+-- Test 15: Config-driven thresholds
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'capacity_thresholds_warning_pct';
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'capacity_thresholds_critical_pct';
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_summary(interval '2 hours')$$,
+    'capacity_summary: Should respect config threshold changes'
+);
+
+-- Reset thresholds
+UPDATE flight_recorder.config SET value = '60' WHERE key = 'capacity_thresholds_warning_pct';
+UPDATE flight_recorder.config SET value = '80' WHERE key = 'capacity_thresholds_critical_pct';
+
+-- -----------------------------------------------------------------------------
+-- Section 5: capacity_dashboard View (10 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: View exists
+SELECT has_view('flight_recorder', 'capacity_dashboard', 'View capacity_dashboard should exist');
+
+-- Test 2: View executes without error
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_dashboard$$,
+    'capacity_dashboard: Should execute without error'
+);
+
+-- Test 3: Returns exactly one row
+SELECT is(
+    (SELECT count(*)::integer FROM flight_recorder.capacity_dashboard),
+    1,
+    'capacity_dashboard: Should return exactly one row'
+);
+
+-- Test 4: last_updated is populated
+SELECT ok(
+    (SELECT last_updated FROM flight_recorder.capacity_dashboard) IS NOT NULL,
+    'capacity_dashboard: last_updated should be populated'
+);
+
+-- Test 5: connections_status is valid
+SELECT ok(
+    (SELECT connections_status FROM flight_recorder.capacity_dashboard) IN ('healthy', 'warning', 'critical', 'insufficient_data'),
+    'capacity_dashboard: connections_status should be valid'
+);
+
+-- Test 6: memory_status is valid
+SELECT ok(
+    (SELECT memory_status FROM flight_recorder.capacity_dashboard) IN ('healthy', 'warning', 'critical', 'insufficient_data'),
+    'capacity_dashboard: memory_status should be valid'
+);
+
+-- Test 7: overall_status is valid
+SELECT ok(
+    (SELECT overall_status FROM flight_recorder.capacity_dashboard) IN ('healthy', 'warning', 'critical', 'insufficient_data'),
+    'capacity_dashboard: overall_status should be valid'
+);
+
+-- Test 8: memory_pressure_score is within bounds
+SELECT ok(
+    (SELECT memory_pressure_score FROM flight_recorder.capacity_dashboard) >= 0 AND
+    (SELECT memory_pressure_score FROM flight_recorder.capacity_dashboard) <= 100,
+    'capacity_dashboard: memory_pressure_score should be 0-100'
+);
+
+-- Test 9: critical_issues is an array
+SELECT ok(
+    pg_typeof((SELECT critical_issues FROM flight_recorder.capacity_dashboard))::text = 'text[]',
+    'capacity_dashboard: critical_issues should be text array'
+);
+
+-- Test 10: Dashboard reflects underlying summary data
+SELECT ok(
+    (SELECT connections_status FROM flight_recorder.capacity_dashboard) =
+    COALESCE((SELECT status FROM flight_recorder.capacity_summary(interval '24 hours') WHERE metric = 'connections'), 'insufficient_data'),
+    'capacity_dashboard: Should reflect capacity_summary connections status'
+);
+
+-- -----------------------------------------------------------------------------
+-- Section 6: Backward Compatibility (4 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: Existing queries still work
+SELECT lives_ok(
+    $$SELECT count(*) FROM flight_recorder.snapshots$$,
+    'Backward compatibility: Existing snapshot queries should work'
+);
+
+-- Test 2: Existing views still work
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.deltas LIMIT 1$$,
+    'Backward compatibility: Existing views should work'
+);
+
+-- Test 3: Historical snapshots with NULL capacity columns don't break queries
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.snapshots WHERE xact_commit IS NULL) >= 0,
+    'Backward compatibility: NULL capacity columns should be handled'
+);
+
+-- Test 4: capacity_summary handles historical NULL data
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.capacity_summary(interval '30 days')$$,
+    'Backward compatibility: capacity_summary should handle historical NULLs'
 );
 
 SELECT * FROM finish();

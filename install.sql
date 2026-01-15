@@ -342,6 +342,27 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
 
 -- -----------------------------------------------------------------------------
+-- Capacity Planning Columns (FR-1) - Added for capacity planning enhancements
+-- These columns track additional metrics needed for right-sizing and capacity analysis
+-- -----------------------------------------------------------------------------
+
+-- Transaction rate metrics (from pg_stat_database)
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS xact_commit BIGINT;
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS xact_rollback BIGINT;
+
+-- Block I/O metrics (from pg_stat_database)
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS blks_read BIGINT;
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS blks_hit BIGINT;
+
+-- Connection metrics (from pg_stat_activity and pg_settings)
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_active INTEGER;
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_total INTEGER;
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_max INTEGER;
+
+-- Database size metrics (from pg_database_size)
+ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS db_size_bytes BIGINT;
+
+-- -----------------------------------------------------------------------------
 -- Table: replication_snapshots - Per-replica stats captured with each snapshot
 -- REGULAR (LOGGED): Low-frequency, minimal WAL overhead, SURVIVES CRASHES
 -- -----------------------------------------------------------------------------
@@ -797,7 +818,15 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('archive_retention_days', '7'),           -- How long to keep archived samples (default: 7 days)
     ('archive_activity_samples', 'true'),      -- Archive activity samples (PIDs, queries, sessions)
     ('archive_lock_samples', 'true'),          -- Archive lock samples (blocking chains, PIDs)
-    ('archive_wait_samples', 'true')           -- Archive wait event samples (wait patterns)
+    ('archive_wait_samples', 'true'),          -- Archive wait event samples (wait patterns)
+    -- Capacity planning (FR-4: Phase 1 MVP)
+    ('capacity_planning_enabled', 'true'),     -- Enable capacity planning data collection
+    ('capacity_thresholds_warning_pct', '60'), -- Warning threshold for capacity utilization
+    ('capacity_thresholds_critical_pct', '80'), -- Critical threshold for capacity utilization
+    ('capacity_forecast_window_days', '90'),   -- Forecast horizon for capacity predictions (Phase 3)
+    ('snapshot_retention_days_extended', '90'), -- Extended retention for capacity planning
+    ('collect_database_size', 'true'),         -- Collect database size (pg_database_size - can be expensive)
+    ('collect_connection_metrics', 'true')     -- Collect connection metrics (active/total/max)
 ON CONFLICT (key) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
@@ -2572,6 +2601,16 @@ DECLARE
     v_should_skip BOOLEAN;
     -- OPTIMIZATION 3: Cache pg_control_checkpoint() result to avoid redundant calls
     v_checkpoint_info RECORD;
+    -- Capacity planning metrics (FR-1)
+    v_xact_commit BIGINT;
+    v_xact_rollback BIGINT;
+    v_blks_read BIGINT;
+    v_blks_hit BIGINT;
+    v_connections_active INTEGER;
+    v_connections_total INTEGER;
+    v_connections_max INTEGER;
+    v_db_size_bytes BIGINT;
+    v_capacity_enabled BOOLEAN;
 BEGIN
     -- P0 Safety: Check circuit breaker
     v_should_skip := flight_recorder._check_circuit_breaker('snapshot');
@@ -2738,6 +2777,60 @@ BEGIN
     END;
     END IF;
 
+    -- Section 3: Capacity planning metrics collection (FR-1)
+    -- Check if capacity planning is enabled
+    v_capacity_enabled := COALESCE(
+        flight_recorder._get_config('capacity_planning_enabled', 'true')::boolean,
+        true
+    );
+
+    IF v_capacity_enabled THEN
+    BEGIN
+        PERFORM flight_recorder._set_section_timeout();
+
+        -- Transaction and I/O metrics from pg_stat_database (already read for throttling in sample())
+        IF COALESCE(flight_recorder._get_config('collect_connection_metrics', 'true')::boolean, true) THEN
+            SELECT
+                xact_commit,
+                xact_rollback,
+                blks_read,
+                blks_hit
+            INTO v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit
+            FROM pg_stat_database
+            WHERE datname = current_database();
+        END IF;
+
+        -- Connection metrics (current state from pg_stat_activity and pg_settings)
+        IF COALESCE(flight_recorder._get_config('collect_connection_metrics', 'true')::boolean, true) THEN
+            v_connections_max := current_setting('max_connections')::integer;
+
+            SELECT
+                count(*) FILTER (WHERE state NOT IN ('idle')),
+                count(*)
+            INTO v_connections_active, v_connections_total
+            FROM pg_stat_activity;
+        END IF;
+
+        -- Database size (expensive query - make optional via config)
+        IF COALESCE(flight_recorder._get_config('collect_database_size', 'true')::boolean, true) THEN
+            v_db_size_bytes := pg_database_size(current_database());
+        END IF;
+
+        PERFORM flight_recorder._record_section_success(v_stat_id);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg-flight-recorder: Capacity planning metrics collection failed: %', SQLERRM;
+        -- Set defaults so snapshot can continue
+        v_xact_commit := NULL;
+        v_xact_rollback := NULL;
+        v_blks_read := NULL;
+        v_blks_hit := NULL;
+        v_connections_active := NULL;
+        v_connections_total := NULL;
+        v_connections_max := NULL;
+        v_db_size_bytes := NULL;
+    END;
+    END IF;
+
     IF v_pg_version = 17 THEN
         -- PG17: checkpointer stats in pg_stat_checkpointer
         INSERT INTO flight_recorder.snapshots (
@@ -2752,7 +2845,10 @@ BEGIN
             io_autovacuum_writes, io_autovacuum_write_time,
             io_client_writes, io_client_write_time,
             io_bgwriter_writes, io_bgwriter_write_time,
-            temp_files, temp_bytes
+            temp_files, temp_bytes,
+            xact_commit, xact_rollback, blks_read, blks_hit,
+            connections_active, connections_total, connections_max,
+            db_size_bytes
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2767,7 +2863,10 @@ BEGIN
             v_io_av_writes, v_io_av_write_time,
             v_io_client_writes, v_io_client_write_time,
             v_io_bgw_writes, v_io_bgw_write_time,
-            v_temp_files, v_temp_bytes
+            v_temp_files, v_temp_bytes,
+            v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
+            v_connections_active, v_connections_total, v_connections_max,
+            v_db_size_bytes
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_checkpointer c
         CROSS JOIN pg_stat_bgwriter b
@@ -2787,7 +2886,10 @@ BEGIN
             io_autovacuum_writes, io_autovacuum_write_time,
             io_client_writes, io_client_write_time,
             io_bgwriter_writes, io_bgwriter_write_time,
-            temp_files, temp_bytes
+            temp_files, temp_bytes,
+            xact_commit, xact_rollback, blks_read, blks_hit,
+            connections_active, connections_total, connections_max,
+            db_size_bytes
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2802,7 +2904,10 @@ BEGIN
             v_io_av_writes, v_io_av_write_time,
             v_io_client_writes, v_io_client_write_time,
             v_io_bgw_writes, v_io_bgw_write_time,
-            v_temp_files, v_temp_bytes
+            v_temp_files, v_temp_bytes,
+            v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
+            v_connections_active, v_connections_total, v_connections_max,
+            v_db_size_bytes
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -2817,7 +2922,10 @@ BEGIN
             bgw_buffers_clean, bgw_maxwritten_clean, bgw_buffers_alloc,
             bgw_buffers_backend, bgw_buffers_backend_fsync,
             autovacuum_workers, slots_count, slots_max_retained_wal,
-            temp_files, temp_bytes
+            temp_files, temp_bytes,
+            xact_commit, xact_rollback, blks_read, blks_hit,
+            connections_active, connections_total, connections_max,
+            db_size_bytes
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2828,7 +2936,10 @@ BEGIN
             b.buffers_clean, b.maxwritten_clean, b.buffers_alloc,
             b.buffers_backend, b.buffers_backend_fsync,
             v_autovacuum_workers, v_slots_count, v_slots_max_retained,
-            v_temp_files, v_temp_bytes
+            v_temp_files, v_temp_bytes,
+            v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
+            v_connections_active, v_connections_total, v_connections_max,
+            v_db_size_bytes
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -6073,6 +6184,624 @@ $$;
 
 COMMENT ON FUNCTION flight_recorder.quarterly_review_with_summary() IS
 'Quarterly health check with summary. Calls quarterly_review() twice - once for results, once to count. More expensive but includes summary row.';
+
+-- =============================================================================
+-- Capacity Planning Functions (FR-2.1) - Phase 1 MVP
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION flight_recorder.capacity_summary(
+    p_time_window INTERVAL DEFAULT interval '24 hours'
+)
+RETURNS TABLE(
+    metric                  TEXT,
+    current_usage           TEXT,
+    provisioned_capacity    TEXT,
+    utilization_pct         NUMERIC,
+    headroom_pct            NUMERIC,
+    status                  TEXT,
+    recommendation          TEXT
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_warning_pct INTEGER;
+    v_critical_pct INTEGER;
+    v_window_start TIMESTAMPTZ;
+
+    -- Connection metrics
+    v_current_connections INTEGER;
+    v_max_connections INTEGER;
+    v_avg_connections NUMERIC;
+    v_peak_connections INTEGER;
+
+    -- Memory metrics (shared_buffers pressure)
+    v_bgw_backend_total BIGINT;
+    v_bgw_backend_avg_per_min NUMERIC;
+    v_shared_buffers_setting TEXT;
+
+    -- Memory metrics (work_mem spills)
+    v_temp_bytes_total BIGINT;
+    v_temp_bytes_per_hour NUMERIC;
+
+    -- I/O metrics
+    v_blks_read_total BIGINT;
+    v_blks_hit_total BIGINT;
+    v_cache_hit_ratio NUMERIC;
+
+    -- Storage metrics
+    v_current_db_size BIGINT;
+    v_oldest_db_size BIGINT;
+    v_storage_growth_mb_per_day NUMERIC;
+
+    -- Transaction metrics
+    v_xact_total BIGINT;
+    v_xact_rate_avg NUMERIC;
+    v_xact_rate_peak NUMERIC;
+
+    v_window_hours NUMERIC;
+    v_sample_count INTEGER;
+BEGIN
+    -- Get thresholds from config
+    v_warning_pct := COALESCE(
+        flight_recorder._get_config('capacity_thresholds_warning_pct', '60')::integer,
+        60
+    );
+    v_critical_pct := COALESCE(
+        flight_recorder._get_config('capacity_thresholds_critical_pct', '80')::integer,
+        80
+    );
+
+    v_window_start := now() - p_time_window;
+    v_window_hours := EXTRACT(EPOCH FROM p_time_window) / 3600.0;
+
+    -- Check if we have sufficient data
+    SELECT count(*) INTO v_sample_count
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= v_window_start;
+
+    IF v_sample_count < 2 THEN
+        -- Insufficient data - return warning row
+        RETURN QUERY SELECT
+            'insufficient_data'::text,
+            NULL::text,
+            NULL::text,
+            NULL::numeric,
+            NULL::numeric,
+            'insufficient_data'::text,
+            format('Need at least 2 snapshots. Only %s found in window. Wait %s for capacity analysis.',
+                   v_sample_count,
+                   CASE WHEN v_sample_count = 0 THEN '5 minutes' ELSE 'a few more minutes' END)::text;
+        RETURN;
+    END IF;
+
+    -- =================================================================
+    -- METRIC 1: CONNECTIONS
+    -- =================================================================
+
+    -- Get max_connections setting
+    SELECT setting::integer INTO v_max_connections
+    FROM pg_settings WHERE name = 'max_connections';
+
+    -- Current connections (from most recent snapshot)
+    SELECT COALESCE(connections_total, 0)
+    INTO v_current_connections
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= v_window_start
+      AND connections_total IS NOT NULL
+    ORDER BY captured_at DESC
+    LIMIT 1;
+
+    -- Average and peak connections over window
+    SELECT
+        COALESCE(round(avg(connections_total), 0), 0),
+        COALESCE(max(connections_total), 0)
+    INTO v_avg_connections, v_peak_connections
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= v_window_start
+      AND connections_total IS NOT NULL;
+
+    IF v_current_connections IS NOT NULL THEN
+        metric := 'connections';
+        current_usage := format('%s current / %s avg / %s peak',
+                               v_current_connections,
+                               v_avg_connections::integer,
+                               v_peak_connections);
+        provisioned_capacity := v_max_connections::text;
+        utilization_pct := LEAST(100, round((v_peak_connections::numeric / NULLIF(v_max_connections, 0)) * 100, 1));
+        headroom_pct := CASE WHEN utilization_pct IS NOT NULL THEN round(GREATEST(0, 100 - utilization_pct), 1) ELSE NULL END;
+
+        status := CASE
+            WHEN utilization_pct >= v_critical_pct THEN 'critical'
+            WHEN utilization_pct >= v_warning_pct THEN 'warning'
+            ELSE 'healthy'
+        END;
+
+        recommendation := CASE
+            WHEN utilization_pct >= v_critical_pct THEN
+                format('CRITICAL: Peak connections at %s%%. Increase max_connections to %s+ or implement connection pooling (PgBouncer)',
+                       utilization_pct, (v_peak_connections * 1.5)::integer)
+            WHEN utilization_pct >= v_warning_pct THEN
+                format('WARNING: Peak connections at %s%%. Monitor closely. Consider connection pooling if trend continues.',
+                       utilization_pct)
+            WHEN utilization_pct < 40 THEN
+                format('HEALTHY: Peak usage %s%% (%s connections). max_connections may be over-provisioned (potential cost savings).',
+                       utilization_pct, v_peak_connections)
+            ELSE
+                format('HEALTHY: Peak usage %s%% with %s%% headroom. No action needed.',
+                       utilization_pct, headroom_pct)
+        END;
+
+        RETURN NEXT;
+    END IF;
+
+    -- =================================================================
+    -- METRIC 2: MEMORY - SHARED_BUFFERS PRESSURE
+    -- =================================================================
+
+    -- Calculate bgw_buffers_backend delta (backends writing buffers = shared_buffers pressure)
+    WITH buffer_deltas AS (
+        SELECT
+            s.captured_at,
+            s.bgw_buffers_backend - prev.bgw_buffers_backend AS backend_writes_delta,
+            EXTRACT(EPOCH FROM (s.captured_at - prev.captured_at)) / 60.0 AS interval_minutes
+        FROM flight_recorder.snapshots s
+        JOIN flight_recorder.snapshots prev ON prev.id = (
+            SELECT MAX(id) FROM flight_recorder.snapshots WHERE id < s.id
+        )
+        WHERE s.captured_at >= v_window_start
+          AND s.bgw_buffers_backend IS NOT NULL
+          AND prev.bgw_buffers_backend IS NOT NULL
+          AND s.bgw_buffers_backend >= prev.bgw_buffers_backend  -- Handle stats_reset
+    )
+    SELECT
+        GREATEST(0, COALESCE(sum(backend_writes_delta), 0)),
+        GREATEST(0, COALESCE(sum(backend_writes_delta) / NULLIF(sum(interval_minutes), 0), 0))
+    INTO v_bgw_backend_total, v_bgw_backend_avg_per_min
+    FROM buffer_deltas;
+
+    SELECT setting INTO v_shared_buffers_setting
+    FROM pg_settings WHERE name = 'shared_buffers';
+
+    -- Heuristic: >100 backend writes/min = warning, >1000/min = critical
+    metric := 'memory_shared_buffers';
+    current_usage := format('%s backend writes total (%s/min avg)',
+                           v_bgw_backend_total,
+                           round(v_bgw_backend_avg_per_min, 1));
+    provisioned_capacity := v_shared_buffers_setting;
+
+    -- Calculate pressure score (0-100 scale)
+    utilization_pct := CASE
+        WHEN v_bgw_backend_avg_per_min IS NULL OR v_bgw_backend_avg_per_min <= 0 THEN 0
+        WHEN v_bgw_backend_avg_per_min < 100 THEN round((v_bgw_backend_avg_per_min / 100.0) * 60, 1)
+        ELSE LEAST(100, round(60 + ((v_bgw_backend_avg_per_min - 100) / 900.0) * 40, 1))
+    END;
+    headroom_pct := round(GREATEST(0, 100 - utilization_pct), 1);
+
+    status := CASE
+        WHEN v_bgw_backend_avg_per_min >= 1000 THEN 'critical'
+        WHEN v_bgw_backend_avg_per_min >= 100 THEN 'warning'
+        ELSE 'healthy'
+    END;
+
+    recommendation := CASE
+        WHEN v_bgw_backend_avg_per_min >= 1000 THEN
+            format('CRITICAL: Heavy shared_buffers pressure (%s backend writes/min). Increase shared_buffers or reduce concurrent write load.',
+                   round(v_bgw_backend_avg_per_min, 1))
+        WHEN v_bgw_backend_avg_per_min >= 100 THEN
+            format('WARNING: Moderate shared_buffers pressure (%s backend writes/min). Monitor trend and consider increasing shared_buffers.',
+                   round(v_bgw_backend_avg_per_min, 1))
+        WHEN v_bgw_backend_total = 0 THEN
+            'HEALTHY: No shared_buffers pressure detected. Current setting appears adequate.'
+        ELSE
+            format('HEALTHY: Minimal shared_buffers pressure (%s backend writes/min). No action needed.',
+                   round(v_bgw_backend_avg_per_min, 1))
+    END;
+
+    RETURN NEXT;
+
+    -- =================================================================
+    -- METRIC 3: MEMORY - WORK_MEM (TEMP FILE SPILLS)
+    -- =================================================================
+
+    WITH temp_deltas AS (
+        SELECT
+            s.temp_bytes - prev.temp_bytes AS temp_bytes_delta
+        FROM flight_recorder.snapshots s
+        JOIN flight_recorder.snapshots prev ON prev.id = (
+            SELECT MAX(id) FROM flight_recorder.snapshots WHERE id < s.id
+        )
+        WHERE s.captured_at >= v_window_start
+          AND s.temp_bytes IS NOT NULL
+          AND prev.temp_bytes IS NOT NULL
+          AND s.temp_bytes >= prev.temp_bytes  -- Handle stats_reset
+    )
+    SELECT
+        COALESCE(sum(temp_bytes_delta), 0)
+    INTO v_temp_bytes_total
+    FROM temp_deltas;
+
+    v_temp_bytes_per_hour := v_temp_bytes_total / NULLIF(v_window_hours, 0);
+
+    metric := 'memory_work_mem';
+    current_usage := format('%s spilled (%s/hour)',
+                           flight_recorder._pretty_bytes(v_temp_bytes_total),
+                           flight_recorder._pretty_bytes(v_temp_bytes_per_hour::bigint));
+    provisioned_capacity := (SELECT setting FROM pg_settings WHERE name = 'work_mem');
+
+    -- Heuristic: <100MB/hour = healthy, 100MB-1GB/hour = warning, >1GB/hour = critical
+    utilization_pct := CASE
+        WHEN v_temp_bytes_per_hour IS NULL OR v_temp_bytes_per_hour <= 0 THEN 0
+        WHEN v_temp_bytes_per_hour < 104857600 THEN round((v_temp_bytes_per_hour / 104857600.0) * 60, 1)
+        ELSE LEAST(100, round(60 + ((v_temp_bytes_per_hour - 104857600) / 939524096.0) * 40, 1))
+    END;
+    headroom_pct := round(GREATEST(0, 100 - utilization_pct), 1);
+
+    status := CASE
+        WHEN v_temp_bytes_per_hour >= 1073741824 THEN 'critical'  -- >1GB/hour
+        WHEN v_temp_bytes_per_hour >= 104857600 THEN 'warning'     -- >100MB/hour
+        ELSE 'healthy'
+    END;
+
+    recommendation := CASE
+        WHEN v_temp_bytes_per_hour >= 1073741824 THEN
+            format('CRITICAL: Heavy temp file spills (%s/hour). Increase work_mem for affected queries or globally.',
+                   flight_recorder._pretty_bytes(v_temp_bytes_per_hour::bigint))
+        WHEN v_temp_bytes_per_hour >= 104857600 THEN
+            format('WARNING: Moderate temp file spills (%s/hour). Consider increasing work_mem for sort/hash operations.',
+                   flight_recorder._pretty_bytes(v_temp_bytes_per_hour::bigint))
+        WHEN v_temp_bytes_total = 0 THEN
+            'HEALTHY: No temp file spills detected. Queries fitting in work_mem.'
+        ELSE
+            format('HEALTHY: Minimal temp file spills (%s/hour). Current work_mem adequate.',
+                   flight_recorder._pretty_bytes(v_temp_bytes_per_hour::bigint))
+    END;
+
+    RETURN NEXT;
+
+    -- =================================================================
+    -- METRIC 4: I/O CAPACITY (BUFFER CACHE HIT RATIO)
+    -- =================================================================
+
+    WITH io_deltas AS (
+        SELECT
+            s.blks_read - prev.blks_read AS read_delta,
+            s.blks_hit - prev.blks_hit AS hit_delta
+        FROM flight_recorder.snapshots s
+        JOIN flight_recorder.snapshots prev ON prev.id = (
+            SELECT MAX(id) FROM flight_recorder.snapshots WHERE id < s.id
+        )
+        WHERE s.captured_at >= v_window_start
+          AND s.blks_read IS NOT NULL
+          AND prev.blks_read IS NOT NULL
+          AND s.blks_read >= prev.blks_read  -- Handle stats_reset
+    )
+    SELECT
+        COALESCE(sum(read_delta), 0),
+        COALESCE(sum(hit_delta), 0)
+    INTO v_blks_read_total, v_blks_hit_total
+    FROM io_deltas;
+
+    v_cache_hit_ratio := CASE
+        WHEN (v_blks_read_total + v_blks_hit_total) > 0
+        THEN round((v_blks_hit_total::numeric / (v_blks_read_total + v_blks_hit_total)) * 100, 2)
+        ELSE NULL
+    END;
+
+    metric := 'io_buffer_cache';
+    current_usage := format('%s%% cache hit ratio (%s reads / %s hits)',
+                           v_cache_hit_ratio,
+                           v_blks_read_total,
+                           v_blks_hit_total);
+    provisioned_capacity := 'Target: >95%';
+
+    -- Inverse utilization: lower cache hit = higher I/O "utilization"
+    utilization_pct := CASE
+        WHEN v_cache_hit_ratio IS NULL THEN NULL
+        WHEN v_cache_hit_ratio >= 95 THEN round((100 - v_cache_hit_ratio) * 20, 1)
+        ELSE round(100 - (v_cache_hit_ratio / 95.0) * 100, 1)
+    END;
+    headroom_pct := CASE WHEN utilization_pct IS NOT NULL THEN round(GREATEST(0, 100 - utilization_pct), 1) ELSE NULL END;
+
+    status := CASE
+        WHEN v_cache_hit_ratio IS NULL THEN 'insufficient_data'
+        WHEN v_cache_hit_ratio < 80 THEN 'critical'
+        WHEN v_cache_hit_ratio < 95 THEN 'warning'
+        ELSE 'healthy'
+    END;
+
+    recommendation := CASE
+        WHEN v_cache_hit_ratio IS NULL THEN
+            'Insufficient I/O data. Need more snapshots for cache hit ratio analysis.'
+        WHEN v_cache_hit_ratio < 80 THEN
+            format('CRITICAL: Poor cache hit ratio (%s%%). Increase shared_buffers or optimize queries to reduce I/O.',
+                   v_cache_hit_ratio)
+        WHEN v_cache_hit_ratio < 95 THEN
+            format('WARNING: Below-optimal cache hit ratio (%s%%). Consider increasing shared_buffers for better performance.',
+                   v_cache_hit_ratio)
+        ELSE
+            format('HEALTHY: Good cache hit ratio (%s%%). I/O performance is adequate.',
+                   v_cache_hit_ratio)
+    END;
+
+    RETURN NEXT;
+
+    -- =================================================================
+    -- METRIC 5: STORAGE (DATABASE SIZE GROWTH)
+    -- =================================================================
+
+    -- Get current and oldest db_size_bytes from window
+    SELECT
+        COALESCE(
+            (SELECT db_size_bytes FROM flight_recorder.snapshots
+             WHERE captured_at >= v_window_start AND db_size_bytes IS NOT NULL
+             ORDER BY captured_at DESC LIMIT 1),
+            0
+        ),
+        COALESCE(
+            (SELECT db_size_bytes FROM flight_recorder.snapshots
+             WHERE captured_at >= v_window_start AND db_size_bytes IS NOT NULL
+             ORDER BY captured_at ASC LIMIT 1),
+            0
+        )
+    INTO v_current_db_size, v_oldest_db_size;
+
+    IF v_current_db_size > 0 AND v_oldest_db_size > 0 THEN
+        -- Calculate growth rate
+        v_storage_growth_mb_per_day := ((v_current_db_size - v_oldest_db_size)::numeric / (1024.0 * 1024.0))
+                                       / NULLIF(v_window_hours / 24.0, 0);
+
+        metric := 'storage_growth';
+        current_usage := format('%s current size, growing %s MB/day',
+                               flight_recorder._pretty_bytes(v_current_db_size),
+                               CASE
+                                   WHEN v_storage_growth_mb_per_day < 0 THEN '~0'
+                                   ELSE round(v_storage_growth_mb_per_day, 1)::text
+                               END);
+        provisioned_capacity := 'Disk capacity dependent';
+
+        -- Growth rate heuristic: <1GB/day = healthy, 1-10GB/day = warning, >10GB/day = critical
+        utilization_pct := CASE
+            WHEN v_storage_growth_mb_per_day <= 0 THEN 0
+            WHEN v_storage_growth_mb_per_day < 1024 THEN round((v_storage_growth_mb_per_day / 1024.0) * 60, 1)
+            ELSE LEAST(100, round(60 + ((v_storage_growth_mb_per_day - 1024) / 9216.0) * 40, 1))
+        END;
+        headroom_pct := round(GREATEST(0, 100 - utilization_pct), 1);
+
+        status := CASE
+            WHEN v_storage_growth_mb_per_day >= 10240 THEN 'critical'  -- >10GB/day
+            WHEN v_storage_growth_mb_per_day >= 1024 THEN 'warning'     -- >1GB/day
+            ELSE 'healthy'
+        END;
+
+        recommendation := CASE
+            WHEN v_storage_growth_mb_per_day >= 10240 THEN
+                format('CRITICAL: Rapid storage growth (%s MB/day). Review VACUUM, bloat, and retention policies.',
+                       round(v_storage_growth_mb_per_day, 1))
+            WHEN v_storage_growth_mb_per_day >= 1024 THEN
+                format('WARNING: Significant storage growth (%s MB/day). Monitor disk capacity and plan expansion.',
+                       round(v_storage_growth_mb_per_day, 1))
+            WHEN v_storage_growth_mb_per_day < 0 THEN
+                'HEALTHY: Database size stable or shrinking (VACUUM/DELETE activity). No concerns.'
+            ELSE
+                format('HEALTHY: Moderate storage growth (%s MB/day). Current rate is sustainable.',
+                       round(v_storage_growth_mb_per_day, 1))
+        END;
+
+        RETURN NEXT;
+    END IF;
+
+    -- =================================================================
+    -- METRIC 6: TRANSACTION RATE TRENDS
+    -- =================================================================
+
+    WITH xact_deltas AS (
+        SELECT
+            (s.xact_commit + s.xact_rollback - prev.xact_commit - prev.xact_rollback) AS xact_delta,
+            EXTRACT(EPOCH FROM (s.captured_at - prev.captured_at)) AS interval_seconds
+        FROM flight_recorder.snapshots s
+        JOIN flight_recorder.snapshots prev ON prev.id = (
+            SELECT MAX(id) FROM flight_recorder.snapshots WHERE id < s.id
+        )
+        WHERE s.captured_at >= v_window_start
+          AND s.xact_commit IS NOT NULL
+          AND prev.xact_commit IS NOT NULL
+          AND (s.xact_commit + s.xact_rollback) >= (prev.xact_commit + prev.xact_rollback)  -- Handle stats_reset
+    )
+    SELECT
+        COALESCE(sum(xact_delta), 0),
+        COALESCE(round(avg(xact_delta / NULLIF(interval_seconds, 0)), 1), 0),
+        COALESCE(round(max(xact_delta / NULLIF(interval_seconds, 0)), 1), 0)
+    INTO v_xact_total, v_xact_rate_avg, v_xact_rate_peak
+    FROM xact_deltas;
+
+    IF v_xact_total > 0 THEN
+        metric := 'transaction_rate';
+        current_usage := format('%s total (%s/sec avg, %s/sec peak)',
+                               v_xact_total,
+                               v_xact_rate_avg,
+                               v_xact_rate_peak);
+        provisioned_capacity := 'Workload dependent';
+
+        -- Use peak rate for utilization (relative to typical PostgreSQL capacity)
+        -- Heuristic: <1000 tps = healthy, 1000-5000 = warning, >5000 = critical (needs review)
+        utilization_pct := CASE
+            WHEN v_xact_rate_peak IS NULL OR v_xact_rate_peak <= 0 THEN 0
+            WHEN v_xact_rate_peak < 1000 THEN round((v_xact_rate_peak / 1000.0) * 60, 1)
+            ELSE LEAST(100, round(60 + ((v_xact_rate_peak - 1000) / 4000.0) * 40, 1))
+        END;
+        headroom_pct := round(GREATEST(0, 100 - utilization_pct), 1);
+
+        status := CASE
+            WHEN v_xact_rate_peak >= 5000 THEN 'warning'
+            ELSE 'healthy'
+        END;
+
+        recommendation := CASE
+            WHEN v_xact_rate_peak >= 5000 THEN
+                format('High transaction rate (%s tps peak). Ensure connection pooling and monitoring CPU/I/O capacity.',
+                       v_xact_rate_peak)
+            WHEN v_xact_rate_avg < 10 THEN
+                format('Low transaction rate (%s tps avg). Database may be under-utilized.',
+                       v_xact_rate_avg)
+            ELSE
+                format('HEALTHY: Transaction rate %s tps avg, %s tps peak. Workload appears normal.',
+                       v_xact_rate_avg, v_xact_rate_peak)
+        END;
+
+        RETURN NEXT;
+    END IF;
+
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.capacity_summary(INTERVAL) IS
+'Capacity planning summary across all resource dimensions. Analyzes connections, memory (shared_buffers, work_mem), I/O (cache hit ratio), storage growth, and transaction rates over the specified time window. Returns utilization, status (healthy/warning/critical), and actionable recommendations. Part of Phase 1 MVP capacity planning enhancements (FR-2.1).';
+
+-- =============================================================================
+-- Capacity Planning View (FR-3.1) - Phase 1 MVP
+-- =============================================================================
+
+CREATE OR REPLACE VIEW flight_recorder.capacity_dashboard AS
+WITH
+-- Get most recent snapshot timestamp
+latest_snapshot AS (
+    SELECT max(captured_at) AS last_updated
+    FROM flight_recorder.snapshots
+),
+-- Get capacity summary for last 24 hours
+capacity_metrics AS (
+    SELECT
+        metric,
+        utilization_pct,
+        headroom_pct,
+        status,
+        recommendation
+    FROM flight_recorder.capacity_summary(interval '24 hours')
+    WHERE metric != 'insufficient_data'  -- Filter out insufficient data row
+),
+-- Aggregate metrics by dimension
+connections_metric AS (
+    SELECT
+        status AS connections_status,
+        utilization_pct AS connections_utilization_pct,
+        headroom_pct AS connections_headroom,
+        recommendation AS connections_recommendation
+    FROM capacity_metrics
+    WHERE metric = 'connections'
+),
+memory_sb_metric AS (
+    SELECT
+        status,
+        utilization_pct
+    FROM capacity_metrics
+    WHERE metric = 'memory_shared_buffers'
+),
+memory_wm_metric AS (
+    SELECT
+        status,
+        utilization_pct
+    FROM capacity_metrics
+    WHERE metric = 'memory_work_mem'
+),
+io_metric AS (
+    SELECT
+        status AS io_status,
+        utilization_pct AS io_saturation_pct,
+        recommendation AS io_recommendation
+    FROM capacity_metrics
+    WHERE metric = 'io_buffer_cache'
+),
+storage_metric AS (
+    SELECT
+        status AS storage_status,
+        utilization_pct AS storage_utilization_pct,
+        recommendation AS storage_recommendation
+    FROM capacity_metrics
+    WHERE metric = 'storage_growth'
+)
+SELECT
+    l.last_updated,
+
+    -- Connections
+    COALESCE(c.connections_status, 'insufficient_data') AS connections_status,
+    c.connections_utilization_pct,
+    c.connections_headroom,
+
+    -- Memory (composite score from shared_buffers + work_mem pressure)
+    CASE
+        WHEN ms.status IS NULL AND mw.status IS NULL THEN 'insufficient_data'
+        WHEN ms.status = 'critical' OR mw.status = 'critical' THEN 'critical'
+        WHEN ms.status = 'warning' OR mw.status = 'warning' THEN 'warning'
+        ELSE COALESCE(ms.status, mw.status, 'healthy')
+    END AS memory_status,
+    -- Memory pressure score: weighted average of shared_buffers (60%) + work_mem (40%)
+    GREATEST(0, LEAST(100, round(
+        COALESCE(ms.utilization_pct, 0) * 0.6 +
+        COALESCE(mw.utilization_pct, 0) * 0.4,
+        1
+    ))) AS memory_pressure_score,
+
+    -- I/O
+    COALESCE(io.io_status, 'insufficient_data') AS io_status,
+    io.io_saturation_pct,
+
+    -- Storage
+    COALESCE(s.storage_status, 'insufficient_data') AS storage_status,
+    s.storage_utilization_pct,
+    -- Extract growth rate from recommendation (parse "growing X MB/day")
+    CASE
+        WHEN s.storage_recommendation ~ 'growing [0-9\.]+' THEN
+            (regexp_match(s.storage_recommendation, 'growing ([0-9\.]+)'))[1]::numeric
+        ELSE NULL
+    END AS storage_growth_mb_per_day,
+
+    -- Overall status (worst across all dimensions)
+    CASE
+        WHEN 'critical' IN (
+            c.connections_status,
+            CASE WHEN ms.status = 'critical' OR mw.status = 'critical' THEN 'critical' END,
+            io.io_status,
+            s.storage_status
+        ) THEN 'critical'
+        WHEN 'warning' IN (
+            c.connections_status,
+            CASE WHEN ms.status = 'warning' OR mw.status = 'warning' THEN 'warning' END,
+            io.io_status,
+            s.storage_status
+        ) THEN 'warning'
+        WHEN 'insufficient_data' IN (
+            COALESCE(c.connections_status, 'insufficient_data'),
+            CASE WHEN ms.status IS NULL AND mw.status IS NULL THEN 'insufficient_data' END,
+            COALESCE(io.io_status, 'insufficient_data'),
+            COALESCE(s.storage_status, 'insufficient_data')
+        ) THEN 'insufficient_data'
+        ELSE 'healthy'
+    END AS overall_status,
+
+    -- Critical issues array (collect all critical/warning recommendations)
+    ARRAY_REMOVE(ARRAY[
+        CASE WHEN c.connections_status IN ('critical', 'warning')
+             THEN 'CONNECTIONS: ' || c.connections_recommendation END,
+        CASE WHEN ms.status IN ('critical', 'warning')
+             THEN 'MEMORY (shared_buffers): ' ||
+                  (SELECT recommendation FROM capacity_metrics WHERE metric = 'memory_shared_buffers') END,
+        CASE WHEN mw.status IN ('critical', 'warning')
+             THEN 'MEMORY (work_mem): ' ||
+                  (SELECT recommendation FROM capacity_metrics WHERE metric = 'memory_work_mem') END,
+        CASE WHEN io.io_status IN ('critical', 'warning')
+             THEN 'I/O: ' || io.io_recommendation END,
+        CASE WHEN s.storage_status IN ('critical', 'warning')
+             THEN 'STORAGE: ' || s.storage_recommendation END
+    ], NULL) AS critical_issues
+
+FROM latest_snapshot l
+LEFT JOIN connections_metric c ON true
+LEFT JOIN memory_sb_metric ms ON true
+LEFT JOIN memory_wm_metric mw ON true
+LEFT JOIN io_metric io ON true
+LEFT JOIN storage_metric s ON true;
+
+COMMENT ON VIEW flight_recorder.capacity_dashboard IS
+'At-a-glance capacity planning dashboard. Shows current status (healthy/warning/critical) across all resource dimensions: connections, memory, I/O, storage. Includes utilization percentages, composite memory pressure score, and array of critical issues requiring attention. Based on last 24 hours of data. Part of Phase 1 MVP capacity planning enhancements (FR-3.1).';
 
 -- Capture initial snapshot and sample
 SELECT flight_recorder.snapshot();
