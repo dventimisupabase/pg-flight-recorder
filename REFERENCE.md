@@ -16,6 +16,12 @@ Complete documentation for pg-flight-recorder.
 - [Three-Tier Architecture](#three-tier-architecture) - Data storage model
 - [Collection Modes](#collection-modes) - Sampling frequencies
 
+**Capacity Planning:**
+
+- [Capacity Planning](#capacity-planning) - Right-sizing and resource assessment
+- [Using capacity_summary()](#using-capacity_summary) - Analyze resource utilization
+- [Using capacity_dashboard](#using-capacity_dashboard) - At-a-glance capacity view
+
 **Advanced:**
 
 - [Configuration](#configuration) - Individual parameters (advanced users)
@@ -245,6 +251,7 @@ Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 dat
 | `anomaly_report(start, end)`    | Auto-detect 6 issue types                               |
 | `summary_report(start, end)`    | Comprehensive diagnostic report                         |
 | `statement_compare(start, end)` | Compare query performance (requires pg_stat_statements) |
+| `capacity_summary(time_window)` | Analyze resource utilization and headroom               |
 
 ### Control
 
@@ -295,6 +302,7 @@ Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 dat
 | `recent_locks`       | Lock contention (last 10 hours, static window) |
 | `recent_replication` | Replication lag (last 2 hours, from snapshots) |
 | `deltas`             | Snapshot-over-snapshot changes              |
+| `capacity_dashboard` | At-a-glance resource utilization and headroom assessment |
 
 **Dynamic Retention Functions** (use these for mode-aware retention):
 
@@ -332,6 +340,544 @@ SELECT * FROM flight_recorder.get_mode();
 | `BACKEND_FSYNC`            | Backends doing fsync (bgwriter overwhelmed) |
 | `TEMP_FILE_SPILLS`         | Queries spilling to disk (work_mem too low) |
 | `LOCK_CONTENTION`          | Sessions blocked on locks                   |
+
+## Capacity Planning
+
+Flight Recorder now includes comprehensive capacity planning features to answer: **"Do I have the right amount of resources?"**
+
+### Overview
+
+Capacity planning extends the existing forensic capabilities with:
+
+- **Resource utilization tracking** across 6 dimensions
+- **Headroom assessment** for right-sizing decisions
+- **Trend analysis** to identify growth patterns
+- **Traffic light status** (healthy/warning/critical) for each resource
+- **Actionable recommendations** for addressing issues
+
+**Key principle:** Uses data already collected (every 5 minutes) with no additional overhead.
+
+### Metrics Tracked
+
+Flight Recorder collects these capacity metrics in every snapshot:
+
+| Metric                | Source                  | What It Measures                          |
+|-----------------------|-------------------------|-------------------------------------------|
+| `xact_commit`         | pg_stat_database        | Committed transactions (cumulative)       |
+| `xact_rollback`       | pg_stat_database        | Rolled back transactions (cumulative)     |
+| `blks_read`           | pg_stat_database        | Blocks read from disk (cumulative)        |
+| `blks_hit`            | pg_stat_database        | Blocks found in cache (cumulative)        |
+| `connections_active`  | pg_stat_activity        | Active connections (non-idle)             |
+| `connections_total`   | pg_stat_activity        | Total connections (including idle)        |
+| `connections_max`     | max_connections setting | Configured connection limit               |
+| `db_size_bytes`       | pg_class.relpages       | Database size in bytes (statistical estimate, 95-99% accurate) |
+
+**Storage overhead:** ~40 bytes per snapshot = 11.5 KB/day (~0.5% increase)
+
+**Historical data:** Existing snapshots will have NULL values for capacity metrics (handled gracefully)
+
+### Using capacity_summary()
+
+Analyzes resource utilization over a time window and provides status/recommendations.
+
+**Function signature:**
+
+```sql
+flight_recorder.capacity_summary(
+    p_time_window INTERVAL DEFAULT interval '24 hours'
+) RETURNS TABLE(
+    metric TEXT,
+    current_usage TEXT,
+    provisioned_capacity TEXT,
+    utilization_pct NUMERIC,
+    headroom_pct NUMERIC,
+    status TEXT,
+    recommendation TEXT
+)
+```
+
+**Example:**
+
+```sql
+-- Last 24 hours (default)
+SELECT * FROM flight_recorder.capacity_summary();
+
+-- Last 7 days
+SELECT * FROM flight_recorder.capacity_summary(interval '7 days');
+
+-- Last hour
+SELECT * FROM flight_recorder.capacity_summary(interval '1 hour');
+```
+
+**Output columns:**
+
+- `metric` - Resource dimension (connections, memory_shared_buffers, memory_work_mem, io_buffer_cache, storage_growth, transaction_rate)
+- `current_usage` - Human-readable current usage (e.g., "45 connections")
+- `provisioned_capacity` - Configured capacity (e.g., "100 max connections")
+- `utilization_pct` - Percentage of capacity used (0-100+)
+- `headroom_pct` - Available capacity remaining (can be negative if over-provisioned)
+- `status` - Traffic light: `healthy`, `warning`, `critical`, or `insufficient_data`
+- `recommendation` - Actionable advice (increase settings, investigate, monitor, etc.)
+
+**Metrics analyzed:**
+
+1. **connections** - Active/total connections vs max_connections
+   - Status based on peak active connections vs max_connections
+   - Warning: ≥60% utilization
+   - Critical: ≥80% utilization
+   - Recommendation: Increase max_connections or investigate connection pooling
+
+2. **memory_shared_buffers** - Shared buffer pressure
+   - Monitors "backends writing buffers" events (backends bypassing bgwriter)
+   - Indicates shared_buffers exhaustion
+   - Warning: >1,000 backend buffer writes
+   - Critical: >10,000 backend buffer writes
+   - Recommendation: Increase shared_buffers or investigate write patterns
+
+3. **memory_work_mem** - Work memory adequacy
+   - Tracks temporary file spills to disk (queries exceeding work_mem)
+   - Warning: >100 MB temp file writes
+   - Critical: >1 GB temp file writes
+   - Recommendation: Increase work_mem or optimize queries
+
+4. **io_buffer_cache** - Buffer cache efficiency
+   - Buffer cache hit ratio: blks_hit / (blks_hit + blks_read) × 100
+   - Warning: <95% hit ratio
+   - Critical: <90% hit ratio
+   - Recommendation: Increase shared_buffers, investigate query patterns, or check disk I/O
+
+5. **storage_growth** - Database growth rate
+   - Linear regression of database size over time window
+   - Projects growth rate (MB/day)
+   - Warning: Growth rate detected (informational)
+   - Recommendation: Shows projected size at 30/60/90 days
+
+6. **transaction_rate** - Transaction throughput trends
+   - Tracks commits + rollbacks per second over time
+   - Uses linear regression to detect trends
+   - Status based on trend direction (increasing/stable/decreasing)
+   - Recommendation: Monitor for capacity planning
+
+**Status thresholds (configurable):**
+
+- `healthy` - Utilization < 60% (default)
+- `warning` - Utilization 60-80% (default)
+- `critical` - Utilization > 80% (default)
+- `insufficient_data` - <2 snapshots in time window
+
+**Handling insufficient data:**
+
+If fewer than 2 snapshots exist in the time window, returns:
+
+```
+metric: insufficient_data
+status: insufficient_data
+recommendation: "Need at least 2 snapshots for analysis. Wait 10 minutes or choose longer time window."
+```
+
+**Example output:**
+
+```sql
+SELECT * FROM flight_recorder.capacity_summary(interval '7 days');
+
+-- Example results:
+┌────────────────────────┬────────────────┬─────────────────────┬─────────────────┬──────────────┬───────────┬──────────────────────────────────┐
+│ metric                 │ current_usage  │ provisioned_capacity│ utilization_pct │ headroom_pct │ status    │ recommendation                   │
+├────────────────────────┼────────────────┼─────────────────────┼─────────────────┼──────────────┼───────────┼──────────────────────────────────┤
+│ connections            │ 45 active      │ 100 max             │ 45.0            │ 55.0         │ healthy   │ Connection usage is healthy      │
+│ memory_shared_buffers  │ 1.2k writes    │ Low pressure        │ 12.0            │ 88.0         │ healthy   │ Shared buffer usage is healthy   │
+│ memory_work_mem        │ 50 MB spilled  │ Acceptable          │ 50.0            │ 50.0         │ healthy   │ work_mem usage is acceptable     │
+│ io_buffer_cache        │ 98.5% hit      │ >95% target         │ 98.5            │ 1.5          │ healthy   │ Cache hit ratio is excellent     │
+│ storage_growth         │ +125 MB/day    │ -                   │ -               │ -            │ warning   │ Growing 125 MB/day. In 30d: +4GB│
+│ transaction_rate       │ 850 TPS (avg)  │ Stable trend        │ -               │ -            │ healthy   │ Transaction rate is stable       │
+└────────────────────────┴────────────────┴─────────────────────┴─────────────────┴──────────────┴───────────┴──────────────────────────────────┘
+```
+
+### Using capacity_dashboard
+
+At-a-glance view aggregating all capacity metrics with composite scores.
+
+**View structure:**
+
+```sql
+SELECT * FROM flight_recorder.capacity_dashboard;
+```
+
+**Columns:**
+
+- `last_updated` - Timestamp of most recent snapshot
+- `connections_status` - Status for connections (healthy/warning/critical)
+- `connections_utilization_pct` - Connection utilization percentage
+- `connections_headroom` - Remaining connection capacity
+- `memory_status` - Overall memory status (worst of shared_buffers + work_mem)
+- `memory_pressure_score` - Composite memory pressure (0-100, weighted average)
+- `io_status` - I/O and cache status
+- `io_saturation_pct` - I/O saturation percentage (inverse of cache hit ratio)
+- `storage_status` - Storage growth status
+- `storage_utilization_pct` - Not applicable for growth metric
+- `storage_growth_mb_per_day` - Database growth rate (MB/day)
+- `overall_status` - Worst status across all dimensions
+- `critical_issues` - Array of warnings for critical/warning metrics
+
+**Composite memory_pressure_score calculation:**
+
+```
+memory_pressure_score = (shared_buffers_utilization × 0.6) + (work_mem_utilization × 0.4)
+```
+
+Weights reflect that shared_buffers exhaustion is typically more critical than work_mem spills.
+
+**Example:**
+
+```sql
+SELECT
+    last_updated,
+    overall_status,
+    connections_utilization_pct,
+    memory_pressure_score,
+    io_status,
+    storage_growth_mb_per_day,
+    critical_issues
+FROM flight_recorder.capacity_dashboard;
+
+-- Example output:
+┌─────────────────────────┬────────────────┬──────────────────────────┬──────────────────────┬───────────┬──────────────────────────┬──────────────────────────────────────┐
+│ last_updated            │ overall_status │ connections_utilization  │ memory_pressure_score│ io_status │ storage_growth_mb_per_day│ critical_issues                      │
+├─────────────────────────┼────────────────┼──────────────────────────┼──────────────────────┼───────────┼──────────────────────────┼──────────────────────────────────────┤
+│ 2024-01-15 14:35:00     │ warning        │ 45.0                     │ 28.4                 │ healthy   │ 125.3                    │ {storage: growing 125MB/day}         │
+└─────────────────────────┴────────────────┴──────────────────────────┴──────────────────────┴───────────┴──────────────────────────┴──────────────────────────────────────┘
+```
+
+**Interpretation:**
+
+- `overall_status = warning` - At least one metric is in warning state
+- `critical_issues` - Lists specific concerns (review capacity_summary() for details)
+- Use this view for monitoring dashboards and alerts
+
+### Interpreting Results
+
+**Status Progression:**
+
+```
+healthy (< 60%) → warning (60-80%) → critical (> 80%)
+```
+
+**When to act:**
+
+- **healthy** - No action needed, monitor periodically
+- **warning** - Review trends, plan capacity increases within 30-60 days
+- **critical** - Immediate action needed, risk of resource exhaustion
+
+**Common patterns:**
+
+1. **High connection utilization + low memory pressure**
+   - Likely: Many idle connections
+   - Action: Implement connection pooling (PgBouncer, pgpool)
+
+2. **Low connection utilization + high memory pressure**
+   - Likely: Individual queries are memory-intensive
+   - Action: Optimize queries, increase work_mem, or add shared_buffers
+
+3. **High I/O saturation + low cache hit ratio**
+   - Likely: Working set exceeds shared_buffers
+   - Action: Increase shared_buffers or optimize query access patterns
+
+4. **Steady storage growth + stable transaction rate**
+   - Likely: Normal business growth
+   - Action: Plan storage expansion based on growth rate
+
+5. **Sudden storage growth + increasing transaction rate**
+   - Likely: New feature launch or seasonal spike
+   - Action: Investigate data retention policies, consider partitioning
+
+**Forecasting example:**
+
+```sql
+-- Storage growth forecast
+SELECT
+    metric,
+    current_usage,
+    recommendation
+FROM flight_recorder.capacity_summary(interval '30 days')
+WHERE metric = 'storage_growth';
+
+-- Example output:
+-- metric: storage_growth
+-- current_usage: +4.2 GB over 30 days
+-- recommendation: "Growing 140 MB/day. Projected: 30d: +4.2GB, 60d: +8.4GB, 90d: +12.6GB"
+```
+
+### Configuration
+
+Capacity planning configuration keys (all in `flight_recorder.config` table):
+
+```sql
+SELECT * FROM flight_recorder.config
+WHERE key LIKE 'capacity_%';
+```
+
+| Key                                   | Default | Purpose                                    |
+|---------------------------------------|---------|---------------------------------------------|
+| `capacity_planning_enabled`           | true    | Enable/disable capacity metrics collection  |
+| `capacity_thresholds_warning_pct`     | 60      | Warning threshold (percentage)              |
+| `capacity_thresholds_critical_pct`    | 80      | Critical threshold (percentage)             |
+| `capacity_forecast_window_days`       | 90      | Forecast window for growth projections      |
+| `snapshot_retention_days_extended`    | 90      | Extended retention for capacity analysis    |
+| `collect_database_size`               | true    | Collect db_size_bytes (fast statistical estimate from pg_class.relpages) |
+| `collect_connection_metrics`          | true    | Collect connection and transaction metrics  |
+
+**Adjust thresholds:**
+
+```sql
+-- More conservative thresholds (earlier warnings)
+UPDATE flight_recorder.config SET value = '50' WHERE key = 'capacity_thresholds_warning_pct';
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'capacity_thresholds_critical_pct';
+
+-- More aggressive thresholds (later warnings)
+UPDATE flight_recorder.config SET value = '70' WHERE key = 'capacity_thresholds_warning_pct';
+UPDATE flight_recorder.config SET value = '90' WHERE key = 'capacity_thresholds_critical_pct';
+```
+
+**Disable database size collection** (rarely needed - statistical estimate is very cheap):
+
+```sql
+-- Disable database size collection
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collect_database_size';
+```
+
+**Disable capacity planning entirely:**
+
+```sql
+-- Stop collecting capacity metrics
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'capacity_planning_enabled';
+```
+
+### Practical Examples
+
+**Use Case 1: Sizing a new production instance**
+
+```sql
+-- Run in staging for 7 days with similar load
+SELECT
+    metric,
+    utilization_pct,
+    status,
+    recommendation
+FROM flight_recorder.capacity_summary(interval '7 days')
+ORDER BY utilization_pct DESC NULLS LAST;
+
+-- Provision production with 2x headroom for critical resources
+-- Example: If staging shows 40% connection utilization, provision 2x connections
+```
+
+**Use Case 2: Identifying growth trends**
+
+```sql
+-- 30-day analysis
+SELECT * FROM flight_recorder.capacity_summary(interval '30 days')
+WHERE metric = 'storage_growth';
+
+-- Compare multiple time windows
+SELECT '7d' as window, * FROM flight_recorder.capacity_summary(interval '7 days')
+WHERE metric = 'storage_growth'
+UNION ALL
+SELECT '30d' as window, * FROM flight_recorder.capacity_summary(interval '30 days')
+WHERE metric = 'storage_growth';
+```
+
+**Use Case 3: Pre-incident detection**
+
+```sql
+-- Monitor dashboard view daily
+SELECT
+    overall_status,
+    critical_issues,
+    memory_pressure_score,
+    connections_utilization_pct
+FROM flight_recorder.capacity_dashboard;
+
+-- Alert on critical status
+-- (Integrate with your monitoring system)
+```
+
+**Use Case 4: Post-incident right-sizing**
+
+```sql
+-- Analyze peak usage during incident
+SELECT * FROM flight_recorder.capacity_summary(
+    interval '2 hours'  -- Incident window
+)
+WHERE status IN ('warning', 'critical');
+
+-- Identify which resources were constrained
+-- Increase those specific resources by 50-100%
+```
+
+**Use Case 5: Cost optimization**
+
+```sql
+-- Identify over-provisioned resources
+SELECT
+    metric,
+    utilization_pct,
+    headroom_pct,
+    recommendation
+FROM flight_recorder.capacity_summary(interval '30 days')
+WHERE utilization_pct < 30  -- Less than 30% utilized
+ORDER BY utilization_pct;
+
+-- Consider downsizing resources with consistent low utilization
+```
+
+### Troubleshooting
+
+**"insufficient_data" status:**
+
+**Cause:** <2 snapshots in time window
+
+**Solutions:**
+
+```sql
+-- Wait 10 minutes for data collection
+-- Or choose longer time window
+SELECT * FROM flight_recorder.capacity_summary(interval '24 hours');
+
+-- Check snapshot collection is running
+SELECT count(*) FROM flight_recorder.snapshots
+WHERE captured_at > now() - interval '1 hour';
+-- Should return 12+ (collected every 5 minutes)
+
+-- Verify collection is enabled
+SELECT * FROM flight_recorder.health_check()
+WHERE component = 'Collection Status';
+```
+
+**NULL values in capacity columns:**
+
+**Cause:** Historical snapshots before capacity planning was enabled
+
+**Impact:** Gracefully handled with COALESCE, may show "insufficient_data" for older time windows
+
+**Solution:** Wait for new data to accumulate (7+ days for meaningful trends)
+
+**Unexpected utilization percentages:**
+
+**Cause:** Cumulative statistics reset (pg_stat_reset() called)
+
+**Impact:** Deltas may be negative or incorrect for one time window
+
+**Solution:** capacity_summary() filters negative deltas automatically, will self-correct after next valid snapshot
+
+**Query performance:**
+
+**Typical execution time:** <500ms p95 for 30-day analysis
+
+**If slower:**
+
+```sql
+-- Check snapshot table size
+SELECT count(*) FROM flight_recorder.snapshots;
+
+-- Check retention settings
+SELECT * FROM flight_recorder.config
+WHERE key = 'retention_snapshots_days';
+
+-- Consider reducing retention if table is very large (>100k rows)
+UPDATE flight_recorder.config SET value = '14' WHERE key = 'retention_snapshots_days';
+```
+
+**Capacity metrics not collected:**
+
+```sql
+-- Verify capacity planning is enabled
+SELECT * FROM flight_recorder.config WHERE key = 'capacity_planning_enabled';
+-- Should return: value = 'true'
+
+-- Check for collection errors
+SELECT * FROM flight_recorder.collection_stats
+WHERE success = false
+  AND started_at > now() - interval '1 hour'
+ORDER BY started_at DESC;
+
+-- Manually trigger snapshot to test
+SELECT flight_recorder.snapshot();
+
+-- Check if new capacity columns were populated
+SELECT
+    xact_commit,
+    connections_active,
+    connections_total,
+    db_size_bytes
+FROM flight_recorder.snapshots
+ORDER BY captured_at DESC
+LIMIT 1;
+-- Should return non-NULL values
+```
+
+**capacity_dashboard shows NULL:**
+
+**Cause:** Insufficient data or disabled capacity planning
+
+**Solution:**
+
+```sql
+-- Test capacity_summary directly
+SELECT * FROM flight_recorder.capacity_summary(interval '24 hours');
+
+-- If returns "insufficient_data", wait for data collection
+-- If returns actual metrics, dashboard will populate on next snapshot
+```
+
+### Integration with Existing Features
+
+**Combine with anomaly detection:**
+
+```sql
+-- Detect capacity issues + anomalies
+SELECT 'CAPACITY' as source, metric as type, status as severity, recommendation as details
+FROM flight_recorder.capacity_summary(interval '24 hours')
+WHERE status IN ('warning', 'critical')
+UNION ALL
+SELECT 'ANOMALY' as source, anomaly_type as type, 'critical' as severity, details
+FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:00');
+```
+
+**Combine with performance analysis:**
+
+```sql
+-- Correlate slow queries with resource constraints
+WITH capacity AS (
+    SELECT * FROM flight_recorder.capacity_summary(interval '1 hour')
+),
+slow_queries AS (
+    SELECT * FROM flight_recorder.statement_compare(
+        '2024-01-15 10:00',
+        '2024-01-15 11:00'
+    )
+    WHERE mean_exec_time_delta_ms > 100
+)
+SELECT
+    sq.query,
+    sq.mean_exec_time_delta_ms,
+    c.metric,
+    c.status
+FROM slow_queries sq
+CROSS JOIN capacity c
+WHERE c.status IN ('warning', 'critical');
+```
+
+**Profile-based configuration:**
+
+Capacity planning is enabled in all default profiles:
+
+- `default` - Full capacity tracking
+- `production_safe` - Full capacity tracking
+- `development` - Full capacity tracking
+- `troubleshooting` - Full capacity tracking
+- `minimal_overhead` - Capacity tracking enabled (adds negligible overhead)
+- `high_ddl` - Full capacity tracking
+
+**No additional configuration needed** - works out of the box.
 
 ## Safety Features
 
@@ -992,6 +1538,13 @@ Key settings:
 | `archive_activity_samples`          | true    | Archive activity samples (PIDs, sessions)      |
 | `archive_lock_samples`              | true    | Archive lock samples (blocking chains)         |
 | `archive_wait_samples`              | true    | Archive wait event samples                     |
+| `capacity_planning_enabled`         | true    | Enable capacity metrics collection             |
+| `capacity_thresholds_warning_pct`   | 60      | Warning threshold for capacity metrics         |
+| `capacity_thresholds_critical_pct`  | 80      | Critical threshold for capacity metrics        |
+| `capacity_forecast_window_days`     | 90      | Forecast window for growth projections         |
+| `snapshot_retention_days_extended`  | 90      | Extended retention for capacity analysis       |
+| `collect_database_size`             | true    | Collect db_size_bytes (fast statistical estimate) |
+| `collect_connection_metrics`        | true    | Collect connection and transaction metrics     |
 
 ## Catalog Lock Contention
 

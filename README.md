@@ -33,6 +33,10 @@ SELECT * FROM flight_recorder.wait_summary('2024-01-15 10:00', '2024-01-15 11:00
 
 -- Auto-detect problems
 SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:00');
+
+-- Do I have the right amount of resources?
+SELECT * FROM flight_recorder.capacity_dashboard;
+SELECT * FROM flight_recorder.capacity_summary(interval '7 days');
 ```
 
 ## Optional: Configuration
