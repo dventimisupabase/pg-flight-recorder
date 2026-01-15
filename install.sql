@@ -4719,6 +4719,10 @@ BEGIN
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_flush');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
 
+        PERFORM cron.unschedule('flight_recorder_archive')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_archive');
+        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
+
         -- Mark as disabled in config
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('enabled', 'false', now())

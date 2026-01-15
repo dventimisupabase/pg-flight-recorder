@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(393);  -- Expanded test suite: 145 base + 37 boundary (Phase 1) + 63 critical functions (Phase 2) + 60 error handling (Phase 3) + 44 version-specific (Phase 4) + 29 safety mechanisms (Phase 5) + 15 archive functionality (Phase 6)
+SELECT plan(394);  -- Expanded test suite: 378 base (original) + 3 archive tables (TIER 1.5) + 1 archive function + 12 archive functionality tests (Phase 6)
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -427,10 +427,10 @@ SELECT lives_ok(
     'enable() should execute without error'
 );
 
--- Verify jobs are rescheduled (4 jobs: snapshot, sample, cleanup, partition)
+-- Verify jobs are rescheduled (5 jobs: snapshot, sample, flush, archive, cleanup)
 SELECT ok(
-    (SELECT count(*) FROM cron.job WHERE jobname LIKE 'flight_recorder%') = 4,
-    'All 4 telemetry cron jobs should be rescheduled after enable()'
+    (SELECT count(*) FROM cron.job WHERE jobname LIKE 'flight_recorder%') = 5,
+    'All 5 telemetry cron jobs should be rescheduled after enable()'
 );
 
 -- =============================================================================
@@ -3670,6 +3670,11 @@ SELECT ok(
 -- =============================================================================
 -- 6. ARCHIVE FUNCTIONALITY (12 tests)
 -- =============================================================================
+
+-- Clear any archive data that may have been created by background cron jobs
+TRUNCATE flight_recorder.activity_samples_archive;
+TRUNCATE flight_recorder.lock_samples_archive;
+TRUNCATE flight_recorder.wait_samples_archive;
 
 -- Test 1: Archive configuration exists
 SELECT ok(
