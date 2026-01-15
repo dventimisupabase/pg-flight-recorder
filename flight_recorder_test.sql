@@ -3436,6 +3436,8 @@ SELECT ok(
 UPDATE flight_recorder.config SET value = '1000' WHERE key = 'load_throttle_xact_threshold';
 
 -- Test 8: Combined load shedding + throttling (shedding runs first)
+-- Set load shedding to 0% which will always trigger (X% >= 0% is always true)
+-- Set load throttling to 0 which may or may not trigger depending on xact rate
 UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_shedding_active_pct';
 UPDATE flight_recorder.config SET value = '0' WHERE key = 'load_throttle_xact_threshold';
 DELETE FROM flight_recorder.collection_stats;
@@ -3444,7 +3446,8 @@ DO $$ BEGIN
     PERFORM flight_recorder.sample();
 END $$;
 
--- Load shedding runs first, so skip_reason should be load shedding
+-- Load shedding runs first (checked before throttling), so skip_reason should be load shedding
+-- With >= comparison and 0% threshold, load shedding always triggers before throttling check
 SELECT ok(
     (SELECT skipped_reason FROM flight_recorder.collection_stats WHERE collection_type = 'sample' AND skipped = true ORDER BY started_at DESC LIMIT 1) LIKE
     '%Load shedding%',
