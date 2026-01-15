@@ -33,14 +33,15 @@ Complete documentation for pg-flight-recorder.
 
 ## How It Works
 
-Flight Recorder uses `pg_cron` to run four collection types:
+Flight Recorder uses `pg_cron` to run five collection types:
 
 1. **Samples** (adaptive frequency): Ring buffer - wait events, active sessions, locks
    - Normal/Light: every 180 seconds (4-hour rolling window)
    - Emergency: every 300 seconds (10-hour rolling window)
 2. **Flush** (every 5 minutes): Ring buffer → aggregates (durable storage)
-3. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
-4. **Cleanup** (daily at 3 AM): Remove old aggregates and snapshots
+3. **Archive** (every 15 minutes): Ring buffer → raw sample archives (high-resolution forensics)
+4. **Snapshots** (every 5 minutes): Cumulative stats - WAL, checkpoints, bgwriter, replication, temp files, I/O
+5. **Cleanup** (daily at 3 AM): Remove old aggregates, archives, and snapshots
 
 The ring buffer provides low-overhead, adaptive-frequency sampling using a fixed 120-slot circular buffer with modular arithmetic. Analysis functions compare snapshots or aggregate samples to diagnose performance issues.
 
@@ -111,6 +112,84 @@ Flight Recorder uses a three-tier data architecture optimized for minimal overhe
 
 - `wait_summary(start, end)` function (aggregate wait events over time)
 - Direct SQL on aggregate tables for custom analysis
+
+### TIER 1.5: Raw Sample Archives (Durable, High-Resolution Forensics)
+
+**Purpose:** Periodic snapshots of raw samples for high-resolution forensic analysis beyond ring buffer retention
+
+**Tables:**
+
+- `activity_samples_archive` (raw activity samples: PIDs, queries, sessions)
+- `lock_samples_archive` (raw lock samples: blocking chains, PIDs)
+- `wait_samples_archive` (raw wait event samples: wait patterns with counts)
+
+**Characteristics:**
+
+- **Durable (LOGGED)** - Survives crashes
+- **Archived every 15 minutes** - Configurable via `archive_sample_frequency_minutes`
+- **7-day default retention** - Configurable via `archive_retention_days`
+- **Full resolution** - Not aggregated, preserves all details (PIDs, exact timestamps, complete blocking chains)
+- **Slower cadence** - Archives less frequently than flush (15 min vs 5 min) to minimize overhead
+
+**What's preserved (that aggregates lose):**
+
+- **Specific PIDs** - Can answer "what was PID 12345 doing at 3:42 PM?"
+- **Exact timestamps** - Precise timing within archived period
+- **Complete blocking chains** - Full lock dependency graphs with all participants
+- **Session details** - Individual session characteristics and queries
+
+**How archival works:**
+
+1. Checks when last archive was created
+2. If enough time has passed (default: 15 minutes), copies raw samples from ring buffers
+3. Uses `sample_id` (epoch_seconds) to group related samples
+4. Filters out NULL rows (unused pre-allocated slots)
+
+**Configuration:**
+
+- `archive_samples_enabled` - Enable/disable archival (default: true)
+- `archive_sample_frequency_minutes` - How often to archive (default: 15)
+- `archive_retention_days` - How long to keep archives (default: 7)
+- `archive_activity_samples` - Archive activity samples (default: true)
+- `archive_lock_samples` - Archive lock samples (default: true)
+- `archive_wait_samples` - Archive wait event samples (default: true)
+
+**Storage overhead:**
+
+- ~1-5 MB/day for typical workloads
+- 7-day retention: ~7-35 MB
+- 30-day retention: ~30-150 MB
+
+**Use cases:**
+
+- "What was PID X doing 2 days ago at specific time?"
+- "Show me the exact blocking chain during that incident"
+- "Was this specific session blocking others?"
+- Forensic analysis requiring full resolution beyond 6-10 hour ring buffer window
+
+**Query directly from:**
+
+```sql
+-- Find what PID 12345 was doing around 2024-01-14 15:30
+SELECT * FROM flight_recorder.activity_samples_archive
+WHERE pid = 12345
+  AND captured_at BETWEEN '2024-01-14 15:25' AND '2024-01-14 15:35'
+ORDER BY captured_at;
+
+-- Reconstruct blocking chain at specific time
+SELECT * FROM flight_recorder.lock_samples_archive
+WHERE captured_at BETWEEN '2024-01-14 15:30' AND '2024-01-14 15:31'
+ORDER BY blocked_pid, blocking_pid;
+
+-- Analyze wait event patterns during specific period
+SELECT backend_type, wait_event_type, wait_event,
+       SUM(count) as total_waiters,
+       COUNT(*) as sample_count
+FROM flight_recorder.wait_samples_archive
+WHERE captured_at BETWEEN '2024-01-14 15:00' AND '2024-01-14 16:00'
+GROUP BY backend_type, wait_event_type, wait_event
+ORDER BY total_waiters DESC;
+```
 
 ### TIER 3: Snapshots (Durable, Long Retention)
 
@@ -198,7 +277,8 @@ Daily 3AM: cleanup_aggregates() + cleanup() → Delete old TIER 2 and TIER 3 dat
 | `snapshot()`                   | Collect system stats snapshot                |
 | `sample()`                     | Collect ring buffer sample                   |
 | `flush_ring_to_aggregates()`   | Flush ring buffer to durable aggregates      |
-| `cleanup_aggregates()`         | Clean old aggregate data                     |
+| `archive_ring_samples()`       | Archive raw samples for forensic analysis    |
+| `cleanup_aggregates()`         | Clean old aggregate and archive data         |
 
 **"Set and Forget" Workflow:**
 
@@ -638,6 +718,7 @@ SELECT * FROM flight_recorder.get_current_profile();
 - All safety features enabled (load shedding, throttling, circuit breaker)
 - Adaptive sampling enabled (skips when idle)
 - All collectors enabled (locks, progress, statements)
+- Archive: Enabled, 15-min frequency, 7-day retention, all types
 - Overhead: ~0.013% CPU sustained
 
 **When to use:**
@@ -661,6 +742,7 @@ SELECT flight_recorder.apply_profile('default');
 - Stricter circuit breaker (800ms vs 1000ms)
 - Locks and progress disabled (reduces catalog contention)
 - Faster lock timeout (50ms vs 100ms)
+- Archive: Enabled, 30-min frequency, 14-day retention, waits disabled
 - Overhead: ~0.008% CPU sustained
 
 **When to use:**
@@ -683,6 +765,7 @@ SELECT flight_recorder.apply_profile('production_safe');
 - Adaptive sampling **disabled** (always collect, even when idle)
 - All collectors enabled
 - Shorter retention (7 days snapshots, 3 days aggregates)
+- Archive: Enabled, 15-min frequency, 3-day retention, all types
 - Overhead: ~0.013% CPU sustained
 
 **When to use:**
@@ -706,6 +789,7 @@ SELECT flight_recorder.apply_profile('development');
 - All collectors enabled
 - More lenient circuit breaker (2000ms)
 - Collects top 50 queries (vs 20)
+- Archive: Enabled, 5-min frequency (aggressive), 7-day retention, all types
 - Overhead: ~0.04% CPU sustained
 
 **When to use:**
@@ -736,6 +820,7 @@ SELECT flight_recorder.apply_profile('default');
 - Higher idle threshold (10 vs 5 connections)
 - Strict circuit breaker (500ms)
 - Locks, progress, and statements **disabled**
+- Archive: **Disabled** entirely (minimum overhead mode)
 - Overhead: ~0.008% CPU sustained
 
 **When to use:**
@@ -761,6 +846,7 @@ SELECT flight_recorder.apply_profile('minimal_overhead');
 - Very fast lock timeout (50ms)
 - Pre-collection DDL lock checks enabled
 - All collectors enabled
+- Archive: Enabled, 15-min frequency, 7-day retention, all types
 - Overhead: ~0.013% CPU sustained
 
 **When to use:**
@@ -776,14 +862,14 @@ SELECT flight_recorder.apply_profile('high_ddl');
 
 ### Profile Comparison Table
 
-| Profile | Sample Interval | Overhead | Collectors | Safety | Retention |
-|---------|----------------|----------|------------|--------|-----------|
-| `default` | 180s | 0.013% | All | Balanced | 30d/7d |
-| `production_safe` | 300s | 0.008% | Wait/activity only | Aggressive | 30d/7d |
-| `development` | 180s | 0.013% | All | Balanced | 7d/3d |
-| `troubleshooting` | 60s | 0.04% | All + top 50 queries | Lenient | 7d/3d |
-| `minimal_overhead` | 300s | 0.008% | Wait/activity only | Very aggressive | 7d/3d |
-| `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d |
+| Profile | Sample Interval | Overhead | Collectors | Safety | Retention | Archive |
+|---------|----------------|----------|------------|--------|-----------|---------|
+| `default` | 180s | 0.013% | All | Balanced | 30d/7d | 15min/7d (all) |
+| `production_safe` | 300s | 0.008% | Wait/activity only | Aggressive | 30d/7d | 30min/14d (no waits) |
+| `development` | 180s | 0.013% | All | Balanced | 7d/3d | 15min/3d (all) |
+| `troubleshooting` | 60s | 0.04% | All + top 50 queries | Lenient | 7d/3d | 5min/7d (all) |
+| `minimal_overhead` | 300s | 0.008% | Wait/activity only | Very aggressive | 7d/3d | Disabled |
+| `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d | 15min/7d (all) |
 
 ### Advanced Usage
 
@@ -900,6 +986,12 @@ Key settings:
 | `retention_snapshots_days`          | 30      | TIER 3 snapshot retention                      |
 | `retention_statements_days`         | 30      | pg_stat_statements snapshot retention          |
 | `retention_collection_stats_days`   | 30      | Collection performance stats retention         |
+| `archive_samples_enabled`           | true    | Enable periodic raw sample archival            |
+| `archive_sample_frequency_minutes`  | 15      | How often to archive raw samples (TIER 1.5)    |
+| `archive_retention_days`            | 7       | TIER 1.5 archive retention                     |
+| `archive_activity_samples`          | true    | Archive activity samples (PIDs, sessions)      |
+| `archive_lock_samples`              | true    | Archive lock samples (blocking chains)         |
+| `archive_wait_samples`              | true    | Archive wait event samples                     |
 
 ## Catalog Lock Contention
 

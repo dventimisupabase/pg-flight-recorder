@@ -14,7 +14,7 @@ BEGIN
     -- Collect job IDs before unscheduling
     SELECT array_agg(jobid) INTO v_jobids
     FROM cron.job
-    WHERE jobname IN ('flight_recorder_snapshot', 'flight_recorder_sample', 'flight_recorder_flush', 'flight_recorder_cleanup');
+    WHERE jobname IN ('flight_recorder_snapshot', 'flight_recorder_sample', 'flight_recorder_flush', 'flight_recorder_archive', 'flight_recorder_cleanup');
 
     -- Unschedule jobs
     PERFORM cron.unschedule('flight_recorder_snapshot')
@@ -25,6 +25,9 @@ BEGIN
 
     PERFORM cron.unschedule('flight_recorder_flush')
     WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_flush');
+
+    PERFORM cron.unschedule('flight_recorder_archive')
+    WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_archive');
 
     PERFORM cron.unschedule('flight_recorder_cleanup')
     WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_cleanup');
@@ -54,7 +57,7 @@ BEGIN
     RAISE NOTICE 'Removed:';
     RAISE NOTICE '  - All flight recorder tables and data';
     RAISE NOTICE '  - All flight recorder functions and views';
-    RAISE NOTICE '  - All scheduled cron jobs (snapshot, sample, flush, cleanup)';
+    RAISE NOTICE '  - All scheduled cron jobs (snapshot, sample, flush, archive, cleanup)';
     RAISE NOTICE '  - All cron job execution history';
     RAISE NOTICE '';
 END;
