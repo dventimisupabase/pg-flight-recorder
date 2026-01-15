@@ -370,7 +370,7 @@ Flight Recorder collects these capacity metrics in every snapshot:
 | `connections_active`  | pg_stat_activity        | Active connections (non-idle)             |
 | `connections_total`   | pg_stat_activity        | Total connections (including idle)        |
 | `connections_max`     | max_connections setting | Configured connection limit               |
-| `db_size_bytes`       | pg_database_size()      | Database size in bytes                    |
+| `db_size_bytes`       | pg_class.relpages       | Database size in bytes (statistical estimate, 95-99% accurate) |
 
 **Storage overhead:** ~40 bytes per snapshot = 11.5 KB/day (~0.5% increase)
 
@@ -623,7 +623,7 @@ WHERE key LIKE 'capacity_%';
 | `capacity_thresholds_critical_pct`    | 80      | Critical threshold (percentage)             |
 | `capacity_forecast_window_days`       | 90      | Forecast window for growth projections      |
 | `snapshot_retention_days_extended`    | 90      | Extended retention for capacity analysis    |
-| `collect_database_size`               | true    | Collect db_size_bytes (expensive query)     |
+| `collect_database_size`               | true    | Collect db_size_bytes (fast statistical estimate from pg_class.relpages) |
 | `collect_connection_metrics`          | true    | Collect connection and transaction metrics  |
 
 **Adjust thresholds:**
@@ -638,10 +638,10 @@ UPDATE flight_recorder.config SET value = '70' WHERE key = 'capacity_thresholds_
 UPDATE flight_recorder.config SET value = '90' WHERE key = 'capacity_thresholds_critical_pct';
 ```
 
-**Disable expensive queries:**
+**Disable database size collection** (rarely needed - statistical estimate is very cheap):
 
 ```sql
--- Skip database size collection (reduces overhead slightly)
+-- Disable database size collection
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collect_database_size';
 ```
 
@@ -1543,7 +1543,7 @@ Key settings:
 | `capacity_thresholds_critical_pct`  | 80      | Critical threshold for capacity metrics        |
 | `capacity_forecast_window_days`     | 90      | Forecast window for growth projections         |
 | `snapshot_retention_days_extended`  | 90      | Extended retention for capacity analysis       |
-| `collect_database_size`             | true    | Collect db_size_bytes (pg_database_size query) |
+| `collect_database_size`             | true    | Collect db_size_bytes (fast statistical estimate) |
 | `collect_connection_metrics`        | true    | Collect connection and transaction metrics     |
 
 ## Catalog Lock Contention

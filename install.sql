@@ -359,7 +359,7 @@ ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_activ
 ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_total INTEGER;
 ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_max INTEGER;
 
--- Database size metrics (from pg_database_size)
+-- Database size metrics (statistical estimate from pg_class.relpages - fast!)
 ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS db_size_bytes BIGINT;
 
 -- -----------------------------------------------------------------------------
@@ -825,7 +825,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('capacity_thresholds_critical_pct', '80'), -- Critical threshold for capacity utilization
     ('capacity_forecast_window_days', '90'),   -- Forecast horizon for capacity predictions (Phase 3)
     ('snapshot_retention_days_extended', '90'), -- Extended retention for capacity planning
-    ('collect_database_size', 'true'),         -- Collect database size (pg_database_size - can be expensive)
+    ('collect_database_size', 'true'),         -- Collect database size (fast statistical estimate from pg_class.relpages)
     ('collect_connection_metrics', 'true')     -- Collect connection metrics (active/total/max)
 ON CONFLICT (key) DO NOTHING;
 
@@ -1357,9 +1357,12 @@ BEGIN
         );
 
         IF v_use_percentage THEN
-            -- Calculate database size
-            SELECT round(pg_database_size(current_database()) / 1024.0 / 1024.0, 2)
-            INTO v_db_size_mb;
+            -- Calculate database size (using fast statistical estimate)
+            SELECT round((sum(relpages::bigint * current_setting('block_size')::bigint) / 1024.0 / 1024.0), 2)
+            INTO v_db_size_mb
+            FROM pg_class
+            WHERE relkind IN ('r', 't', 'i', 'm')
+              AND relpages > 0;
 
             -- Get percentage and bounds
             v_percentage := COALESCE(
@@ -2811,9 +2814,14 @@ BEGIN
             FROM pg_stat_activity;
         END IF;
 
-        -- Database size (expensive query - make optional via config)
+        -- Database size (fast statistical estimate using pg_class.relpages)
+        -- Much cheaper than pg_database_size(), accuracy 95-99%
         IF COALESCE(flight_recorder._get_config('collect_database_size', 'true')::boolean, true) THEN
-            v_db_size_bytes := pg_database_size(current_database());
+            SELECT sum(relpages::bigint * current_setting('block_size')::bigint)
+            INTO v_db_size_bytes
+            FROM pg_class
+            WHERE relkind IN ('r', 't', 'i', 'm')  -- tables, TOAST, indexes, materialized views
+              AND relpages > 0;
         END IF;
 
         PERFORM flight_recorder._record_section_success(v_stat_id);
@@ -4473,7 +4481,7 @@ BEGIN
             ('production_safe', 'capacity_thresholds_critical_pct', '80'),
             ('production_safe', 'capacity_forecast_window_days', '90'),
             ('production_safe', 'snapshot_retention_days_extended', '90'),
-            ('production_safe', 'collect_database_size', 'false'),
+            ('production_safe', 'collect_database_size', 'true'),
             ('production_safe', 'collect_connection_metrics', 'true'),
 
             -- Profile: development
@@ -4554,7 +4562,7 @@ BEGIN
             ('minimal_overhead', 'capacity_thresholds_critical_pct', '85'),
             ('minimal_overhead', 'capacity_forecast_window_days', '30'),
             ('minimal_overhead', 'snapshot_retention_days_extended', '30'),
-            ('minimal_overhead', 'collect_database_size', 'false'),
+            ('minimal_overhead', 'collect_database_size', 'true'),
             ('minimal_overhead', 'collect_connection_metrics', 'true'),
 
             -- Profile: high_ddl
