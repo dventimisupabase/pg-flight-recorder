@@ -1,3 +1,6 @@
+-- psql: stop on first error for clean output (other clients may ignore this)
+\set ON_ERROR_STOP on
+
 -- =============================================================================
 -- pg-flight-recorder: PostgreSQL Performance Flight Recorder
 -- =============================================================================
@@ -286,6 +289,21 @@
 --   DROP SCHEMA flight_recorder CASCADE;
 --
 -- =============================================================================
+
+-- Wrap entire installation in a transaction so prerequisite check failure
+-- rolls back everything, leaving no trace. PostgreSQL DDL is transactional.
+BEGIN;
+
+-- -----------------------------------------------------------------------------
+-- Prerequisite Check: pg_cron must be installed
+-- Fail fast before creating any objects if pg_cron is not available
+-- -----------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        RAISE EXCEPTION E'\n\nFlight Recorder requires pg_cron extension.\n\nInstall pg_cron first:\n  CREATE EXTENSION pg_cron;\n\nSee: https://github.com/citusdata/pg_cron\n';
+    END IF;
+END $$;
 
 CREATE SCHEMA IF NOT EXISTS flight_recorder;
 
@@ -6906,13 +6924,7 @@ BEGIN
     RAISE NOTICE '  - flight_recorder.recent_locks      (lock contention, last 2 hours from ring buffer)';
     RAISE NOTICE '  - flight_recorder.recent_replication (replication lag, last 2 hours)';
     RAISE NOTICE '';
-EXCEPTION
-    WHEN undefined_table THEN
-        -- pg_cron not available, show generic message
-        RAISE NOTICE '';
-        RAISE NOTICE 'Flight Recorder installed successfully.';
-        RAISE NOTICE '';
-        RAISE NOTICE 'NOTE: pg_cron not available. Run flight_recorder.snapshot() and flight_recorder.sample() manually.';
-        RAISE NOTICE '';
 END;
 $$;
+
+COMMIT;
