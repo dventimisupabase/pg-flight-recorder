@@ -525,18 +525,6 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
 
 COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
 
--- Set fill factor on existing ring buffer tables (for upgrades)
-DO $$
-BEGIN
-    ALTER TABLE flight_recorder.samples_ring SET (fillfactor = 70);
-    ALTER TABLE flight_recorder.wait_samples_ring SET (fillfactor = 90);
-    ALTER TABLE flight_recorder.activity_samples_ring SET (fillfactor = 90);
-    ALTER TABLE flight_recorder.lock_samples_ring SET (fillfactor = 90);
-EXCEPTION WHEN OTHERS THEN
-    -- Ignore errors (tables may not exist yet)
-    NULL;
-END $$;
-
 -- NOTE: Aggressive autovacuum settings removed - no longer needed with UPDATE-only pattern
 -- Ring buffers now use UPSERT pattern with pre-populated rows:
 --   - wait_samples_ring: 12,000 rows (120 slots × 100 rows) - zero dead tuples
