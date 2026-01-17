@@ -45,7 +45,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 ### Purpose and Scope
 
-pg-flight-recorder continuously samples PostgreSQL system state, storing data in a three-tier architecture optimized for minimal overhead and flexible retention. Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
+pg-flight-recorder continuously samples PostgreSQL system state, storing data in a four-tier architecture optimized for minimal overhead and flexible retention. Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
 
 ### Requirements
 
@@ -70,9 +70,9 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ## Core Concepts
 
-### Three-Tier Data Architecture
+### Four-Tier Data Architecture
 
-Flight Recorder organizes data into three tiers optimized for different access patterns:
+Flight Recorder organizes data into four tiers optimized for different access patterns:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
