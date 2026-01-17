@@ -7,6 +7,7 @@ BEGIN
     END IF;
 END $$;
 CREATE SCHEMA IF NOT EXISTS flight_recorder;
+
 -- Stores periodic snapshots of PostgreSQL system performance metrics
 -- Captures WAL activity, checkpoint behavior, IO operations, transactions,
 -- and resource utilization to enable performance analysis and historical trending
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
     db_size_bytes               BIGINT
 );
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
+
 -- Captures replication metrics from pg_stat_replication for each snapshot
 -- Tracks streaming replication connection state, LSN positions, and lag for each replica
 -- Each record represents a single replication connection at a point in time
@@ -75,6 +77,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.replication_snapshots (
     replay_lag              INTERVAL,
     PRIMARY KEY (snapshot_id, pid)
 );
+
 -- Stores execution statistics for SQL statements at specific snapshot points
 -- Captures query performance metrics (timing, I/O, WAL activity) per query/user/database
 -- Linked to snapshots via FK; enables historical analysis and performance trending
@@ -110,6 +113,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
 COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. Conservative 120s with proactive throttling. Fill factor 70 enables HOT updates.';
+
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
     row_num             INTEGER NOT NULL CHECK (row_num >= 0 AND row_num < 100),
@@ -121,6 +125,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
 COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
+
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
     row_num             INTEGER NOT NULL CHECK (row_num >= 0 AND row_num < 25),
@@ -137,6 +142,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
 COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (UPDATE-only pattern). Pre-populated with 3,000 rows (120 slots × 25 rows). Top 25 active sessions per sample. UPSERTs enable HOT updates, zero dead tuples. NULLs indicate unused slots.';
+
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     slot_id                 INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
     row_num                 INTEGER NOT NULL CHECK (row_num >= 0 AND row_num < 100),
@@ -154,6 +160,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
 COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
+
 INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
 SELECT
     generate_series AS slot_id,
@@ -198,6 +205,8 @@ CREATE INDEX IF NOT EXISTS wait_aggregates_time_idx
 CREATE INDEX IF NOT EXISTS wait_aggregates_event_idx
     ON flight_recorder.wait_event_aggregates(wait_event_type, wait_event);
 COMMENT ON TABLE flight_recorder.wait_event_aggregates IS 'TIER 2: Durable wait event summaries (5-min windows, survives crashes)';
+
+
 -- Stores aggregated lock contention patterns within time windows
 -- Tracks which sessions block others, including lock type, affected relation, and duration statistics
 -- Enables forensic analysis of lock conflicts and performance bottlenecks across restarts
@@ -217,6 +226,8 @@ CREATE TABLE IF NOT EXISTS flight_recorder.lock_aggregates (
 CREATE INDEX IF NOT EXISTS lock_aggregates_time_idx
     ON flight_recorder.lock_aggregates(start_time, end_time);
 COMMENT ON TABLE flight_recorder.lock_aggregates IS 'TIER 2: Durable lock pattern summaries (5-min windows, survives crashes)';
+
+
 -- Aggregates query execution patterns within 5-minute time windows
 -- Stores query preview, occurrence count, and duration metrics (max/avg)
 -- Provides durable query performance summaries that survive database crashes
@@ -232,6 +243,8 @@ CREATE TABLE IF NOT EXISTS flight_recorder.query_aggregates (
 CREATE INDEX IF NOT EXISTS query_aggregates_time_idx
     ON flight_recorder.query_aggregates(start_time, end_time);
 COMMENT ON TABLE flight_recorder.query_aggregates IS 'TIER 2: Durable query pattern summaries (5-min windows, survives crashes)';
+
+
 -- Stores snapshot samples of PostgreSQL backend activity for forensic analysis
 -- Captures session details, query state, and wait events at regular intervals (15-min cadence)
 -- Indexed by timestamp, sample group, and process ID for efficient historical queries
@@ -257,6 +270,8 @@ CREATE INDEX IF NOT EXISTS activity_archive_sample_id_idx
 CREATE INDEX IF NOT EXISTS activity_archive_pid_idx
     ON flight_recorder.activity_samples_archive(pid, captured_at);
 COMMENT ON TABLE flight_recorder.activity_samples_archive IS 'TIER 1.5: Raw activity samples for forensic analysis (15-min cadence, full resolution)';
+
+
 -- Archives lock contention incidents with complete blocking chains (blocked and blocking process details)
 -- Captures at 15-minute intervals for forensic analysis of lock conflicts and deadlock relationships
 -- Stores query previews, process info (PID, user, application), lock types, and relation OIDs
@@ -285,6 +300,8 @@ CREATE INDEX IF NOT EXISTS lock_archive_blocked_pid_idx
 CREATE INDEX IF NOT EXISTS lock_archive_blocking_pid_idx
     ON flight_recorder.lock_samples_archive(blocking_pid, captured_at);
 COMMENT ON TABLE flight_recorder.lock_samples_archive IS 'TIER 1.5: Raw lock samples for forensic analysis (15-min cadence, full blocking chains)';
+
+
 -- Archives raw wait event samples at full resolution for forensic analysis
 -- Captures backend type, wait event type/name, and state to enable detailed investigation
 -- Linked to parent samples via sample_id; indexed for efficient time-series queries
@@ -305,6 +322,8 @@ CREATE INDEX IF NOT EXISTS wait_archive_sample_id_idx
 CREATE INDEX IF NOT EXISTS wait_archive_wait_event_idx
     ON flight_recorder.wait_samples_archive(wait_event_type, wait_event, captured_at);
 COMMENT ON TABLE flight_recorder.wait_samples_archive IS 'TIER 1.5: Raw wait event samples for forensic analysis (15-min cadence, full resolution)';
+
+
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
 CREATE OR REPLACE FUNCTION flight_recorder._pretty_bytes(bytes BIGINT)
 RETURNS TEXT
@@ -317,6 +336,7 @@ LANGUAGE sql IMMUTABLE AS $$
         ELSE bytes::text || ' B'
     END
 $$;
+
 -- Returns the PostgreSQL major version number
 -- Extracts major version by dividing server_version_num by 10000
 CREATE OR REPLACE FUNCTION flight_recorder._pg_version()
@@ -324,6 +344,7 @@ RETURNS INTEGER
 LANGUAGE sql STABLE AS $$
     SELECT current_setting('server_version_num')::integer / 10000
 $$;
+
 -- Configuration key-value store for flight_recorder extension
 -- Manages tuning parameters, thresholds, timeouts, and feature flags
 -- Tracks when each setting was last modified via updated_at timestamp
@@ -415,6 +436,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
 );
 CREATE INDEX IF NOT EXISTS collection_stats_type_started_idx
     ON flight_recorder.collection_stats(collection_type, started_at DESC);
+
 -- Checks if circuit breaker conditions are met (excessive errors or collection failures)
 -- Returns TRUE if circuit breaker is tripped and collection should be skipped
 CREATE OR REPLACE FUNCTION flight_recorder._check_circuit_breaker(p_collection_type TEXT)
@@ -459,6 +481,7 @@ BEGIN
     RETURN false;
 END;
 $$;
+
 -- Records the start of a collection operation and creates a tracking entry in collection_stats
 -- Returns the ID of the new record to track subsequent collection progress
 CREATE OR REPLACE FUNCTION flight_recorder._record_collection_start(
@@ -471,6 +494,7 @@ LANGUAGE sql AS $$
     VALUES (p_collection_type, now(), p_sections_total)
     RETURNING id
 $$;
+
 -- Records collection completion with timing and success/failure status
 -- Updates collection_stats with end time, duration, and error details if applicable
 CREATE OR REPLACE FUNCTION flight_recorder._record_collection_end(
@@ -487,6 +511,7 @@ LANGUAGE sql AS $$
         error_message = p_error_message
     WHERE id = p_stat_id
 $$;
+
 -- Records a skipped collection event with the reason for skipping
 CREATE OR REPLACE FUNCTION flight_recorder._record_collection_skip(
     p_collection_type TEXT,
@@ -499,6 +524,7 @@ LANGUAGE sql AS $$
     )
     VALUES (p_collection_type, now(), now(), true, p_reason)
 $$;
+
 -- Increments the sections_succeeded counter to record successful section completion
 CREATE OR REPLACE FUNCTION flight_recorder._record_section_success(p_stat_id INTEGER)
 RETURNS VOID
@@ -507,6 +533,7 @@ LANGUAGE sql AS $$
     SET sections_succeeded = COALESCE(sections_succeeded, 0) + 1
     WHERE id = p_stat_id
 $$;
+
 -- Retrieves configuration values by key from the config table with optional fallback
 -- Returns the provided default value if the key does not exist
 CREATE OR REPLACE FUNCTION flight_recorder._get_config(p_key TEXT, p_default TEXT DEFAULT NULL)
@@ -517,6 +544,7 @@ LANGUAGE sql STABLE AS $$
         p_default
     )
 $$;
+
 -- Sets statement timeout for section recording based on configuration, defaulting to 250ms
 CREATE OR REPLACE FUNCTION flight_recorder._set_section_timeout()
 RETURNS VOID
@@ -531,6 +559,7 @@ BEGIN
     PERFORM set_config('statement_timeout', v_timeout_ms::text, true);
 END;
 $$;
+
 -- Evaluates system metrics (active connections, circuit breaker activity) and automatically
 -- adjusts the flight recorder mode between normal, light, and emergency states
 CREATE OR REPLACE FUNCTION flight_recorder._check_and_adjust_mode()
@@ -614,6 +643,7 @@ BEGIN
     RETURN;
 END;
 $$;
+
 -- Validates flight_recorder configuration parameters and system health
 -- Returns diagnostic checks with status levels (OK, WARNING, CRITICAL) for configuration values, thresholds, and recent operational errors
 CREATE OR REPLACE FUNCTION flight_recorder.validate_config()
@@ -718,6 +748,7 @@ BEGIN
     END;
 END;
 $$;
+
 -- Check if the pg_stat_statements extension is installed
 -- Returns TRUE if available, FALSE otherwise
 CREATE OR REPLACE FUNCTION flight_recorder._has_pg_stat_statements()
@@ -727,6 +758,7 @@ LANGUAGE sql STABLE AS $$
         SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
     )
 $$;
+
 -- Monitors pg_stat_statements table health by checking current statement count against configured max capacity
 -- Returns utilization percentage and status (OK, WARNING, HIGH_CHURN) to detect statement table churn
 CREATE OR REPLACE FUNCTION flight_recorder._check_statements_health()
@@ -778,6 +810,7 @@ BEGIN
         END;
 END;
 $$;
+
 -- Monitor flight_recorder schema size and automatically manage collection state (cleanup, disable, re-enable) to prevent unbounded growth
 -- Returns current size, thresholds, status, and actions taken based on configurable warning/critical thresholds
 CREATE OR REPLACE FUNCTION flight_recorder._check_schema_size()
@@ -959,6 +992,7 @@ BEGIN
         'None'::TEXT;
 END;
 $$;
+
 -- Checks for exclusive DDL locks on critical system catalog tables
 -- Returns true if locks detected to indicate potential lock contention
 CREATE OR REPLACE FUNCTION flight_recorder._check_catalog_ddl_locks()
@@ -988,6 +1022,8 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder._check_catalog_ddl_locks() IS 'Pre-check for DDL locks on system catalogs to avoid lock contention';
+
+
 -- Evaluates replica lag, active checkpoints, and backups to determine collection eligibility
 -- Returns skip reason message or NULL if collection can proceed
 CREATE OR REPLACE FUNCTION flight_recorder._should_skip_collection()
@@ -1055,6 +1091,8 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder._should_skip_collection() IS 'Pre-flight checks for replication lag, checkpoints, and backups';
+
+
 -- TIER 1: Collect performance samples (wait events, active sessions, locks) into ring buffers
 -- Applies load shedding, circuit breaker, and pre-flight checks before collection
 CREATE OR REPLACE FUNCTION flight_recorder.sample()
@@ -1555,6 +1593,8 @@ EXCEPTION
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.sample() IS 'TIER 1: Collect samples into ring buffer (60s intervals, 3 sections: waits, activity, locks)';
+
+
 -- TIER 2: Aggregate wait events, lock conflicts, and query activity from ring buffers into durable aggregate tables
 CREATE OR REPLACE FUNCTION flight_recorder.flush_ring_to_aggregates()
 RETURNS VOID
@@ -1637,6 +1677,8 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.flush_ring_to_aggregates() IS 'TIER 2: Flush ring buffer to durable aggregates every 5 minutes';
+
+
 -- Archives activity, lock, and wait samples from ring buffers to persistent storage for forensic analysis
 -- Executes periodically (default every 15 minutes) based on configuration settings
 CREATE OR REPLACE FUNCTION flight_recorder.archive_ring_samples()
@@ -1769,6 +1811,8 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'TIER 1.5: Archive raw samples for high-resolution forensic analysis (default: every 15 minutes)';
+
+
 -- Removes aged aggregate and archived sample data based on configured retention periods
 -- Deletes expired records from wait_event_aggregates, lock_aggregates, query_aggregates, and all *_samples_archive tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
@@ -1818,6 +1862,8 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'TIER 2: Clean up old aggregate data based on retention period';
+
+
 -- TIER 1: Collect comprehensive snapshot of PostgreSQL system metrics (WAL, checkpoints, I/O, replication, statements)
 -- Returns the captured timestamp for downstream processing and analysis
 CREATE OR REPLACE FUNCTION flight_recorder.snapshot()
@@ -2641,6 +2687,7 @@ LANGUAGE sql STABLE AS $$
     GROUP BY w.backend_type, w.wait_event_type, w.wait_event, t.cnt
     ORDER BY total_waiters DESC, sample_count DESC;
 $$;
+
 -- Compares statement execution metrics between two snapshots, calculating performance deltas
 -- Identifies queries with significant changes in execution time and resource consumption
 CREATE OR REPLACE FUNCTION flight_recorder.statement_compare(
@@ -2754,6 +2801,7 @@ LANGUAGE sql STABLE AS $$
     ORDER BY (m.total_exec_time_end - COALESCE(m.total_exec_time_start, 0)) DESC
     LIMIT p_limit
 $$;
+
 -- Retrieves active session details at a specific point in time
 -- Shows query text, wait events, and session state from archived activity samples
 CREATE OR REPLACE FUNCTION flight_recorder.activity_at(p_timestamp TIMESTAMPTZ)
@@ -2866,6 +2914,7 @@ LANGUAGE sql STABLE AS $$
     CROSS JOIN sample_progress sp
     CROSS JOIN wait_array wa
 $$;
+
 -- Analyzes database metrics within a time window and reports detected anomalies (checkpoints, buffer pressure, lock contention, etc.)
 -- Returns anomalies with severity levels and actionable remediation recommendations
 CREATE OR REPLACE FUNCTION flight_recorder.anomaly_report(
@@ -2970,6 +3019,7 @@ BEGIN
     RETURN;
 END;
 $$;
+
 -- Generates a comprehensive performance report with metrics and interpretations for a specified time window
 -- Aggregates data from compare, anomaly detection, wait events, and lock contention to provide human-readable insights
 CREATE OR REPLACE FUNCTION flight_recorder.summary_report(
@@ -3088,6 +3138,7 @@ BEGIN
     RETURN;
 END;
 $$;
+
 -- Switches flight recorder to specified mode (normal/light/emergency) with different overhead and retention trade-offs
 -- Validates mode and configures sampling interval and collector enablement accordingly
 CREATE OR REPLACE FUNCTION flight_recorder.set_mode(p_mode TEXT)
@@ -3156,6 +3207,7 @@ BEGIN
     RETURN v_description;
 END;
 $$;
+
 -- Retrieve the current flight recorder operating mode and its associated configuration
 -- Returns mode, sample interval, and feature flags for locks, progress, and statement tracking
 CREATE OR REPLACE FUNCTION flight_recorder.get_mode()
@@ -3179,6 +3231,7 @@ LANGUAGE sql STABLE AS $$
         COALESCE(flight_recorder._get_config('enable_progress', 'true')::boolean, true) AS progress_enabled,
         flight_recorder._get_config('statements_enabled', 'auto') AS statements_enabled
 $$;
+
 -- Lists the available monitoring profiles for flight recorder with their configurations, use cases, and overhead levels
 CREATE OR REPLACE FUNCTION flight_recorder.list_profiles()
 RETURNS TABLE(
@@ -3222,6 +3275,7 @@ LANGUAGE sql STABLE AS $$
          'Minimal (~0.013% CPU)')
     ) AS t(profile_name, description, use_case, sample_interval, overhead_level)
 $$;
+
 -- Preview the configuration changes from applying a specified profile
 -- Compares current settings against profile values to show impact before applying
 CREATE OR REPLACE FUNCTION flight_recorder.explain_profile(p_profile_name TEXT)
@@ -3325,6 +3379,7 @@ BEGIN
     LEFT JOIN flight_recorder.config c ON c.key = ps.key
     ORDER BY will_change DESC, ps.key;
 END $$;
+
 -- Applies a named configuration profile to flight_recorder by upserting configuration settings
 -- Returns details of changed settings and adjusts recording mode based on the profile
 CREATE OR REPLACE FUNCTION flight_recorder.apply_profile(p_profile_name TEXT)
@@ -3529,6 +3584,7 @@ BEGIN
     RAISE NOTICE 'Profile "%" applied: % settings changed, mode set to %', 
         p_profile_name, v_changes_made, v_mode;
 END $$;
+
 -- Identifies the closest matching predefined profile for current configuration and returns match percentage with differences
 -- Helps users understand their configuration state relative to available profiles
 CREATE OR REPLACE FUNCTION flight_recorder.get_current_profile()
@@ -3581,6 +3637,7 @@ BEGIN
         END::text;
 END $$;
 DROP FUNCTION IF EXISTS flight_recorder.cleanup(INTERVAL);
+
 -- Removes old snapshot and sample data based on configured retention periods
 -- Cleans up snapshots, statement_snapshots, replication_snapshots tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup(p_retain_interval INTERVAL DEFAULT NULL)
@@ -3653,6 +3710,7 @@ BEGIN
 END;
 $$;
 DROP FUNCTION IF EXISTS flight_recorder.ring_buffer_health();
+
 -- Monitor ring buffer health: XID age, dead tuple bloat, HOT update effectiveness, and autovacuum status
 CREATE OR REPLACE FUNCTION flight_recorder.ring_buffer_health()
 RETURNS TABLE(
@@ -3706,6 +3764,7 @@ LANGUAGE sql STABLE AS $$
     ORDER BY c.relname;
 $$;
 COMMENT ON FUNCTION flight_recorder.ring_buffer_health() IS
+
 'Monitor ring buffer XID age, dead tuple bloat, and HOT update effectiveness. samples_ring uses UPSERT (1,440x/day) and should achieve >90% HOT update ratio with fillfactor=70. Child tables use DELETE/INSERT so HOT updates are N/A.';
 -- Disable Flight Recorder by unscheduling all cron jobs and updating the enabled configuration flag to false
 CREATE OR REPLACE FUNCTION flight_recorder.disable()
@@ -3742,6 +3801,7 @@ BEGIN
     END;
 END;
 $$;
+
 -- Enables flight recorder by scheduling periodic cron jobs for collection, archival, and cleanup
 -- Requires pg_cron extension; returns status message on success
 CREATE OR REPLACE FUNCTION flight_recorder.enable()
@@ -3886,6 +3946,7 @@ EXCEPTION
         RAISE NOTICE 'pg_cron extension not found. Automatic scheduling disabled. Run flight_recorder.snapshot() and flight_recorder.sample() manually or via external scheduler.';
 END;
 $$;
+
 -- Performs comprehensive health check of Flight Recorder system components
 -- Reports status, metrics, and recommended actions for critical subsystems
 CREATE OR REPLACE FUNCTION flight_recorder.health_check()
@@ -4069,6 +4130,7 @@ BEGIN
     END;
 END;
 $$;
+
 -- Generates a health report of flight recorder operations, including collection performance metrics,
 -- success rates, and schema size with qualitative assessments
 CREATE OR REPLACE FUNCTION flight_recorder.performance_report(p_lookback_interval INTERVAL DEFAULT '24 hours')
@@ -4220,6 +4282,7 @@ BEGIN
         END::text;
 END;
 $$;
+
 -- Monitors flight recorder system health by checking for circuit breaker trips, schema size limits, collection failures, and stale data
 -- Returns alerts with severity levels (CRITICAL/WARNING) and recommendations when thresholds are exceeded
 CREATE OR REPLACE FUNCTION flight_recorder.check_alerts(p_lookback_interval INTERVAL DEFAULT '1 hour')
@@ -4309,6 +4372,7 @@ BEGIN
     END;
 END;
 $$;
+
 -- Aggregates and exports flight recorder diagnostic data (samples, snapshots, anomalies, waits)
 -- within a time range as JSONB
 CREATE OR REPLACE FUNCTION flight_recorder.export_json(
@@ -4386,6 +4450,7 @@ BEGIN
     RETURN v_result;
 END;
 $$;
+
 -- Analyzes current metrics (schema size, sample duration, retention settings) and returns configuration optimization recommendations
 -- Provides actionable SQL commands for performance, storage, and automation tuning
 CREATE OR REPLACE FUNCTION flight_recorder.config_recommendations()
@@ -4454,6 +4519,7 @@ BEGIN
     END IF;
 END;
 $$;
+
 -- Validates system readiness for flight recorder installation by checking resources, connections, and dependencies
 -- Returns component status (GO/CAUTION/NO-GO) to determine installation viability
 CREATE OR REPLACE FUNCTION flight_recorder.preflight_check()
@@ -4574,6 +4640,7 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.preflight_check() IS
+
 'Pre-installation validation checks. Returns component status (GO/CAUTION/NO-GO). For summary, use preflight_check_with_summary().';
 -- Executes preflight validation checks and appends a summary row indicating overall system readiness (READY, CAUTION, or NO-GO)
 CREATE OR REPLACE FUNCTION flight_recorder.preflight_check_with_summary()
@@ -4616,6 +4683,7 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.preflight_check_with_summary() IS
+
 'Pre-installation validation with summary. Calls preflight_check() twice - once for results, once to count. More expensive but includes summary row.';
 -- Generates a comprehensive quarterly health review of the flight_recorder system
 -- Assesses collection performance, storage consumption, reliability, circuit breaker activity, and data freshness
@@ -4818,6 +4886,7 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.quarterly_review() IS
+
 'Quarterly health check for flight recorder. Returns component metrics (EXCELLENT/GOOD/REVIEW NEEDED/ERROR). For summary, use quarterly_review_with_summary().';
 -- Quarterly health check with summary. Appends overall health status (HEALTHY or ACTION REQUIRED) based on count of ERROR or REVIEW NEEDED items detected
 -- More expensive than quarterly_review() as it calls it twice - once for detailed results, once to count critical issues
@@ -4852,6 +4921,7 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.quarterly_review_with_summary() IS
+
 'Quarterly health check with summary. Calls quarterly_review() twice - once for results, once to count. More expensive but includes summary row.';
 -- Analyzes database resource capacity metrics (connections, memory, storage, transactions) over a time window
 -- Returns utilization status with actionable recommendations
@@ -5221,6 +5291,7 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.capacity_summary(INTERVAL) IS
+
 'Capacity planning summary across all resource dimensions. Analyzes connections, memory (shared_buffers, work_mem), I/O (cache hit ratio), storage growth, and transaction rates over the specified time window. Returns utilization, status (healthy/warning/critical), and actionable recommendations. Part of Phase 1 MVP capacity planning enhancements (FR-2.1).';
 CREATE OR REPLACE VIEW flight_recorder.capacity_dashboard AS
 WITH
