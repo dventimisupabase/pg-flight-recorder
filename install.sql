@@ -364,31 +364,26 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
 
     -- Temp file usage (pg_stat_database)
     temp_files                  BIGINT,           -- cumulative temp files created
-    temp_bytes                  BIGINT            -- cumulative temp bytes written
+    temp_bytes                  BIGINT,           -- cumulative temp bytes written
+
+    -- Capacity Planning Columns (FR-1) - Transaction rate metrics (from pg_stat_database)
+    xact_commit                 BIGINT,
+    xact_rollback               BIGINT,
+
+    -- Block I/O metrics (from pg_stat_database)
+    blks_read                   BIGINT,
+    blks_hit                    BIGINT,
+
+    -- Connection metrics (from pg_stat_activity and pg_settings)
+    connections_active          INTEGER,
+    connections_total           INTEGER,
+    connections_max             INTEGER,
+
+    -- Database size metrics (statistical estimate from pg_class.relpages - fast!)
+    db_size_bytes               BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
-
--- -----------------------------------------------------------------------------
--- Capacity Planning Columns (FR-1) - Added for capacity planning enhancements
--- These columns track additional metrics needed for right-sizing and capacity analysis
--- -----------------------------------------------------------------------------
-
--- Transaction rate metrics (from pg_stat_database)
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS xact_commit BIGINT;
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS xact_rollback BIGINT;
-
--- Block I/O metrics (from pg_stat_database)
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS blks_read BIGINT;
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS blks_hit BIGINT;
-
--- Connection metrics (from pg_stat_activity and pg_settings)
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_active INTEGER;
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_total INTEGER;
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS connections_max INTEGER;
-
--- Database size metrics (statistical estimate from pg_class.relpages - fast!)
-ALTER TABLE flight_recorder.snapshots ADD COLUMN IF NOT EXISTS db_size_bytes BIGINT;
 
 -- -----------------------------------------------------------------------------
 -- Table: replication_snapshots - Per-replica stats captured with each snapshot
