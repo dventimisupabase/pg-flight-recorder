@@ -3485,6 +3485,9 @@ SELECT ok(
 -- 15.3 CIRCUIT BREAKER (10 tests)
 -- -----------------------------------------------------------------------------
 
+-- Disable jitter to prevent race conditions with background cron jobs
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collection_jitter_enabled';
+
 -- Test 1: Circuit breaker disabled
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'circuit_breaker_enabled';
 DELETE FROM flight_recorder.collection_stats;
@@ -3669,6 +3672,9 @@ SELECT ok(
     flight_recorder._check_circuit_breaker('sample') = false,
     'Safety: Circuit breaker should recover after 3 fast collections'
 );
+
+-- Re-enable jitter after circuit breaker tests
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'collection_jitter_enabled';
 
 -- =============================================================================
 -- 6. ARCHIVE FUNCTIONALITY (12 tests)
