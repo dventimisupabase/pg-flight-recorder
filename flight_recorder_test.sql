@@ -6,7 +6,7 @@
 -- =============================================================================
 
 BEGIN;
-SELECT plan(451);  -- Expanded test suite: 378 base (original) + 16 archive tests (Phase 6) + 57 capacity planning tests (Phase 1 MVP)
+SELECT plan(474);  -- Expanded test suite: 378 base + 16 archive tests + 57 capacity planning + 23 feature designs (table/index/config tracking)
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -248,7 +248,7 @@ SELECT ok(
 -- =============================================================================
 
 -- Capture a second snapshot and sample for time-based queries
-SELECT pg_sleep(1);
+SELECT pg_sleep(0.1);
 SELECT flight_recorder.snapshot();
 SELECT flight_recorder.sample();
 
@@ -2534,7 +2534,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         -- Query deltas view with io_* columns
@@ -2555,7 +2555,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
         SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
@@ -2579,7 +2579,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
@@ -2628,7 +2628,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
@@ -2667,7 +2667,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         -- Test multiple analysis functions
@@ -2825,7 +2825,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
         SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
@@ -2848,7 +2848,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT io_ckpt_writes_delta INTO v_io_delta
@@ -2870,7 +2870,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
@@ -2892,7 +2892,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
@@ -3005,7 +3005,7 @@ BEGIN
 
     IF v_pg_version = 17 THEN
         SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
         SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
@@ -3053,7 +3053,7 @@ BEGIN
 
     IF v_pg_version = 17 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
@@ -3121,7 +3121,7 @@ BEGIN
 
     IF v_pg_version = 17 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         -- Test multiple analysis functions
@@ -4149,6 +4149,139 @@ SELECT ok(
 SELECT lives_ok(
     $$SELECT * FROM flight_recorder.capacity_summary(interval '30 days')$$,
     'Backward compatibility: capacity_summary should handle historical NULLs'
+);
+
+-- =============================================================================
+-- FEATURE DESIGNS: TABLE/INDEX/CONFIG TRACKING (23 tests)
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Section 1: Table Existence (3 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT has_table('flight_recorder', 'table_snapshots', 'Table flight_recorder.table_snapshots should exist');
+SELECT has_table('flight_recorder', 'index_snapshots', 'Table flight_recorder.index_snapshots should exist');
+SELECT has_table('flight_recorder', 'config_snapshots', 'Table flight_recorder.config_snapshots should exist');
+
+-- -----------------------------------------------------------------------------
+-- Section 2: Collection Function Existence (3 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT has_function('flight_recorder', '_collect_table_stats', 'Function flight_recorder._collect_table_stats should exist');
+SELECT has_function('flight_recorder', '_collect_index_stats', 'Function flight_recorder._collect_index_stats should exist');
+SELECT has_function('flight_recorder', '_collect_config_snapshot', 'Function flight_recorder._collect_config_snapshot should exist');
+
+-- -----------------------------------------------------------------------------
+-- Section 3: Analysis Function Existence (7 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT has_function('flight_recorder', 'table_compare', 'Function flight_recorder.table_compare should exist');
+SELECT has_function('flight_recorder', 'table_hotspots', 'Function flight_recorder.table_hotspots should exist');
+SELECT has_function('flight_recorder', 'unused_indexes', 'Function flight_recorder.unused_indexes should exist');
+SELECT has_function('flight_recorder', 'index_efficiency', 'Function flight_recorder.index_efficiency should exist');
+SELECT has_function('flight_recorder', 'config_changes', 'Function flight_recorder.config_changes should exist');
+SELECT has_function('flight_recorder', 'config_at', 'Function flight_recorder.config_at should exist');
+SELECT has_function('flight_recorder', 'config_health_check', 'Function flight_recorder.config_health_check should exist');
+
+-- -----------------------------------------------------------------------------
+-- Section 4: Collection Function Execution (3 tests)
+-- -----------------------------------------------------------------------------
+
+-- First capture a snapshot to get a valid snapshot_id
+DO $$
+DECLARE
+    v_snapshot_id INTEGER;
+BEGIN
+    SELECT id INTO v_snapshot_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+    IF v_snapshot_id IS NULL THEN
+        SELECT flight_recorder.snapshot();
+        SELECT id INTO v_snapshot_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+    END IF;
+    -- Store for tests
+    CREATE TEMP TABLE IF NOT EXISTS test_snapshot_id (id INTEGER);
+    DELETE FROM test_snapshot_id;
+    INSERT INTO test_snapshot_id VALUES (v_snapshot_id);
+END $$;
+
+SELECT lives_ok(
+    $$SELECT flight_recorder._collect_table_stats((SELECT id FROM test_snapshot_id))$$,
+    'Table stats collection executes without error'
+);
+
+SELECT lives_ok(
+    $$SELECT flight_recorder._collect_index_stats((SELECT id FROM test_snapshot_id))$$,
+    'Index stats collection executes without error'
+);
+
+SELECT lives_ok(
+    $$SELECT flight_recorder._collect_config_snapshot((SELECT id FROM test_snapshot_id))$$,
+    'Config snapshot collection executes without error'
+);
+
+-- -----------------------------------------------------------------------------
+-- Section 5: Analysis Function Execution (7 tests)
+-- -----------------------------------------------------------------------------
+
+-- Get time range for queries
+DO $$
+DECLARE
+    v_start_time TIMESTAMPTZ;
+    v_end_time TIMESTAMPTZ;
+BEGIN
+    v_start_time := now() - interval '1 hour';
+    v_end_time := now();
+    -- Store for later tests
+    CREATE TEMP TABLE IF NOT EXISTS test_feature_times (start_time TIMESTAMPTZ, end_time TIMESTAMPTZ);
+    DELETE FROM test_feature_times;
+    INSERT INTO test_feature_times VALUES (v_start_time, v_end_time);
+END;
+$$;
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.table_compare(
+        (SELECT start_time FROM test_feature_times),
+        (SELECT end_time FROM test_feature_times)
+    )$$,
+    'table_compare() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.table_hotspots(
+        (SELECT start_time FROM test_feature_times),
+        (SELECT end_time FROM test_feature_times)
+    )$$,
+    'table_hotspots() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.unused_indexes()$$,
+    'unused_indexes() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.index_efficiency(
+        (SELECT start_time FROM test_feature_times),
+        (SELECT end_time FROM test_feature_times)
+    )$$,
+    'index_efficiency() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.config_changes(
+        (SELECT start_time FROM test_feature_times),
+        (SELECT end_time FROM test_feature_times)
+    )$$,
+    'config_changes() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.config_at(now())$$,
+    'config_at() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.config_health_check()$$,
+    'config_health_check() should execute without error'
 );
 
 SELECT * FROM finish();
