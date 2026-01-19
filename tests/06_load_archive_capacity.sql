@@ -12,6 +12,9 @@ SELECT plan(89);
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
 
+-- Disable collection jitter to speed up tests (default is 0-10 second random delay)
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collection_jitter_enabled';
+
 -- =============================================================================
 -- 15. LOAD SHEDDING & CIRCUIT BREAKER (30 tests) - Phase 5
 -- =============================================================================
@@ -296,9 +299,6 @@ SELECT ok(
 -- 15.3 CIRCUIT BREAKER (10 tests)
 -- -----------------------------------------------------------------------------
 
--- Disable jitter to prevent race conditions with background cron jobs
-UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collection_jitter_enabled';
-
 -- Test 1: Circuit breaker disabled
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'circuit_breaker_enabled';
 DELETE FROM flight_recorder.collection_stats;
@@ -418,9 +418,6 @@ SELECT ok(
 
 -- Reset threshold
 UPDATE flight_recorder.config SET value = '1000' WHERE key = 'circuit_breaker_threshold_ms';
-
--- Re-enable jitter after circuit breaker tests
-UPDATE flight_recorder.config SET value = 'true' WHERE key = 'collection_jitter_enabled';
 
 -- =============================================================================
 -- 6. ARCHIVE FUNCTIONALITY (12 tests)

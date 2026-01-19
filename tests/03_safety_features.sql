@@ -12,6 +12,9 @@ SELECT plan(70);
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
 
+-- Disable collection jitter to speed up tests (default is 0-10 second random delay)
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'collection_jitter_enabled';
+
 -- =============================================================================
 -- 8. KILL SWITCH (6 tests)
 -- =============================================================================
