@@ -3554,8 +3554,11 @@ BEGIN
             v_sample_interval_minutes := CEILING(v_sample_interval_seconds::numeric / 60.0)::integer;
             v_cron_expression := format('*/%s * * * *', v_sample_interval_minutes);
         END IF;
-        PERFORM cron.unschedule('flight_recorder_sample');
-        PERFORM cron.schedule('flight_recorder_sample', v_cron_expression, 'SELECT flight_recorder.sample()');
+        -- Only reschedule if the job exists (i.e., collection is enabled)
+        IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_sample') THEN
+            PERFORM cron.unschedule('flight_recorder_sample');
+            PERFORM cron.schedule('flight_recorder_sample', v_cron_expression, 'SELECT flight_recorder.sample()');
+        END IF;
     EXCEPTION
         WHEN undefined_table THEN NULL;
         WHEN undefined_function THEN NULL;

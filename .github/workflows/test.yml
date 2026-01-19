@@ -55,7 +55,11 @@ jobs:
         run: |
           docker compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
 
-      - name: Run pgTAP tests (442 tests)
+      - name: Disable scheduled jobs for testing
+        run: |
+          docker compose exec -T postgres psql -U postgres -d postgres -c "SELECT flight_recorder.disable();"
+
+      - name: Run pgTAP tests (462 tests)
         run: |
           docker compose exec -T postgres sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql'
 

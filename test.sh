@@ -50,6 +50,9 @@ run_tests() {
     echo "Installing pgTAP extension..."
     docker-compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
 
+    echo "Disabling scheduled jobs for testing..."
+    docker-compose exec -T postgres psql -U postgres -d postgres -c "SELECT flight_recorder.disable();" > /dev/null
+
     echo "Running tests with per-file timing..."
     docker-compose exec -T postgres sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql'
 
@@ -91,6 +94,7 @@ run_parallel_tests() {
             docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /dev/null
             docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -f /install.sql > /dev/null
             docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
+            docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -c "SELECT flight_recorder.disable();" > /dev/null
         ) &
     done
     wait
