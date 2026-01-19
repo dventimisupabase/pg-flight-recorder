@@ -3,11 +3,11 @@
 -- =============================================================================
 -- Tests: Kill switch, P0-P4 safety features, configuration profiles
 -- Sections: 8, 9, 10 (P1/P2), 11, 12, Configuration Profiles
--- Test count: 70
+-- Test count: 75
 -- =============================================================================
 
 BEGIN;
-SELECT plan(70);
+SELECT plan(75);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -337,6 +337,36 @@ SELECT lives_ok(
 SELECT ok(
     (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'meta'),
     'P4: export_json() should include meta in result'
+);
+
+-- Test P4: Export includes table_hotspots
+SELECT ok(
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'table_hotspots'),
+    'P4: export_json() should include table_hotspots in result'
+);
+
+-- Test P4: Export includes index_efficiency
+SELECT ok(
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'index_efficiency'),
+    'P4: export_json() should include index_efficiency in result'
+);
+
+-- Test P4: Export includes config_changes
+SELECT ok(
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'config_changes'),
+    'P4: export_json() should include config_changes in result'
+);
+
+-- Test P4: Export includes db_role_config_changes
+SELECT ok(
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'db_role_config_changes'),
+    'P4: export_json() should include db_role_config_changes in result'
+);
+
+-- Test P4: Export version is 1.1-ai
+SELECT ok(
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now())->'meta'->>'version' = '1.1-ai'),
+    'P4: export_json() should have version 1.1-ai'
 );
 
 -- Test P4: Config recommendations function exists

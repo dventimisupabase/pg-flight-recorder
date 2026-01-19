@@ -490,6 +490,43 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `archive_ring_samples()` | Archive raw samples for forensic analysis |
 | `cleanup_aggregates()` | Clean old aggregate and archive data |
 
+### export_json() Output Structure
+
+The `export_json(start, end)` function returns a JSONB object optimized for AI analysis. It aggregates data from multiple analysis functions into a single payload.
+
+**Output sections:**
+
+| Section | Source | Content |
+|---------|--------|---------|
+| `meta` | Generated | Version, timestamp, schema documentation |
+| `range` | Parameters | Start/end timestamps of the export window |
+| `anomalies` | `anomaly_report()` | Auto-detected issues (checkpoints, buffer pressure, etc.) |
+| `wait_summary` | `wait_summary()` | Aggregated wait events by type |
+| `table_hotspots` | `table_hotspots()` | Table issues: seq scan storms, bloat, low HOT ratio |
+| `index_efficiency` | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
+| `config_changes` | `config_changes()` | PostgreSQL parameter changes during window |
+| `db_role_config_changes` | `db_role_config_changes()` | Database/role override changes during window |
+| `samples` | Ring buffers | Raw wait events and lock samples (compact array format) |
+| `snapshots` | Snapshots table | System stats: WAL, checkpoints, bgwriter (compact array format) |
+
+**Example usage:**
+
+```sql
+-- Export last hour for AI analysis
+SELECT flight_recorder.export_json(
+    now() - interval '1 hour',
+    now()
+);
+
+-- Export incident window
+SELECT flight_recorder.export_json(
+    '2024-01-15 14:00:00'::timestamptz,
+    '2024-01-15 15:00:00'::timestamptz
+);
+```
+
+**Schema documentation** is embedded in the `meta.schemas` field to help AI consumers interpret compact array formats.
+
 ## Views Reference
 
 | View | Purpose |

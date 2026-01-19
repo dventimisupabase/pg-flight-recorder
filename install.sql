@@ -4791,11 +4791,36 @@ DECLARE
     v_snapshots JSONB;
     v_anomalies JSONB;
     v_wait_summary JSONB;
+    v_table_hotspots JSONB;
+    v_index_efficiency JSONB;
+    v_config_changes JSONB;
+    v_db_role_config_changes JSONB;
 BEGIN
+    -- Anomaly detection
     SELECT jsonb_agg(to_jsonb(r)) INTO v_anomalies
     FROM flight_recorder.anomaly_report(p_start_time, p_end_time) r;
+
+    -- Wait event summary
     SELECT jsonb_agg(to_jsonb(r)) INTO v_wait_summary
     FROM flight_recorder.wait_summary(p_start_time, p_end_time) r;
+
+    -- Table hotspots (issues detected)
+    SELECT jsonb_agg(to_jsonb(r)) INTO v_table_hotspots
+    FROM flight_recorder.table_hotspots(p_start_time, p_end_time) r;
+
+    -- Index efficiency analysis
+    SELECT jsonb_agg(to_jsonb(r)) INTO v_index_efficiency
+    FROM flight_recorder.index_efficiency(p_start_time, p_end_time) r;
+
+    -- Configuration changes during window
+    SELECT jsonb_agg(to_jsonb(r)) INTO v_config_changes
+    FROM flight_recorder.config_changes(p_start_time, p_end_time) r;
+
+    -- Database/role configuration changes during window
+    SELECT jsonb_agg(to_jsonb(r)) INTO v_db_role_config_changes
+    FROM flight_recorder.db_role_config_changes(p_start_time, p_end_time) r;
+
+    -- Ring buffer samples (compact array format)
     SELECT jsonb_agg(
         jsonb_build_array(
             s.captured_at,
@@ -4824,6 +4849,8 @@ BEGIN
     INTO v_samples
     FROM flight_recorder.samples_ring s
     WHERE s.captured_at BETWEEN p_start_time AND p_end_time;
+
+    -- System snapshots (compact array format)
     SELECT jsonb_agg(
         jsonb_build_array(
             sn.captured_at,
@@ -4836,18 +4863,28 @@ BEGIN
     INTO v_snapshots
     FROM flight_recorder.snapshots sn
     WHERE sn.captured_at BETWEEN p_start_time AND p_end_time;
+
+    -- Build result with all data sources
     v_result := jsonb_build_object(
         'meta', jsonb_build_object(
             'generated_at', now(),
-            'version', '1.0-ai',
+            'version', '1.1-ai',
             'schemas', jsonb_build_object(
                 'samples', '[captured_at, wait_events[[backend, type, event, count]], locks[[blocked_pid, blocking_pid, type, duration]]]',
-                'snapshots', '[captured_at, wal_bytes, ckpt_timed, ckpt_req, bgw_backend_writes]'
+                'snapshots', '[captured_at, wal_bytes, ckpt_timed, ckpt_req, bgw_backend_writes]',
+                'table_hotspots', '{schemaname, relname, issue_type, severity, description, recommendation}',
+                'index_efficiency', '{schemaname, relname, indexrelname, idx_scan_delta, idx_tup_read_delta, idx_tup_fetch_delta, selectivity, index_size, scans_per_gb}',
+                'config_changes', '{parameter_name, old_value, new_value, old_source, new_source, changed_at}',
+                'db_role_config_changes', '{database_name, role_name, parameter_name, old_value, new_value, change_type}'
             )
         ),
         'range', jsonb_build_object('start', p_start_time, 'end', p_end_time),
         'anomalies', COALESCE(v_anomalies, '[]'::jsonb),
         'wait_summary', COALESCE(v_wait_summary, '[]'::jsonb),
+        'table_hotspots', COALESCE(v_table_hotspots, '[]'::jsonb),
+        'index_efficiency', COALESCE(v_index_efficiency, '[]'::jsonb),
+        'config_changes', COALESCE(v_config_changes, '[]'::jsonb),
+        'db_role_config_changes', COALESCE(v_db_role_config_changes, '[]'::jsonb),
         'samples', COALESCE(v_samples, '[]'::jsonb),
         'snapshots', COALESCE(v_snapshots, '[]'::jsonb)
     );
