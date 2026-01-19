@@ -1,0 +1,74 @@
+services:
+  postgres15:
+    build:
+      context: .
+      args:
+        PG_VERSION: 15
+    image: pg-flight-recorder-test:15
+    container_name: pg-flight-recorder-test-15
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5415:5432"
+    volumes:
+      - postgres15_data:/var/lib/postgresql/data
+      - ./install.sql:/install.sql:ro
+      - ./tests:/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres16:
+    build:
+      context: .
+      args:
+        PG_VERSION: 16
+    image: pg-flight-recorder-test:16
+    container_name: pg-flight-recorder-test-16
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5416:5432"
+    volumes:
+      - postgres16_data:/var/lib/postgresql/data
+      - ./install.sql:/install.sql:ro
+      - ./tests:/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres17:
+    build:
+      context: .
+      args:
+        PG_VERSION: 17
+    image: pg-flight-recorder-test:17
+    container_name: pg-flight-recorder-test-17
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5417:5432"
+    volumes:
+      - postgres17_data:/var/lib/postgresql/data
+      - ./install.sql:/install.sql:ro
+      - ./tests:/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres15_data:
+  postgres16_data:
+  postgres17_data:

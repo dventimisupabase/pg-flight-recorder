@@ -248,7 +248,7 @@ SELECT ok(
 -- =============================================================================
 
 -- Capture a second snapshot and sample for time-based queries
-SELECT pg_sleep(1);
+SELECT pg_sleep(0.1);
 SELECT flight_recorder.snapshot();
 SELECT flight_recorder.sample();
 
@@ -2534,7 +2534,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         -- Query deltas view with io_* columns
@@ -2555,7 +2555,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
         SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
@@ -2579,7 +2579,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
@@ -2628,7 +2628,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
@@ -2667,7 +2667,7 @@ BEGIN
 
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         -- Test multiple analysis functions
@@ -2825,7 +2825,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
         SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
@@ -2848,7 +2848,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT io_ckpt_writes_delta INTO v_io_delta
@@ -2870,7 +2870,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
@@ -2892,7 +2892,7 @@ BEGIN
 
     IF v_pg_version = 16 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         PERFORM * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
@@ -3005,7 +3005,7 @@ BEGIN
 
     IF v_pg_version = 17 THEN
         SELECT id INTO v_start_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
         SELECT id INTO v_end_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
 
@@ -3053,7 +3053,7 @@ BEGIN
 
     IF v_pg_version = 17 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         SELECT flight_recorder.summary_report(now() - interval '1 hour', now()) INTO v_report;
@@ -3121,7 +3121,7 @@ BEGIN
 
     IF v_pg_version = 17 THEN
         PERFORM flight_recorder.snapshot();
-        PERFORM pg_sleep(1);
+        PERFORM pg_sleep(0.1);
         PERFORM flight_recorder.snapshot();
 
         -- Test multiple analysis functions
