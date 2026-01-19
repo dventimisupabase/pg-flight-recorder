@@ -141,8 +141,11 @@ Point-in-time cumulative statistics for long-term trends.
 | `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O |
 | `replication_snapshots` | pg_stat_replication, replication slots |
 | `statement_snapshots` | pg_stat_statements top queries |
+| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat) |
+| `index_snapshots` | Per-index usage and size |
+| `config_snapshots` | PostgreSQL configuration parameters |
 
-Query via: `compare(start, end)`, `statement_compare(start, end)`, `deltas` view.
+Query via: `compare(start, end)`, `statement_compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`, `config_at(timestamp)`.
 
 ### Ring Buffer Mechanism
 
@@ -383,6 +386,26 @@ Formula: `retention = slots × interval` (120 × 180s = 21,600s = 6 hours)
 | `collect_database_size` | true | Collect db_size_bytes |
 | `collect_connection_metrics` | true | Collect connection metrics |
 
+### Table & Index Tracking Settings
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `table_stats_enabled` | true | Enable per-table statistics collection |
+| `table_stats_top_n` | 50 | Number of hottest tables to track per snapshot |
+| `index_stats_enabled` | true | Enable per-index usage tracking |
+
+Table tracking captures seq scans, index scans, tuple activity, bloat indicators, and vacuum/analyze counts for the top N most active tables.
+
+Index tracking captures scan counts, tuple reads/fetches, and index sizes for detecting unused or inefficient indexes.
+
+### Configuration Snapshot Settings
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `config_snapshots_enabled` | true | Enable PostgreSQL config tracking |
+
+Configuration snapshots capture ~50 relevant PostgreSQL parameters (memory, connections, parallelism, WAL, autovacuum, etc.) to provide context during incident analysis and detect configuration drift.
+
 ### Threshold Tuning
 
 Safety thresholds control when collection skips or degrades:
@@ -422,6 +445,13 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `summary_report(start, end)` | Comprehensive diagnostic report |
 | `statement_compare(start, end)` | Compare query performance (requires pg_stat_statements) |
 | `capacity_summary(time_window)` | Analyze resource utilization and headroom |
+| `table_compare(start, end)` | Compare table activity (seq scans, writes, bloat) |
+| `table_hotspots(start, end)` | Detect table issues (seq scan storms, bloat, low HOT ratio) |
+| `index_efficiency(start, end)` | Analyze index usage and selectivity |
+| `unused_indexes(lookback)` | Find indexes with zero or low usage |
+| `config_at(timestamp)` | Show PostgreSQL configuration at a point in time |
+| `config_changes(start, end)` | Detect configuration parameter changes |
+| `config_health_check()` | Analyze current config for common issues |
 
 ### Control Functions
 
@@ -548,6 +578,60 @@ ORDER BY mean_exec_time_delta_ms DESC;
 SELECT * FROM flight_recorder.deltas
 ORDER BY captured_at DESC
 LIMIT 10;
+```
+
+### Table Hotspot Analysis
+
+Identify which tables are under pressure during an incident:
+
+```sql
+-- Compare table activity over a time window
+SELECT * FROM flight_recorder.table_compare(
+    '2024-01-15 10:00',
+    '2024-01-15 11:00'
+)
+ORDER BY total_activity DESC
+LIMIT 10;
+
+-- Auto-detect table issues (seq scan storms, bloat, low HOT ratio)
+SELECT * FROM flight_recorder.table_hotspots(
+    '2024-01-15 10:00',
+    '2024-01-15 11:00'
+);
+```
+
+### Index Usage Analysis
+
+Find unused or inefficient indexes:
+
+```sql
+-- Indexes never used in last 7 days (candidates for removal)
+SELECT * FROM flight_recorder.unused_indexes('7 days');
+
+-- Index efficiency during a time window
+SELECT * FROM flight_recorder.index_efficiency(
+    '2024-01-15 10:00',
+    '2024-01-15 11:00'
+)
+ORDER BY idx_scan_delta DESC;
+```
+
+### Configuration Analysis
+
+Understand configuration context during incidents:
+
+```sql
+-- What was the configuration at incident time?
+SELECT * FROM flight_recorder.config_at('2024-01-15 14:30:00');
+
+-- Detect configuration changes over time
+SELECT * FROM flight_recorder.config_changes(
+    '2024-01-14 00:00',
+    '2024-01-15 00:00'
+);
+
+-- Check current configuration for common issues
+SELECT * FROM flight_recorder.config_health_check();
 ```
 
 ### Quarterly Review
@@ -1105,16 +1189,30 @@ Run tests locally with Docker (supports PostgreSQL 15, 16, 17):
 ./test.sh 15
 ./test.sh 17
 
-# Test all versions
+# Test all versions sequentially
 ./test.sh all
+
+# Test all versions in parallel (fastest)
+./test.sh parallel
 ```
+
+Tests are split into 6 files in `tests/` for per-file timing with `pg_prove --timer`:
+
+| File | Tests | Coverage |
+|------|-------|----------|
+| `01_foundation.sql` | 54 | Installation, functions, core |
+| `02_ring_buffer_analysis.sql` | 25 | Ring buffer, analysis, config |
+| `03_safety_features.sql` | 70 | Kill switch, P0-P4 safety |
+| `04_boundary_critical.sql` | 104 | Boundary tests, critical functions |
+| `05_error_version.sql` | 100 | Error handling, PG15/16/17 specifics |
+| `06_load_archive_capacity.sql` | 89 | Load shedding, archive, capacity |
 
 Or against your own PostgreSQL instance:
 
 ```bash
 psql -f install.sql
 psql -c "CREATE EXTENSION pgtap;"
-pg_prove -U postgres -d postgres flight_recorder_test.sql
+pg_prove --timer -U postgres -d postgres tests/*.sql
 ```
 
 VACUUM warnings during tests are expected (tests run in transactions).
@@ -1180,11 +1278,20 @@ GROUP BY collection_type;
 pg-flight-recorder/
 ├── install.sql                  # Installation script
 ├── uninstall.sql                # Uninstall script
-├── flight_recorder_test.sql     # pgTAP tests
+├── flight_recorder_test.sql     # Original monolithic test file (kept as backup)
+├── tests/                       # Split test files for per-file timing
+│   ├── 01_foundation.sql
+│   ├── 02_ring_buffer_analysis.sql
+│   ├── 03_safety_features.sql
+│   ├── 04_boundary_critical.sql
+│   ├── 05_error_version.sql
+│   └── 06_load_archive_capacity.sql
 ├── docker-compose.yml           # PostgreSQL + pg_cron for testing
-├── test.sh                      # Test runner
+├── docker-compose.parallel.yml  # Parallel testing across PG 15, 16, 17
+├── test.sh                      # Test runner (supports parallel mode)
 ├── README.md                    # Quick start guide
 ├── REFERENCE.md                 # This file
+├── FEATURE_DESIGNS.md           # Technical designs for new features
 └── benchmark/
     ├── measure_absolute.sh      # Overhead measurement
     └── measure_ddl_impact.sh    # DDL interaction testing
