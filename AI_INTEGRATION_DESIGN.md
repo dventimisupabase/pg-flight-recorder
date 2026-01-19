@@ -9,12 +9,14 @@
 ## The Core Idea
 
 Instead of:
+
 1. Query flight_recorder data in psql
 2. Copy/paste into ChatGPT/Claude
 3. Get diagnosis
 4. Go back to psql for follow-up
 
 Do this:
+
 1. `SELECT flight_recorder.ai_diagnose('2025-01-17 10:00:00', '2025-01-17 11:00:00');`
 2. Get diagnosis directly in psql
 3. Done.
@@ -470,6 +472,7 @@ SELECT flight_recorder.ai_chat('Why was the database slow between 8-9am today?')
 ```
 
 **Behind the scenes**:
+
 1. AI receives question + schema of available flight_recorder functions
 2. AI calls `anomaly_report('08:00', '09:00')` → sees temp file spills
 3. AI calls `statement_compare('08:00', '09:00')` → identifies specific query
@@ -1260,6 +1263,7 @@ ON CONFLICT (key) DO NOTHING;
 ## Implementation Roadmap
 
 ### Phase 1: Basic AI Diagnosis (MVP)
+
 **Goal**: CSAs can call `ai_diagnose()` manually during incidents.
 
 - [ ] Add `ai_diagnoses` table
@@ -1273,6 +1277,7 @@ ON CONFLICT (key) DO NOTHING;
 **Value**: Immediate - reduces diagnosis time from hours to seconds
 
 ### Phase 2: Auto-Diagnosis
+
 **Goal**: Database continuously self-monitors and flags issues.
 
 - [ ] Implement `auto_diagnose()`
@@ -1284,6 +1289,7 @@ ON CONFLICT (key) DO NOTHING;
 **Value**: High - proactive issue detection
 
 ### Phase 3: Incident Reports
+
 **Goal**: Generate customer-facing post-mortems automatically.
 
 - [ ] Implement `ai_incident_report()`
@@ -1294,6 +1300,7 @@ ON CONFLICT (key) DO NOTHING;
 **Value**: High - saves hours of report writing
 
 ### Phase 4: Conversational Agent (Advanced)
+
 **Goal**: Multi-turn investigation with tool use.
 
 - [ ] Implement tool use framework
@@ -1305,6 +1312,7 @@ ON CONFLICT (key) DO NOTHING;
 **Value**: Very High - replaces manual SQL investigation
 
 ### Phase 5: Auto-Remediation (CAUTION!)
+
 **Goal**: Database can fix certain issues automatically.
 
 - [ ] Define safe action whitelist
@@ -1321,17 +1329,20 @@ ON CONFLICT (key) DO NOTHING;
 ## Risk Assessment
 
 ### Low Risk (Safe to Implement)
+
 - ✅ Manual `ai_diagnose()` calls
 - ✅ Auto-diagnosis with logging only
 - ✅ Incident report generation
 - ✅ Query explanation
 
 ### Medium Risk (Needs Testing)
+
 - ⚠️ Conversational agent (could generate bad SQL)
 - ⚠️ Natural language interface (SQL injection risk)
 - ⚠️ Cost control failures (budget exceeded)
 
 ### High Risk (Needs Extensive Validation)
+
 - ❌ Auto-remediation (could make things worse)
 - ❌ Unsanitized data sent to API (privacy leak)
 - ❌ API key exposure (security breach)
@@ -1342,6 +1353,7 @@ ON CONFLICT (key) DO NOTHING;
 ## Testing Strategy
 
 ### 1. Unit Tests
+
 ```sql
 -- Test context building
 SELECT flight_recorder._build_diagnostic_context(
@@ -1357,6 +1369,7 @@ SELECT flight_recorder._sanitize_query(
 ```
 
 ### 2. Integration Tests
+
 ```sql
 -- Test full diagnosis (with mock API)
 SELECT flight_recorder.ai_diagnose(
@@ -1366,6 +1379,7 @@ SELECT flight_recorder.ai_diagnose(
 ```
 
 ### 3. Load Tests
+
 ```sql
 -- Simulate high AI usage
 DO $$
@@ -1381,6 +1395,7 @@ WHERE called_at > now() - interval '1 hour';
 ```
 
 ### 4. Security Tests
+
 ```sql
 -- Attempt to extract API key (should fail)
 SELECT current_setting('flight_recorder.anthropic_api_key');
@@ -1435,6 +1450,7 @@ ORDER BY day;
 ## Future Enhancements
 
 ### Multi-Model Support
+
 Support OpenAI, Anthropic, local models:
 
 ```sql
@@ -1454,6 +1470,7 @@ $$;
 ```
 
 ### Learning from Feedback
+
 Train on past diagnoses:
 
 ```sql
@@ -1474,6 +1491,7 @@ LIMIT 10;
 ```
 
 ### Integration with Alerts
+
 Send AI diagnoses to Slack/PagerDuty:
 
 ```sql
@@ -1503,12 +1521,14 @@ $$;
 ## Conclusion
 
 This design enables a truly **self-aware database** that can:
+
 1. ✅ Diagnose its own performance issues
 2. ✅ Explain problems in plain English
 3. ✅ Generate customer-facing reports
 4. ⚠️ (Optionally) Fix certain issues automatically
 
 **Recommended starting point**: Level 1 + Level 2 + Level 7
+
 - Manual diagnosis for CSAs
 - Auto-diagnosis for continuous monitoring
 - Incident report generation
@@ -1516,6 +1536,7 @@ This design enables a truly **self-aware database** that can:
 **Total implementation time**: ~10-15 hours for MVP
 
 **Key success factors**:
+
 - Start simple (Level 1)
 - Build confidence with testing
 - Add guardrails at every step

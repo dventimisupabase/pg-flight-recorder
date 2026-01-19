@@ -43,17 +43,20 @@ ORDER BY blocked_duration DESC;
 ### What to Look For
 
 **In `recent_activity_current()`:**
+
 - Long-running queries (`query_start` far in the past)
 - State = 'active' with `wait_event_type` not null → blocked on something
 - Many queries with same `query_preview` → query storm
 
 **In `recent_waits_current()`:**
+
 - High counts for `Lock` wait events → contention
 - `IO:DataFileRead` → disk I/O bottleneck
 - `Client:ClientRead` → application not consuming results fast enough
 - `LWLock:buffer_mapping` or `buffer_content` → shared_buffers contention
 
 **In `recent_locks_current()`:**
+
 - Look at `blocking_query_preview` to identify the blocker
 - `lock_type` tells you what kind of lock (e.g., `relation`, `tuple`, `transactionid`)
 - Long `blocked_duration` → urgent intervention needed
@@ -152,17 +155,20 @@ ORDER BY captured_at, query_start;
 ### Interpretation Guide
 
 **From `anomaly_report()`:**
+
 - `FORCED_CHECKPOINT` → WAL size exceeded, increase `max_wal_size`
 - `BUFFER_PRESSURE` → `shared_buffers` exhausted
 - `TEMP_FILE_SPILLS` → queries spilling to disk, increase `work_mem`
 - `LOCK_CONTENTION` → blocking queries identified
 
 **From `statement_compare()`:**
+
 - Large `mean_time_increase_ms` → query regressed
 - High `temp_blks_written_delta` → sorts/joins spilling to disk
 - Low `hit_ratio_pct` (<90%) → poor cache hit ratio, disk I/O bound
 
 **From `wait_summary()`:**
+
 - Dominant wait event reveals bottleneck type
 - `pct_of_samples` shows what % of time was spent waiting
 
@@ -536,11 +542,13 @@ WHERE anomaly_type IN ('CHECKPOINT_DURING_WINDOW', 'FORCED_CHECKPOINT', 'BACKEND
 ### Checkpoint Tuning Guide
 
 **Symptoms of Checkpoint Problems:**
+
 - Performance dips every `checkpoint_timeout` interval (default 5 min)
 - `FORCED_CHECKPOINT` anomalies
 - High `bgw_buffers_backend_fsync` (backends forced to sync)
 
 **Fixes:**
+
 ```sql
 -- Increase checkpoint spacing (reduce frequency)
 ALTER SYSTEM SET checkpoint_timeout = '15min';  -- from default 5min
@@ -615,6 +623,7 @@ SELECT pg_reload_conf();
 ```
 
 **⚠️ Warning**: Setting `work_mem` too high can cause OOM kills!
+
 - Formula: `work_mem * max_connections * max_parallel_workers` should be < available RAM
 - Better: Set per-query in application code for known expensive queries
 

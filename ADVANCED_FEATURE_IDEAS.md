@@ -11,6 +11,7 @@
 This document captures creative ideas for enhancing flight_recorder beyond basic monitoring. These features range from predictive analytics to visual representations, all designed to make database diagnosis faster and more proactive.
 
 **Complexity Spectrum**:
+
 - 🟢 **Low**: 4-8 hours implementation
 - 🟡 **Medium**: 1-2 days implementation
 - 🔴 **High**: 3-5 days implementation
@@ -36,14 +37,17 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 **Complexity**: 🔴 High (3-5 days)
 
 ### The Problem
+
 By the time you see a problem, it's already affecting customers. Reactive monitoring means you're always behind.
 
 ### The Vision
+
 ```sql
 SELECT * FROM flight_recorder.forecast('disk_space', interval '7 days');
 ```
 
 **Returns**:
+
 ```
 ┌──────────────┬──────────────┬─────────────┬────────────────────┬──────────────┐
 │ metric       │ current      │ forecast    │ estimated_depleted │ confidence   │
@@ -60,6 +64,7 @@ SELECT * FROM flight_recorder.forecast('disk_space', interval '7 days');
 ### Forecasting Approaches
 
 #### Linear Regression (Simplest)
+
 ```sql
 CREATE OR REPLACE FUNCTION flight_recorder._forecast_linear(
     p_metric TEXT,
@@ -127,6 +132,7 @@ $$;
 ```
 
 #### Exponential Smoothing (Better for Seasonal Data)
+
 ```sql
 CREATE OR REPLACE FUNCTION flight_recorder._forecast_exponential(
     p_metric TEXT,
@@ -166,6 +172,7 @@ CREATE INDEX forecasts_metric_created_idx ON flight_recorder.forecasts(metric_na
 ```
 
 **Forecastable Metrics**:
+
 1. **Disk Space** - When will disk be full?
 2. **Connection Usage** - When will connection pool saturate?
 3. **WAL Generation Rate** - Predicting checkpoint frequency
@@ -252,14 +259,17 @@ SELECT cron.schedule(
 **Complexity**: 🟡 Medium (1-2 days)
 
 ### The Problem
+
 One thousand slightly different queries are actually the *same* query pattern flooding the database. Current tools show them as separate queries.
 
 ### The Vision
+
 ```sql
 SELECT * FROM flight_recorder.query_storms(interval '1 hour');
 ```
 
 **Returns**:
+
 ```
 ┌────────────────────────────────────────┬────────┬────────────┬────────────┐
 │ query_fingerprint                      │ count  │ % of load  │ storm_type │
@@ -278,6 +288,7 @@ SELECT * FROM flight_recorder.query_storms(interval '1 hour');
 ### Implementation
 
 #### Query Fingerprinting
+
 PostgreSQL's `pg_stat_statements` already does this via `queryid`! We just need to leverage it better.
 
 ```sql
@@ -372,16 +383,19 @@ CREATE TYPE flight_recorder.storm_type AS ENUM (
 #### Storm Detection Logic
 
 **Retry Storm Detection**:
+
 - Same query called many times in short period
 - Look for exponential growth pattern
 - Often includes `FOR UPDATE` or similar locking
 
 **Cache Miss Storm**:
+
 - Sudden 10x+ spike in query volume
 - Usually specific to a few query patterns
 - Correlates with cache layer restart/failure
 
 **Bot Attack**:
+
 - Unusual query patterns
 - High volume from specific application/user
 - Often sequential ID scanning
@@ -487,14 +501,17 @@ SELECT cron.schedule(
 **Complexity**: 🟡 Medium (1-2 days)
 
 ### The Problem
+
 Flight recorder samples every 3 minutes. Customer says "at exactly 10:23:47 my query hung." You have no data for that specific second.
 
 ### The Vision
+
 ```sql
 SELECT * FROM flight_recorder.what_happened_at('2025-01-17 10:23:47');
 ```
 
 **Returns**:
+
 ```
 🕐 2025-01-17 10:23:47 UTC
 
@@ -696,9 +713,11 @@ When exact timing is impossible, provide ranges:
 **Complexity**: 🔴 High (3-5 days)
 
 ### The Problem
+
 When one thing goes wrong, what else breaks? What's the collateral damage? Current tools show the primary issue but miss secondary effects.
 
 ### The Vision
+
 ```sql
 SELECT * FROM flight_recorder.blast_radius(
     incident := 'PID 1234 held AccessExclusiveLock on users table',
@@ -708,6 +727,7 @@ SELECT * FROM flight_recorder.blast_radius(
 ```
 
 **Returns**:
+
 ```
 🎯 Primary Impact: PID 1234 held AccessExclusiveLock on users table
    Duration: 12 minutes (10:23:00 - 10:35:00)
@@ -890,6 +910,7 @@ $$;
 ```
 
 **Example correlations to check**:
+
 - Incident: Lock held → Correlation: Connection count +0.92 (strong)
 - Incident: Checkpoint → Correlation: Query latency +0.78 (strong)
 - Incident: Slow query → Correlation: CPU usage +0.15 (weak)
@@ -921,9 +942,11 @@ $$;
 **Complexity**: 🟡 Medium (1-2 days)
 
 ### The Problem
+
 Database performance degrades slowly over time (bloat, missing stats, config drift) and you don't notice until customers complain.
 
 ### The Vision
+
 Synthetic "canary queries" that should always perform consistently. When they slow down, something is wrong with the database itself.
 
 ```sql
@@ -932,6 +955,7 @@ SELECT flight_recorder.run_canaries();
 ```
 
 **Canary queries**:
+
 ```sql
 -- Canary 1: Simple index lookup (should be <1ms)
 SELECT * FROM users WHERE id = 1;
@@ -957,6 +981,7 @@ SELECT * FROM flight_recorder.canary_status();
 ```
 
 **Returns**:
+
 ```
 ┌──────────────┬─────────────┬──────────┬────────┬────────────┐
 │ canary       │ baseline    │ current  │ delta  │ status     │
@@ -1198,15 +1223,18 @@ $$;
 ### Concerns
 
 **Overhead**: Running synthetic queries adds load
+
 - Mitigation: Run infrequently (every 15-30 min)
 - Use lightweight queries
 - Disable if database under stress
 
 **False Positives**: Transient spikes trigger alerts
+
 - Mitigation: Use p50/p95, not single sample
 - Require sustained degradation (3+ samples)
 
 **Canary Selection**: What queries are "good canaries"?
+
 - Use queries that touch different subsystems
 - Index lookups, seq scans, joins, aggregates
 - Avoid queries that depend on volatile data
@@ -1218,16 +1246,19 @@ $$;
 **Complexity**: 🟣 Very High (1+ weeks)
 
 ### The Problem
+
 You have hundreds of customer databases. Is *this* database slow, or are they all slow? How does this database compare to others?
 
 This requires infrastructure beyond just SQL - you need a central aggregator.
 
 ### The Vision
+
 ```sql
 SELECT * FROM flight_recorder.compare_to_fleet('similar_tier');
 ```
 
 **Returns**:
+
 ```
 📊 Your Database vs Similar Databases (n=247, tier: small)
 
@@ -1442,6 +1473,7 @@ This would be a separate service (Node.js/Python API + TimescaleDB) that:
 5. Provides API for querying fleet stats
 
 **Example API endpoint**:
+
 ```
 GET /v1/fleet/stats?tier=small&metric=cache_hit_ratio
 {
@@ -1516,6 +1548,7 @@ $$;
 ### Privacy Considerations
 
 **Critical**: Only send **aggregated, anonymized** metrics:
+
 - ✅ Counts, averages, percentiles
 - ✅ System metrics (connections, cache hits)
 - ❌ Query text
@@ -1566,14 +1599,17 @@ $$;
 **Complexity**: 🟡 Medium (1-2 days)
 
 ### The Problem
+
 A query was fast yesterday, slow today. You don't notice until a customer complains.
 
 ### The Vision
+
 ```sql
 SELECT * FROM flight_recorder.detect_regressions(interval '24 hours');
 ```
 
 **Returns**:
+
 ```
 🔴 3 Performance Regressions Detected (last 24 hours)
 
@@ -1827,14 +1863,17 @@ SELECT cron.schedule(
 **Complexity**: 🟢 Low (4-8 hours)
 
 ### The Problem
+
 Numbers are boring. Humans are visual. CSAs want to *see* the problem at a glance.
 
 ### The Vision
+
 ```sql
 SELECT flight_recorder.timeline('connections', interval '4 hours');
 ```
 
 **Returns**:
+
 ```
 Connections (last 4 hours)
 
@@ -1858,6 +1897,7 @@ SELECT flight_recorder.timeline_multi(interval '1 hour');
 ```
 
 **Returns**:
+
 ```
 Performance Overview (last hour)
 
@@ -1980,6 +2020,7 @@ FROM metrics;
 ```
 
 **Returns**:
+
 ```
 ┌──────────────┬───────────┬────────────┐
 │ metric       │ current   │ trend      │

@@ -8,10 +8,13 @@
 ## Feature 1: Table-Level Hotspot Tracking
 
 ### Problem Statement
+
 When diagnosing incidents, we can see which **queries** are slow, but not which **tables** are under pressure. Knowing "table users got hammered with 10M sequential scans" is incredibly valuable.
 
 ### Data Source
+
 `pg_stat_user_tables` provides perfect table-level metrics:
+
 - `seq_scan`, `seq_tup_read` - Sequential scan activity
 - `idx_scan`, `idx_tup_fetch` - Index scan activity
 - `n_tup_ins`, `n_tup_upd`, `n_tup_del` - Write activity
@@ -24,6 +27,7 @@ When diagnosing incidents, we can see which **queries** are slow, but not which 
 ### Storage Design
 
 #### Option A: Snapshot-Based (Recommended)
+
 Store table stats in a separate table, linked to the existing `snapshots` table:
 
 ```sql
@@ -62,6 +66,7 @@ CREATE INDEX IF NOT EXISTS table_snapshots_relid_idx
 #### Collection Strategy
 
 **Smart Sampling** to minimize overhead:
+
 - Only collect top N hottest tables per snapshot (e.g., top 50 by total activity)
 - Activity score = `seq_tup_read + idx_tup_fetch + n_tup_ins + n_tup_upd + n_tup_del`
 - This avoids storing hundreds of rows for idle tables
@@ -326,6 +331,7 @@ ON CONFLICT (key) DO NOTHING;
 ```
 
 ### Impact Assessment
+
 - **Storage**: ~50 rows × 15 columns × 8 bytes ≈ 6 KB per snapshot
   - At 3-min interval for 30 days: ~6 KB × 14,400 snapshots = **~86 MB**
 - **CPU**: Single query to `pg_stat_user_tables` with ORDER BY and LIMIT
@@ -337,13 +343,17 @@ ON CONFLICT (key) DO NOTHING;
 ## Feature 2: Index Usage Tracking
 
 ### Problem Statement
+
 Knowing which indexes are used (or **not** used) helps identify:
+
 - Missing indexes causing seq scans
 - Unused indexes wasting space and slowing writes
 - Index bloat needing REINDEX
 
 ### Data Source
+
 `pg_stat_user_indexes` provides index-level metrics:
+
 - `idx_scan` - How many times index was scanned
 - `idx_tup_read` - Tuples read from index
 - `idx_tup_fetch` - Tuples fetched via index
@@ -378,6 +388,7 @@ CREATE INDEX IF NOT EXISTS index_snapshots_relid_idx
 ### Collection Strategy
 
 **Smart Sampling**:
+
 - Collect indexes for the top N hottest tables (from table stats)
 - Or collect all indexes if total count is manageable
 
@@ -555,6 +566,7 @@ ON CONFLICT (key) DO NOTHING;
 ```
 
 ### Impact Assessment
+
 - **Storage**: Varies by schema size, but typically ~100-500 indexes
   - Estimate: 300 indexes × 10 columns × 8 bytes = 24 KB per snapshot
   - At 3-min interval for 30 days: ~24 KB × 14,400 = **~346 MB**
@@ -567,13 +579,17 @@ ON CONFLICT (key) DO NOTHING;
 ## Feature 3: PostgreSQL Configuration Snapshots
 
 ### Problem Statement
+
 When diagnosing issues, knowing the configuration context is critical:
+
 - Was `work_mem` too low when queries spilled to disk?
 - What was `max_connections` when we hit connection limits?
 - Did someone change `shared_buffers` recently?
 
 ### Data Source
+
 `pg_settings` view provides all configuration parameters with:
+
 - `name` - Parameter name
 - `setting` - Current value
 - `unit` - Units (e.g., 'kB', 'ms', '8kB')
@@ -862,6 +878,7 @@ ON CONFLICT (key) DO NOTHING;
 ```
 
 ### Impact Assessment
+
 - **Storage**: ~50 relevant parameters × 5 columns × 50 bytes ≈ 12.5 KB per snapshot
   - At 3-min interval for 90 days: ~12.5 KB × 43,200 = **~540 MB**
   - (But configs rarely change, so compression would be very effective)
@@ -874,6 +891,7 @@ ON CONFLICT (key) DO NOTHING;
 ## Implementation Roadmap
 
 ### Phase 1: Table-Level Hotspots (Highest Value)
+
 1. Add `table_snapshots` table
 2. Add `_collect_table_stats()` function
 3. Integrate into `snapshot()` function
@@ -883,6 +901,7 @@ ON CONFLICT (key) DO NOTHING;
 **Estimated Effort**: 2-3 hours of implementation + testing
 
 ### Phase 2: Configuration Snapshots (High Value, Low Cost)
+
 1. Add `config_snapshots` table
 2. Add `_collect_config_snapshot()` function
 3. Integrate into `snapshot()` function
@@ -891,6 +910,7 @@ ON CONFLICT (key) DO NOTHING;
 **Estimated Effort**: 1-2 hours
 
 ### Phase 3: Index Usage Tracking (Good Value, Moderate Storage)
+
 1. Add `index_snapshots` table
 2. Add `_collect_index_stats()` function
 3. Integrate into `snapshot()` function
@@ -905,12 +925,14 @@ ON CONFLICT (key) DO NOTHING;
 For each feature:
 
 1. **Unit Test**: Verify collection functions work
+
    ```sql
    SELECT flight_recorder._collect_table_stats(1);
    SELECT * FROM flight_recorder.table_snapshots WHERE snapshot_id = 1;
    ```
 
 2. **Performance Test**: Measure overhead
+
    ```sql
    \timing on
    SELECT flight_recorder._collect_table_stats(1);
@@ -918,6 +940,7 @@ For each feature:
    ```
 
 3. **Integration Test**: Run full `snapshot()` cycle
+
    ```sql
    SELECT flight_recorder.snapshot();
    -- Verify all new tables populated
