@@ -1,13 +1,13 @@
 -- =============================================================================
 -- pg-flight-recorder pgTAP Tests - Load, Archive, Capacity & Features
 -- =============================================================================
--- Tests: Load shedding, archive, capacity planning, feature designs
--- Sections: 15 (Load/Circuit), 6 (Archive), Capacity Planning, Feature Designs
--- Test count: 89
+-- Tests: Load shedding, archive, capacity planning, feature designs, db/role config
+-- Sections: 15 (Load/Circuit), 6 (Archive), Capacity Planning, Feature Designs, DB/Role Config
+-- Test count: 104
 -- =============================================================================
 
 BEGIN;
-SELECT plan(89);
+SELECT plan(104);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -837,6 +837,91 @@ SELECT lives_ok(
     $$SELECT * FROM flight_recorder.config_health_check()$$,
     'config_health_check() should execute without error'
 );
+
+-- =============================================================================
+-- DATABASE/ROLE CONFIGURATION TRACKING (15 tests)
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Section 1: Table Existence and Structure (5 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT has_table('flight_recorder', 'db_role_config_snapshots', 'Table flight_recorder.db_role_config_snapshots should exist');
+
+SELECT has_column('flight_recorder', 'db_role_config_snapshots', 'snapshot_id', 'db_role_config_snapshots should have snapshot_id column');
+SELECT has_column('flight_recorder', 'db_role_config_snapshots', 'database_name', 'db_role_config_snapshots should have database_name column');
+SELECT has_column('flight_recorder', 'db_role_config_snapshots', 'role_name', 'db_role_config_snapshots should have role_name column');
+SELECT has_column('flight_recorder', 'db_role_config_snapshots', 'parameter_name', 'db_role_config_snapshots should have parameter_name column');
+
+-- -----------------------------------------------------------------------------
+-- Section 2: Function Existence (4 tests)
+-- -----------------------------------------------------------------------------
+
+SELECT has_function('flight_recorder', '_collect_db_role_config_snapshot', 'Function flight_recorder._collect_db_role_config_snapshot should exist');
+SELECT has_function('flight_recorder', 'db_role_config_at', 'Function flight_recorder.db_role_config_at should exist');
+SELECT has_function('flight_recorder', 'db_role_config_changes', 'Function flight_recorder.db_role_config_changes should exist');
+SELECT has_function('flight_recorder', 'db_role_config_summary', 'Function flight_recorder.db_role_config_summary should exist');
+
+-- -----------------------------------------------------------------------------
+-- Section 3: Collection Function Execution (4 tests)
+-- -----------------------------------------------------------------------------
+
+-- Get or create a snapshot for testing
+DO $$
+DECLARE
+    v_snapshot_id INTEGER;
+BEGIN
+    SELECT id INTO v_snapshot_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+    IF v_snapshot_id IS NULL THEN
+        PERFORM flight_recorder.snapshot();
+        SELECT id INTO v_snapshot_id FROM flight_recorder.snapshots ORDER BY id DESC LIMIT 1;
+    END IF;
+    -- Store for tests
+    CREATE TEMP TABLE IF NOT EXISTS test_db_role_snapshot_id (id INTEGER);
+    DELETE FROM test_db_role_snapshot_id;
+    INSERT INTO test_db_role_snapshot_id VALUES (v_snapshot_id);
+END $$;
+
+SELECT lives_ok(
+    $$SELECT flight_recorder._collect_db_role_config_snapshot((SELECT id FROM test_db_role_snapshot_id))$$,
+    'Database/role config snapshot collection executes without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.db_role_config_at(now())$$,
+    'db_role_config_at() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.db_role_config_changes(now() - interval '1 hour', now())$$,
+    'db_role_config_changes() should execute without error'
+);
+
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.db_role_config_summary()$$,
+    'db_role_config_summary() should execute without error'
+);
+
+-- -----------------------------------------------------------------------------
+-- Section 4: Feature Toggle (2 tests)
+-- -----------------------------------------------------------------------------
+
+-- Test 1: Config key exists
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'db_role_config_snapshots_enabled'),
+    'Config key db_role_config_snapshots_enabled should exist'
+);
+
+-- Test 2: Feature can be disabled
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'db_role_config_snapshots_enabled';
+
+SELECT ok(
+    flight_recorder._get_config('db_role_config_snapshots_enabled', 'true')::boolean = false,
+    'db_role_config_snapshots_enabled can be set to false'
+);
+
+-- Reset to default
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'db_role_config_snapshots_enabled';
 
 SELECT * FROM finish();
 ROLLBACK;

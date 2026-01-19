@@ -397,6 +397,22 @@ CREATE INDEX IF NOT EXISTS config_snapshots_name_idx
 COMMENT ON TABLE flight_recorder.config_snapshots IS 'PostgreSQL configuration snapshots for change tracking and incident context';
 
 
+-- Captures database-level and role-level configuration overrides from pg_db_role_setting
+-- These settings override global GUCs and are often overlooked during incident analysis
+-- Complementary to config_snapshots which tracks global settings
+CREATE TABLE IF NOT EXISTS flight_recorder.db_role_config_snapshots (
+    snapshot_id     INTEGER REFERENCES flight_recorder.snapshots(id) ON DELETE CASCADE,
+    database_name   TEXT NOT NULL DEFAULT '',  -- Empty string = applies to all databases (role-level only)
+    role_name       TEXT NOT NULL DEFAULT '',  -- Empty string = applies to all roles (database-level only)
+    parameter_name  TEXT NOT NULL,
+    parameter_value TEXT,
+    PRIMARY KEY (snapshot_id, database_name, role_name, parameter_name)
+);
+CREATE INDEX IF NOT EXISTS db_role_config_snapshots_param_idx
+    ON flight_recorder.db_role_config_snapshots(parameter_name);
+COMMENT ON TABLE flight_recorder.db_role_config_snapshots IS 'Database and role-level configuration overrides (ALTER DATABASE/ROLE SET) for change tracking';
+
+
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
 CREATE OR REPLACE FUNCTION flight_recorder._pretty_bytes(bytes BIGINT)
 RETURNS TEXT
@@ -496,7 +512,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('table_stats_enabled', 'true'),
     ('table_stats_top_n', '50'),
     ('index_stats_enabled', 'true'),
-    ('config_snapshots_enabled', 'true')
+    ('config_snapshots_enabled', 'true'),
+    ('db_role_config_snapshots_enabled', 'true')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -2136,6 +2153,41 @@ END;
 $$;
 
 
+-- Collects database-level and role-level configuration overrides from pg_db_role_setting
+-- These overrides (ALTER DATABASE/ROLE SET) can significantly impact performance but are easily overlooked
+CREATE OR REPLACE FUNCTION flight_recorder._collect_db_role_config_snapshot(p_snapshot_id INTEGER)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+BEGIN
+    v_enabled := COALESCE(
+        flight_recorder._get_config('db_role_config_snapshots_enabled', 'true')::boolean,
+        true
+    );
+
+    IF NOT v_enabled THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO flight_recorder.db_role_config_snapshots (
+        snapshot_id, database_name, role_name, parameter_name, parameter_value
+    )
+    SELECT
+        p_snapshot_id,
+        COALESCE(d.datname, '') AS database_name,
+        COALESCE(r.rolname, '') AS role_name,
+        split_part(setting, '=', 1) AS parameter_name,
+        split_part(setting, '=', 2) AS parameter_value
+    FROM pg_db_role_setting drs
+    CROSS JOIN LATERAL unnest(drs.setconfig) AS setting
+    LEFT JOIN pg_database d ON d.oid = drs.setdatabase
+    LEFT JOIN pg_roles r ON r.oid = drs.setrole
+    WHERE drs.setconfig IS NOT NULL;
+END;
+$$;
+
+
 -- TIER 1: Collect comprehensive snapshot of PostgreSQL system metrics (WAL, checkpoints, I/O, replication, statements)
 -- Returns the captured timestamp for downstream processing and analysis
 CREATE OR REPLACE FUNCTION flight_recorder.snapshot()
@@ -2607,6 +2659,14 @@ BEGIN
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Config snapshot collection failed: %', SQLERRM;
+    END;
+    -- Collect database/role config overrides
+    BEGIN
+        PERFORM flight_recorder._set_section_timeout();
+        PERFORM flight_recorder._collect_db_role_config_snapshot(v_snapshot_id);
+        PERFORM flight_recorder._record_section_success(v_stat_id);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg-flight-recorder: Database/role config collection failed: %', SQLERRM;
     END;
     PERFORM flight_recorder._record_collection_end(v_stat_id, true, NULL);
     PERFORM set_config('statement_timeout', '0', true);
@@ -3603,6 +3663,7 @@ BEGIN
             ('default', 'table_stats_enabled', 'true', 'Collect table statistics'),
             ('default', 'index_stats_enabled', 'true', 'Collect index statistics'),
             ('default', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+            ('default', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
             ('production_safe', 'sample_interval_seconds', '300', 'Sample every 5 minutes (40% less overhead)'),
             ('production_safe', 'adaptive_sampling', 'true', 'Skip when idle'),
             ('production_safe', 'load_shedding_enabled', 'true', 'Skip during high load'),
@@ -3619,6 +3680,7 @@ BEGIN
             ('production_safe', 'table_stats_enabled', 'true', 'Collect table statistics'),
             ('production_safe', 'index_stats_enabled', 'true', 'Collect index statistics'),
             ('production_safe', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+            ('production_safe', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
             ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
             ('development', 'adaptive_sampling', 'false', 'Always collect (never skip when idle)'),
             ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
@@ -3632,6 +3694,7 @@ BEGIN
             ('development', 'table_stats_enabled', 'true', 'Collect table statistics'),
             ('development', 'index_stats_enabled', 'true', 'Collect index statistics'),
             ('development', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+            ('development', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
             ('troubleshooting', 'sample_interval_seconds', '60', 'Sample every minute (detailed data)'),
             ('troubleshooting', 'adaptive_sampling', 'false', 'Never skip - always collect'),
             ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
@@ -3647,6 +3710,7 @@ BEGIN
             ('troubleshooting', 'table_stats_enabled', 'true', 'Collect table statistics'),
             ('troubleshooting', 'index_stats_enabled', 'true', 'Collect index statistics'),
             ('troubleshooting', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+            ('troubleshooting', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
             ('minimal_overhead', 'sample_interval_seconds', '300', 'Sample every 5 minutes'),
             ('minimal_overhead', 'adaptive_sampling', 'true', 'Skip when idle'),
             ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10', 'Higher idle threshold (10 vs 5)'),
@@ -3664,6 +3728,7 @@ BEGIN
             ('minimal_overhead', 'table_stats_enabled', 'false', 'Disable table statistics (reduce overhead)'),
             ('minimal_overhead', 'index_stats_enabled', 'false', 'Disable index statistics (reduce overhead)'),
             ('minimal_overhead', 'config_snapshots_enabled', 'true', 'Collect config snapshots (low overhead)'),
+            ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
             ('high_ddl', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
             ('high_ddl', 'adaptive_sampling', 'true', 'Skip when idle'),
             ('high_ddl', 'load_shedding_enabled', 'true', 'Skip during high load'),
@@ -3679,7 +3744,8 @@ BEGIN
             ('high_ddl', 'aggregate_retention_days', '7', 'Keep 7 days'),
             ('high_ddl', 'table_stats_enabled', 'true', 'Collect table statistics'),
             ('high_ddl', 'index_stats_enabled', 'true', 'Collect index statistics'),
-            ('high_ddl', 'config_snapshots_enabled', 'true', 'Collect config snapshots')
+            ('high_ddl', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+            ('high_ddl', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides')
         ) AS t(profile, key, value, description)
         WHERE profile = p_profile_name
     )
@@ -3741,6 +3807,7 @@ BEGIN
             ('default', 'table_stats_enabled', 'true'),
             ('default', 'index_stats_enabled', 'true'),
             ('default', 'config_snapshots_enabled', 'true'),
+            ('default', 'db_role_config_snapshots_enabled', 'true'),
             ('production_safe', 'sample_interval_seconds', '300'),
             ('production_safe', 'adaptive_sampling', 'true'),
             ('production_safe', 'load_shedding_enabled', 'true'),
@@ -3770,6 +3837,7 @@ BEGIN
             ('production_safe', 'table_stats_enabled', 'true'),
             ('production_safe', 'index_stats_enabled', 'true'),
             ('production_safe', 'config_snapshots_enabled', 'true'),
+            ('production_safe', 'db_role_config_snapshots_enabled', 'true'),
             ('development', 'sample_interval_seconds', '180'),
             ('development', 'adaptive_sampling', 'false'),
             ('development', 'load_shedding_enabled', 'true'),
@@ -3796,6 +3864,7 @@ BEGIN
             ('development', 'table_stats_enabled', 'true'),
             ('development', 'index_stats_enabled', 'true'),
             ('development', 'config_snapshots_enabled', 'true'),
+            ('development', 'db_role_config_snapshots_enabled', 'true'),
             ('troubleshooting', 'sample_interval_seconds', '60'),
             ('troubleshooting', 'adaptive_sampling', 'false'),
             ('troubleshooting', 'load_shedding_enabled', 'false'),
@@ -3824,6 +3893,7 @@ BEGIN
             ('troubleshooting', 'table_stats_enabled', 'true'),
             ('troubleshooting', 'index_stats_enabled', 'true'),
             ('troubleshooting', 'config_snapshots_enabled', 'true'),
+            ('troubleshooting', 'db_role_config_snapshots_enabled', 'true'),
             ('minimal_overhead', 'sample_interval_seconds', '300'),
             ('minimal_overhead', 'adaptive_sampling', 'true'),
             ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10'),
@@ -3854,6 +3924,7 @@ BEGIN
             ('minimal_overhead', 'table_stats_enabled', 'false'),
             ('minimal_overhead', 'index_stats_enabled', 'false'),
             ('minimal_overhead', 'config_snapshots_enabled', 'true'),
+            ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true'),
             ('high_ddl', 'sample_interval_seconds', '180'),
             ('high_ddl', 'adaptive_sampling', 'true'),
             ('high_ddl', 'load_shedding_enabled', 'true'),
@@ -3882,7 +3953,8 @@ BEGIN
             ('high_ddl', 'collect_connection_metrics', 'true'),
             ('high_ddl', 'table_stats_enabled', 'true'),
             ('high_ddl', 'index_stats_enabled', 'true'),
-            ('high_ddl', 'config_snapshots_enabled', 'true')
+            ('high_ddl', 'config_snapshots_enabled', 'true'),
+            ('high_ddl', 'db_role_config_snapshots_enabled', 'true')
         ) AS t(profile, key, value)
         WHERE profile = p_profile_name
     ),
@@ -6222,6 +6294,146 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.config_health_check() IS
 'Perform a health check on current PostgreSQL configuration. Returns potential issues and recommendations for memory, connections, and safety settings.';
+
+
+-- =============================================================================
+-- DATABASE/ROLE CONFIGURATION ANALYSIS FUNCTIONS
+-- =============================================================================
+
+-- Retrieves database/role configuration overrides at a specific point in time
+-- Optionally filters by database, role, or parameter name prefix
+CREATE OR REPLACE FUNCTION flight_recorder.db_role_config_at(
+    p_timestamp TIMESTAMPTZ,
+    p_database TEXT DEFAULT NULL,
+    p_role TEXT DEFAULT NULL,
+    p_prefix TEXT DEFAULT NULL
+)
+RETURNS TABLE(
+    database_name   TEXT,
+    role_name       TEXT,
+    parameter_name  TEXT,
+    parameter_value TEXT,
+    scope           TEXT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT DISTINCT ON (drc.database_name, drc.role_name, drc.parameter_name)
+        NULLIF(drc.database_name, '') AS database_name,
+        NULLIF(drc.role_name, '') AS role_name,
+        drc.parameter_name,
+        drc.parameter_value,
+        CASE
+            WHEN drc.database_name <> '' AND drc.role_name <> '' THEN 'database+role'
+            WHEN drc.database_name <> '' THEN 'database'
+            WHEN drc.role_name <> '' THEN 'role'
+            ELSE 'unknown'
+        END AS scope
+    FROM flight_recorder.db_role_config_snapshots drc
+    JOIN flight_recorder.snapshots s ON s.id = drc.snapshot_id
+    WHERE s.captured_at <= p_timestamp
+        AND (p_database IS NULL OR drc.database_name = p_database)
+        AND (p_role IS NULL OR drc.role_name = p_role)
+        AND (p_prefix IS NULL OR drc.parameter_name LIKE p_prefix || '%')
+    ORDER BY drc.database_name, drc.role_name, drc.parameter_name, s.captured_at DESC
+$$;
+COMMENT ON FUNCTION flight_recorder.db_role_config_at(TIMESTAMPTZ, TEXT, TEXT, TEXT) IS
+'Retrieve database/role configuration overrides at a specific point in time. Filter by database, role, or parameter prefix.';
+
+
+-- Detects database/role configuration changes between two time points
+-- Returns parameters that were added, removed, or modified
+CREATE OR REPLACE FUNCTION flight_recorder.db_role_config_changes(
+    p_start_time TIMESTAMPTZ,
+    p_end_time TIMESTAMPTZ
+)
+RETURNS TABLE(
+    database_name   TEXT,
+    role_name       TEXT,
+    parameter_name  TEXT,
+    old_value       TEXT,
+    new_value       TEXT,
+    change_type     TEXT
+)
+LANGUAGE sql STABLE AS $$
+    WITH
+    start_configs AS (
+        SELECT DISTINCT ON (drc.database_name, drc.role_name, drc.parameter_name)
+            drc.database_name, drc.role_name, drc.parameter_name, drc.parameter_value
+        FROM flight_recorder.db_role_config_snapshots drc
+        JOIN flight_recorder.snapshots s ON s.id = drc.snapshot_id
+        WHERE s.captured_at <= p_start_time
+        ORDER BY drc.database_name, drc.role_name, drc.parameter_name, s.captured_at DESC
+    ),
+    end_configs AS (
+        SELECT DISTINCT ON (drc.database_name, drc.role_name, drc.parameter_name)
+            drc.database_name, drc.role_name, drc.parameter_name, drc.parameter_value
+        FROM flight_recorder.db_role_config_snapshots drc
+        JOIN flight_recorder.snapshots s ON s.id = drc.snapshot_id
+        WHERE s.captured_at <= p_end_time
+        ORDER BY drc.database_name, drc.role_name, drc.parameter_name, s.captured_at DESC
+    )
+    SELECT
+        NULLIF(COALESCE(e.database_name, s.database_name), '') AS database_name,
+        NULLIF(COALESCE(e.role_name, s.role_name), '') AS role_name,
+        COALESCE(e.parameter_name, s.parameter_name) AS parameter_name,
+        s.parameter_value AS old_value,
+        e.parameter_value AS new_value,
+        CASE
+            WHEN s.parameter_name IS NULL THEN 'added'
+            WHEN e.parameter_name IS NULL THEN 'removed'
+            ELSE 'modified'
+        END AS change_type
+    FROM end_configs e
+    FULL OUTER JOIN start_configs s
+        ON s.database_name = e.database_name
+        AND s.role_name = e.role_name
+        AND s.parameter_name = e.parameter_name
+    WHERE e.parameter_value IS DISTINCT FROM s.parameter_value
+    ORDER BY database_name NULLS FIRST, role_name NULLS FIRST, parameter_name
+$$;
+COMMENT ON FUNCTION flight_recorder.db_role_config_changes(TIMESTAMPTZ, TIMESTAMPTZ) IS
+'Detect database/role configuration changes between two time points. Returns added, removed, and modified settings.';
+
+
+-- Provides a summary overview of all database/role configuration overrides
+-- Groups by scope (database-only, role-only, or database+role combination)
+CREATE OR REPLACE FUNCTION flight_recorder.db_role_config_summary()
+RETURNS TABLE(
+    scope           TEXT,
+    database_name   TEXT,
+    role_name       TEXT,
+    parameter_count BIGINT,
+    parameters      TEXT[]
+)
+LANGUAGE sql STABLE AS $$
+    WITH latest_snapshot AS (
+        SELECT id FROM flight_recorder.snapshots ORDER BY captured_at DESC LIMIT 1
+    ),
+    config_data AS (
+        SELECT
+            NULLIF(drc.database_name, '') AS database_name,
+            NULLIF(drc.role_name, '') AS role_name,
+            drc.parameter_name,
+            CASE
+                WHEN drc.database_name <> '' AND drc.role_name <> '' THEN 'database+role'
+                WHEN drc.database_name <> '' THEN 'database'
+                WHEN drc.role_name <> '' THEN 'role'
+                ELSE 'unknown'
+            END AS scope
+        FROM flight_recorder.db_role_config_snapshots drc
+        WHERE drc.snapshot_id = (SELECT id FROM latest_snapshot)
+    )
+    SELECT
+        scope,
+        database_name,
+        role_name,
+        count(*) AS parameter_count,
+        array_agg(parameter_name ORDER BY parameter_name) AS parameters
+    FROM config_data
+    GROUP BY scope, database_name, role_name
+    ORDER BY scope, database_name NULLS FIRST, role_name NULLS FIRST
+$$;
+COMMENT ON FUNCTION flight_recorder.db_role_config_summary() IS
+'Overview of database/role configuration overrides grouped by scope. Shows which databases and roles have custom settings.';
 
 
 SELECT flight_recorder.snapshot();

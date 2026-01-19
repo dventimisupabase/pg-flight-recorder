@@ -452,6 +452,9 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `config_at(timestamp)` | Show PostgreSQL configuration at a point in time |
 | `config_changes(start, end)` | Detect configuration parameter changes |
 | `config_health_check()` | Analyze current config for common issues |
+| `db_role_config_at(timestamp)` | Show database/role configuration overrides at a point in time |
+| `db_role_config_changes(start, end)` | Detect database/role configuration changes |
+| `db_role_config_summary()` | Overview of database/role configuration overrides |
 
 ### Control Functions
 
@@ -633,6 +636,35 @@ SELECT * FROM flight_recorder.config_changes(
 -- Check current configuration for common issues
 SELECT * FROM flight_recorder.config_health_check();
 ```
+
+### Database/Role Configuration Analysis
+
+Track configuration overrides set via `ALTER DATABASE ... SET` or `ALTER ROLE ... SET`. These overrides are often overlooked during incident analysis but can significantly impact performance.
+
+```sql
+-- What database/role config overrides existed at incident time?
+SELECT * FROM flight_recorder.db_role_config_at('2024-01-15 14:30:00');
+
+-- Filter by specific database or role
+SELECT * FROM flight_recorder.db_role_config_at(
+    '2024-01-15 14:30:00',
+    p_database := 'mydb'
+);
+
+-- Detect database/role config changes over time
+SELECT * FROM flight_recorder.db_role_config_changes(
+    '2024-01-14 00:00',
+    '2024-01-15 00:00'
+);
+
+-- Get an overview of all database/role config overrides
+SELECT * FROM flight_recorder.db_role_config_summary();
+```
+
+**Why this matters:**
+- `ALTER DATABASE mydb SET work_mem = '256MB'` overrides global settings
+- `ALTER ROLE analyst SET statement_timeout = '30s'` affects specific users
+- These overrides don't appear in `pg_settings` unless you're connected as that role to that database
 
 ### Quarterly Review
 
