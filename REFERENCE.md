@@ -699,6 +699,7 @@ SELECT * FROM flight_recorder.db_role_config_summary();
 ```
 
 **Why this matters:**
+
 - `ALTER DATABASE mydb SET work_mem = '256MB'` overrides global settings
 - `ALTER ROLE analyst SET statement_timeout = '30s'` affects specific users
 - These overrides don't appear in `pg_settings` unless you're connected as that role to that database
