@@ -75,7 +75,7 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 Flight Recorder uses two independent collection systems that answer different questions:
 
 - **Sampled Activity**: "What's happening right now?" (wait events, sessions, locks)
-- **Cumulative Snapshots**: "How much has happened over time?" (WAL, checkpoints, I/O, transactions)
+- **Snapshots**: "What is/was the system state?" (counters, config, query stats)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -97,15 +97,17 @@ Flight Recorder uses two independent collection systems that answer different qu
 │   │   Forensic analysis │     │   Pattern analysis  │                   │
 │   └─────────────────────┘     └─────────────────────┘                   │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ CUMULATIVE SNAPSHOT SYSTEM                                              │
-│   Collects: pg_stat_* counters (WAL, checkpoints, I/O, transactions)    │
-│   Job: snapshot() every 5 minutes                                       │
+│ SNAPSHOT SYSTEM                                                         │
+│   Job: snapshot() every 5 minutes, 30-day retention                     │
 │                                                                         │
-│   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │ Snapshots                                                       │   │
-│   │   Point-in-time counter values, 30-day retention                │   │
-│   │   Compare two snapshots to compute deltas                       │   │
-│   └─────────────────────────────────────────────────────────────────┘   │
+│   ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐     │
+│   │ Cumulative        │ │ Point-in-time     │ │ Top-N Rankings    │     │
+│   │ Counters          │ │ State             │ │                   │     │
+│   │                   │ │                   │ │                   │     │
+│   │ WAL, checkpoints, │ │ Config params,    │ │ Top queries by    │     │
+│   │ I/O, table/index  │ │ replication lag   │ │ time, calls       │     │
+│   │ stats             │ │                   │ │                   │     │
+│   └───────────────────┘ └───────────────────┘ └───────────────────┘     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,22 +171,36 @@ Note: Archives and aggregates both derive directly from ring buffers—they are 
 
 ---
 
-### Cumulative Snapshot System
+### Snapshot System
 
-Records point-in-time values of monotonically increasing counters from `pg_stat_*` views. Unlike sampled activity (which captures "what's happening now"), snapshots capture "how much has happened since server start." Compare two snapshots to compute deltas.
+Captures periodic snapshots of system state every 5 minutes. Unlike sampled activity (which captures "what's happening now"), snapshots capture "what is/was the system state." The snapshot system collects three types of data:
+
+**Cumulative Counters** — Monotonically increasing values from `pg_stat_*` views. Compare two snapshots to compute deltas (e.g., "500 checkpoints occurred between 10:00 and 11:00").
 
 | Table | Purpose |
 |-------|---------|
 | `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O |
-| `replication_snapshots` | pg_stat_replication, replication slots |
-| `statement_snapshots` | pg_stat_statements top queries |
 | `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat) |
 | `index_snapshots` | Per-index usage and size |
+
+Query via: `compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`.
+
+**Point-in-time State** — Non-cumulative values that represent current state at capture time.
+
+| Table | Purpose |
+|-------|---------|
 | `config_snapshots` | PostgreSQL configuration parameters |
+| `replication_snapshots` | pg_stat_replication, replication slots, lag |
 
-Query via: `compare(start, end)`, `statement_compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`, `config_at(timestamp)`.
+Query via: `config_at(timestamp)`, `config_changes(start, end)`.
 
-Example: "How many checkpoints occurred between 10:00 and 11:00?" → `SELECT * FROM flight_recorder.compare('10:00', '11:00')`
+**Top-N Rankings** — Periodic capture of top queries by various metrics.
+
+| Table | Purpose |
+|-------|---------|
+| `statement_snapshots` | pg_stat_statements top queries by time, calls |
+
+Query via: `statement_compare(start, end)`.
 
 ### Ring Buffer Mechanism
 
