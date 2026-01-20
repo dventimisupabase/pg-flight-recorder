@@ -11,22 +11,26 @@
 ### 1. Created Pathology Test Framework
 
 **New Files:**
+
 - `tests/07_pathology_generators.sql` - 12 pgTAP tests covering 2 pathologies
 - `tests/PATHOLOGY_TESTS.md` - Comprehensive documentation and guide
 - `PR_DESCRIPTION.md` - Ready-to-use PR description
 
 **Git Status:**
+
 - Branch: `claude/pathological-data-generators-9ZPGg`
 - All changes committed and pushed
 - PR needs to be created at: https://github.com/dventimisupabase/pg-flight-recorder/pull/new/claude/pathological-data-generators-9ZPGg
 
 ### 2. Pathologies Implemented (2 of 9)
 
-#### ✅ Pathology 1: Lock Contention
+#### Pathology 1: Lock Contention
+
 **Location:** `tests/07_pathology_generators.sql` lines 20-99
 **Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 5
 
 **Approach:**
+
 - Uses advisory locks (`pg_advisory_lock(12345)`) to simulate blocking
 - Advisory locks are ideal because:
   - Explicit and controllable
@@ -36,6 +40,7 @@
 - Tests that `recent_locks_current()` and `lock_samples_ring` work
 
 **Tests (6 total):**
+
 1. Test table created
 2. `sample()` executes after lock operations
 3. `lock_samples_ring` is queryable
@@ -44,15 +49,18 @@
 6. Test cleanup
 
 **Known Limitation:**
+
 - Advisory locks in a single transaction don't create *blocked* sessions
 - Tests verify infrastructure works, but may not capture actual blocking
 - **POTENTIAL IMPROVEMENT:** Need multi-session test to create real blocking
 
-#### ✅ Pathology 2: Memory Pressure / work_mem
+#### Pathology 2: Memory Pressure / work_mem
+
 **Location:** `tests/07_pathology_generators.sql` lines 101-203
 **Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 9
 
 **Approach:**
+
 - Creates table with 10,000 rows of substantial text data
 - Sets `work_mem = '64kB'` (very low)
 - Runs large sorts and aggregations to force temp file spills
@@ -60,6 +68,7 @@
 - Verifies temp file metrics are captured
 
 **Tests (6 total):**
+
 1. Test table has 10,000 rows
 2. At least 2 snapshots exist from test period
 3. Snapshots capture `temp_files` metric
@@ -68,29 +77,32 @@
 6. Test cleanup
 
 **What We're Testing:**
+
 - `snapshots.temp_files` and `temp_bytes` increase
 - `statement_snapshots.temp_blks_written > 0`
 - `anomaly_report()` can analyze the period
 
 ## What We Haven't Done Yet
 
-### 🎯 CRITICAL NEXT STEP: Review Test Output
+### CRITICAL NEXT STEP: Review Test Output
 
 **Need to:**
+
 1. Create the PR on GitHub
 2. Wait for GitHub Actions to run
 3. Review the test output to see:
-   - Do tests pass? ✅ or ❌
+   - Do tests pass?
    - Did memory pressure actually create temp files?
    - Did lock contention get captured?
    - Any unexpected failures or edge cases?
 
 **Why this matters:**
+
 - We created tests in a non-Docker environment
 - Tests may reveal issues when run in real PostgreSQL
 - We need to iterate based on actual behavior
 
-### 📋 Remaining Pathologies (7 of 9)
+### Remaining Pathologies (7 of 9)
 
 Based on DIAGNOSTIC_PLAYBOOKS.md, we still need:
 
@@ -184,26 +196,32 @@ SELECT ok([cleanup check], '[NAME] PATHOLOGY: Cleanup description');
 ## Known Issues & Questions
 
 ### 1. Lock Contention Test Limitation
+
 **Issue:** Advisory locks in single transaction don't create blocked sessions
 
 **Possible Solutions:**
+
 - Use dblink to create second connection
 - Use pg_background extension
 - Accept limitation and document it
 - Create integration test that runs outside pgTAP
 
 ### 2. Connection Exhaustion Challenge
+
 **Issue:** pgTAP runs in single connection, hard to test connection limits
 
 **Possible Solutions:**
+
 - Use dblink to open many connections
 - Test just that we can query the metrics, not generate the pathology
 - Skip this pathology in unit tests, cover in integration tests
 
 ### 3. Checkpoint Storm Control
+
 **Issue:** Forcing checkpoints requires config changes or heavy WAL load
 
 **Possible Solutions:**
+
 - Use `CHECKPOINT` command (but may not trigger all anomalies)
 - Generate actual WAL traffic (large transactions)
 - Temporarily lower `max_wal_size` in test
@@ -220,12 +238,14 @@ PATHOLOGY_WORK_IN_PROGRESS.md            # NEW - This file
 ## Commands to Continue
 
 ### Review Test Output
+
 ```bash
 # After PR is created and CI runs, check results
 # Share output with Claude for analysis
 ```
 
 ### Run Tests Locally
+
 ```bash
 cd /home/user/pg-flight-recorder
 ./test.sh 16                    # Test on PostgreSQL 16
@@ -234,6 +254,7 @@ cd /home/user/pg-flight-recorder
 ```
 
 ### Continue Development
+
 ```bash
 # Add next pathology (e.g., High CPU)
 # Edit tests/07_pathology_generators.sql
@@ -245,13 +266,13 @@ cd /home/user/pg-flight-recorder
 
 When you resume:
 
-1. ✅ Read this file to get context
-2. ⬜ Check if PR was created and review test output
-3. ⬜ Fix any failures found in CI
-4. ⬜ Decide which pathology to implement next
-5. ⬜ Consider improving lock contention test with real blocking
-6. ⬜ Update PATHOLOGY_TESTS.md with learnings
-7. ⬜ Plan roadmap for remaining 7 pathologies
+1. Read this file to get context
+2. Check if PR was created and review test output
+3. Fix any failures found in CI
+4. Decide which pathology to implement next
+5. Consider improving lock contention test with real blocking
+6. Update PATHOLOGY_TESTS.md with learnings
+7. Plan roadmap for remaining 7 pathologies
 
 ## Questions for User (When They Return)
 
@@ -272,12 +293,13 @@ When you resume:
 ## Success Criteria
 
 This work is successful when:
-- ✅ All 9 playbook pathologies have generator tests
-- ✅ Tests actually generate the pathological conditions
-- ✅ pg-flight-recorder captures the data correctly
-- ✅ Diagnostic functions detect the pathologies
-- ✅ Tests pass in CI on PostgreSQL 15, 16, 17
-- ✅ Documentation is complete and clear
+
+- All 9 playbook pathologies have generator tests
+- Tests actually generate the pathological conditions
+- pg-flight-recorder captures the data correctly
+- Diagnostic functions detect the pathologies
+- Tests pass in CI on PostgreSQL 15, 16, 17
+- Documentation is complete and clear
 
 ## Final Notes
 

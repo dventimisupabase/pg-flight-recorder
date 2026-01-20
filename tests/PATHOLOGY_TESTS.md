@@ -3,6 +3,7 @@
 ## Purpose
 
 This test suite validates that pg-flight-recorder can detect real-world database pathologies by:
+
 1. **Generating** authentic problematic conditions in the database
 2. **Capturing** the data using pg-flight-recorder's snapshot/sample functions
 3. **Verifying** that diagnostic functions correctly identify the issues
@@ -16,37 +17,45 @@ These tests serve as both validation and living documentation, proving that the 
 ## Current Pathologies Covered
 
 ### 1. Lock Contention (Test #1)
+
 **Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 5
 
 **Pathology Generated:**
+
 - Advisory locks held across transactions
 - Simulates scenarios where one session blocks others
 
 **Detection Verified:**
+
 - `recent_locks_current()` function executes
 - `lock_samples_ring` captures lock events
 - `pg_locks` system view is accessible
 
 **Real-world analogue:**
+
 - Long-running transactions holding row/table locks
 - Multiple sessions competing for same resources
 - Idle-in-transaction sessions blocking others
 
 ### 2. Memory Pressure / work_mem Issues (Test #2)
+
 **Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 9
 
 **Pathology Generated:**
+
 - Large dataset (10,000 rows with substantial text data)
 - Low `work_mem` setting (64kB)
 - Complex sorts and aggregations that exceed available memory
 - Forces PostgreSQL to spill to temporary files
 
 **Detection Verified:**
+
 - `snapshots.temp_files` and `temp_bytes` are captured
 - `statement_snapshots` contains query statistics
 - `anomaly_report()` can analyze the time period
 
 **Real-world analogue:**
+
 - Under-provisioned `work_mem` causing performance degradation
 - Large reporting queries spilling to disk
 - Memory-intensive operations during peak load
@@ -72,18 +81,21 @@ docker-compose exec postgres pg_prove -U postgres -d postgres /tests/07_patholog
 To add a new pathology based on DIAGNOSTIC_PLAYBOOKS.md:
 
 ### Step 1: Choose a Playbook Section
+
 Review DIAGNOSTIC_PLAYBOOKS.md and pick an uncovered pathology:
+
 - [ ] Database Slow (Real-time)
 - [ ] Database Slow (Historical)
 - [ ] Queries Timing Out
 - [ ] High CPU Usage
-- [x] Lock Contention ✅
+- [x] Lock Contention
 - [ ] Connection Exhaustion
 - [ ] Disk I/O Problems
 - [ ] Checkpoint Storms
-- [x] Memory Pressure ✅
+- [x] Memory Pressure
 
 ### Step 2: Design the Generator
+
 For each pathology, identify:
 
 1. **Setup**: What database objects are needed?
@@ -141,6 +153,7 @@ DROP TABLE ...;
 ```
 
 ### Step 4: Update Test Count
+
 Don't forget to update `SELECT plan(N)` at the top of the file with the new total test count.
 
 ## Example: High CPU Pathology
@@ -237,6 +250,7 @@ Priority pathologies to add next:
 ## Questions or Issues?
 
 For questions about pathology tests or ideas for new pathologies:
+
 - Review DIAGNOSTIC_PLAYBOOKS.md for inspiration
 - Check existing tests for patterns
 - File an issue in the repository
