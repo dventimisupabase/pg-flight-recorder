@@ -22,7 +22,7 @@ Instead of just testing that functions exist and run without errors, these tests
 - Step-by-step instructions for adding new pathologies
 - Templates and examples for future contributors
 
-## Pathologies Covered (5/9)
+## Pathologies Covered (6/9)
 
 ### 1. Lock Contention (Section 5)
 
@@ -54,12 +54,17 @@ Instead of just testing that functions exist and run without errors, these tests
 - LIKE patterns and aggregations requiring full table scans
 - Verifies `compare()` and `statement_snapshots` work
 
-## Remaining Pathologies (4/9)
+### 6. Connection Exhaustion (Section 6)
+
+- Uses **dblink** extension to create multiple real connections from within pgTAP
+- Opens 15 concurrent connections to simulate connection pressure
+- Verifies `connections_total` and connection utilization metrics
+
+## Remaining Pathologies (3/9)
 
 These can be added in future PRs:
 
 - [ ] Database Slow (Historical) (Section 2)
-- [ ] Connection Exhaustion (Section 6) - requires multiple connections
 - [ ] Disk I/O Problems (Section 7)
 - [ ] Checkpoint Storms (Section 8) - may need config changes
 
@@ -95,4 +100,4 @@ If this approach looks good:
 ---
 
 **Related:** DIAGNOSTIC_PLAYBOOKS.md
-**Test Count:** 27 new tests covering 5 pathologies
+**Test Count:** 33 new tests covering 6 pathologies

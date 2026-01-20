@@ -12,7 +12,7 @@ These tests serve as both validation and living documentation, proving that the 
 
 ## Test Files
 
-- **`07_pathology_generators.sql`** - 27 pgTAP tests covering 5 pathologies
+- **`07_pathology_generators.sql`** - 33 pgTAP tests covering 6 pathologies
 
 ## Current Pathologies Covered
 
@@ -125,6 +125,27 @@ These tests serve as both validation and living documentation, proving that the 
 - Plan regressions after statistics changes
 - Queries timing out under load
 
+### 6. Connection Exhaustion
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 6
+
+**Pathology Generated:**
+
+- Uses `dblink` extension to create 15 real concurrent connections
+- Simulates connection pressure approaching `max_connections`
+
+**Detection Verified:**
+
+- `pg_stat_activity` shows multiple sessions
+- `snapshots.connections_total` captures connection count
+- `recent_activity_current()` shows active connections
+
+**Real-world analogue:**
+
+- Connection pool exhaustion
+- Applications not releasing connections
+- "Too many connections" errors
+
 ## How to Run
 
 ```bash
@@ -154,7 +175,7 @@ Review DIAGNOSTIC_PLAYBOOKS.md and pick an uncovered pathology:
 - [x] Queries Timing Out
 - [x] High CPU Usage
 - [x] Lock Contention
-- [ ] Connection Exhaustion
+- [x] Connection Exhaustion
 - [ ] Disk I/O Problems
 - [ ] Checkpoint Storms
 - [x] Memory Pressure
@@ -290,22 +311,17 @@ When implementing a new pathology test:
 
 ## Future Pathologies to Implement
 
-Remaining pathologies to add (4 of 9):
+Remaining pathologies to add (3 of 9):
 
 1. **Database Slow - Historical** (Section 2)
    - Test archive tables and historical analysis
    - Verify `activity_samples_archive` and `summary_report()`
 
-2. **Connection Exhaustion** (Section 6)
-   - Create many connections approaching `max_connections`
-   - Verify `connections_total` near `connections_max`
-   - **Challenge:** Requires multiple connections (dblink)
-
-3. **Disk I/O Problems** (Section 7)
+2. **Disk I/O Problems** (Section 7)
    - Large sequential scans
    - Verify `IO:DataFileRead` wait events
 
-4. **Checkpoint Storms** (Section 8)
+3. **Checkpoint Storms** (Section 8)
    - Generate heavy WAL traffic
    - Verify `FORCED_CHECKPOINT` anomalies
    - **Challenge:** May need config changes
