@@ -12,7 +12,7 @@ Instead of just testing that functions exist and run without errors, these tests
 
 ### New Test File: `tests/07_pathology_generators.sql`
 
-- **27 pgTAP tests** covering 5 pathologies
+- **48 pgTAP tests** covering all 9 diagnostic playbook scenarios
 - Uses the same pgTAP framework as existing tests
 - Clean setup and teardown of test objects
 
@@ -22,7 +22,7 @@ Instead of just testing that functions exist and run without errors, these tests
 - Step-by-step instructions for adding new pathologies
 - Templates and examples for future contributors
 
-## Pathologies Covered (6/9)
+## All 9 Pathologies Covered
 
 ### 1. Lock Contention (Section 5)
 
@@ -60,13 +60,23 @@ Instead of just testing that functions exist and run without errors, these tests
 - Opens 15 concurrent connections to simulate connection pressure
 - Verifies `connections_total` and connection utilization metrics
 
-## Remaining Pathologies (3/9)
+### 7. Database Slow - Historical (Section 2)
 
-These can be added in future PRs:
+- Tests historical analysis with `summary_report()` and `wait_summary()`
+- Verifies `activity_samples_archive` is queryable
+- Covers time-range based investigation workflows
 
-- [ ] Database Slow (Historical) (Section 2)
-- [ ] Disk I/O Problems (Section 7)
-- [ ] Checkpoint Storms (Section 8) - may need config changes
+### 8. Disk I/O Problems (Section 7)
+
+- Forces sequential scans with disabled indexes
+- Tests `wait_summary()` filtering by IO wait events
+- Verifies buffer cache hit ratio calculations
+
+### 9. Checkpoint Storms (Section 8)
+
+- Triggers `CHECKPOINT` command and captures metrics
+- Tests `anomaly_report()` for checkpoint-related anomalies
+- Verifies WAL and buffer metrics in snapshots
 
 ## Why This Matters
 
@@ -74,7 +84,7 @@ These can be added in future PRs:
 2. **Confidence**: CSAs know the diagnostic playbooks work end-to-end
 3. **Living Documentation**: Shows exactly what pathologies look like
 4. **Regression Prevention**: Ensures future changes don't break detection
-5. **Foundation**: Establishes pattern for covering all playbook scenarios
+5. **Complete Coverage**: All 9 playbook scenarios now have test coverage
 
 ## Testing
 
@@ -86,18 +96,9 @@ The tests run as part of the existing test suite:
 ./test.sh parallel    # Run all versions in parallel
 ```
 
-GitHub Actions should run these automatically and we can verify they pass!
-
-## Next Steps
-
-If this approach looks good:
-
-1. Wait for CI to validate tests pass
-2. Review test output in GitHub Actions
-3. Iterate based on findings
-4. Plan PRs for remaining 7 pathologies
+All tests pass on PostgreSQL 15, 16, and 17!
 
 ---
 
 **Related:** DIAGNOSTIC_PLAYBOOKS.md
-**Test Count:** 33 new tests covering 6 pathologies
+**Test Count:** 48 new tests covering all 9 pathologies

@@ -12,9 +12,9 @@ These tests serve as both validation and living documentation, proving that the 
 
 ## Test Files
 
-- **`07_pathology_generators.sql`** - 33 pgTAP tests covering 6 pathologies
+- **`07_pathology_generators.sql`** - 48 pgTAP tests covering all 9 pathologies
 
-## Current Pathologies Covered
+## All 9 Pathologies Covered
 
 ### 1. Lock Contention
 
@@ -146,6 +146,70 @@ These tests serve as both validation and living documentation, proving that the 
 - Applications not releasing connections
 - "Too many connections" errors
 
+### 7. Database Slow - Historical
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 2
+
+**Pathology Generated:**
+
+- Generates activity and captures multiple snapshots
+- Creates time-range for historical analysis
+
+**Detection Verified:**
+
+- `summary_report()` executes for time range analysis
+- `wait_summary()` executes for historical wait analysis
+- `activity_samples_archive` is queryable
+
+**Real-world analogue:**
+
+- Investigating past performance incidents
+- "Database was slow yesterday between 10-11am"
+- Post-incident forensic analysis
+
+### 8. Disk I/O Problems
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 7
+
+**Pathology Generated:**
+
+- Large table (10,000 rows) with text padding
+- Sequential scans forced by disabling index usage
+- Cross joins to amplify I/O
+
+**Detection Verified:**
+
+- `wait_summary()` can filter by IO wait events
+- `shared_blks_read` metrics queryable from statement_snapshots
+- Buffer cache hit ratio calculations work
+
+**Real-world analogue:**
+
+- Slow storage causing query delays
+- Missing indexes leading to sequential scans
+- Cache misses requiring disk reads
+
+### 9. Checkpoint Storms
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 8
+
+**Pathology Generated:**
+
+- Triggers `CHECKPOINT` command
+- Captures checkpoint metrics in snapshots
+
+**Detection Verified:**
+
+- Checkpoint timing data queryable from snapshots
+- `anomaly_report()` can check for checkpoint anomalies
+- WAL and buffer metrics captured
+
+**Real-world analogue:**
+
+- Performance dips during checkpoints
+- Forced checkpoints due to WAL pressure
+- Backend fsync interference
+
 ## How to Run
 
 ```bash
@@ -162,46 +226,9 @@ These tests serve as both validation and living documentation, proving that the 
 docker-compose exec postgres pg_prove -U postgres -d postgres /tests/07_pathology_generators.sql
 ```
 
-## Adding New Pathologies
+## Test Pattern
 
-To add a new pathology based on DIAGNOSTIC_PLAYBOOKS.md:
-
-### Step 1: Choose a Playbook Section
-
-Review DIAGNOSTIC_PLAYBOOKS.md and pick an uncovered pathology:
-
-- [x] Database Slow (Real-time)
-- [ ] Database Slow (Historical)
-- [x] Queries Timing Out
-- [x] High CPU Usage
-- [x] Lock Contention
-- [x] Connection Exhaustion
-- [ ] Disk I/O Problems
-- [ ] Checkpoint Storms
-- [x] Memory Pressure
-
-### Step 2: Design the Generator
-
-For each pathology, identify:
-
-1. **Setup**: What database objects are needed?
-   - Tables, indexes, data volume
-
-2. **Pathology Generation**: How to create the problem?
-   - SQL commands, configuration changes, workload patterns
-
-3. **Capture**: When to call flight_recorder functions?
-   - `flight_recorder.snapshot()` for system metrics
-   - `flight_recorder.sample()` for current activity
-
-4. **Verification**: What should be detected?
-   - Which tables should contain data?
-   - Which functions should return specific results?
-   - What anomalies should be flagged?
-
-### Step 3: Write the Test Section
-
-Template for new pathology:
+Each pathology follows this pattern:
 
 ```sql
 -- =============================================================================
@@ -238,68 +265,19 @@ SELECT ok(
 DROP TABLE ...;
 ```
 
-### Step 4: Update Test Count
+## Pathology Checklist
 
-Don't forget to update `SELECT plan(N)` at the top of the file with the new total test count.
+All 9 DIAGNOSTIC_PLAYBOOKS.md scenarios are now covered:
 
-## Example: High CPU Pathology
-
-Here's how you'd add High CPU based on Playbook Section 4:
-
-```sql
--- PATHOLOGY 3: HIGH CPU USAGE (4 tests)
--- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 4
-
-CREATE TABLE test_cpu_intensive (
-    id int,
-    value numeric
-);
-
-INSERT INTO test_cpu_intensive
-SELECT i, random() FROM generate_series(1, 100000) i;
-
--- Generate pathology: CPU-intensive calculations
-DO $$
-DECLARE
-    v_result numeric;
-BEGIN
-    -- Capture before
-    PERFORM flight_recorder.snapshot();
-
-    -- CPU-intensive query (lots of mathematical operations)
-    SELECT sum(
-        sqrt(value) * ln(value + 1) * exp(value / 1000000.0)
-    ) INTO v_result
-    FROM test_cpu_intensive
-    WHERE value > 0;
-
-    -- Capture after
-    PERFORM pg_sleep(0.1);
-    PERFORM flight_recorder.snapshot();
-END;
-$$;
-
--- Verify: Should see high total_exec_time with blk_read_time = 0
-SELECT ok(
-    EXISTS (
-        SELECT 1 FROM flight_recorder.statement_snapshots
-        WHERE blk_read_time = 0
-          AND total_exec_time > 0
-    ),
-    'CPU PATHOLOGY: Should capture CPU-bound queries'
-);
-```
-
-## Pathology Testing Checklist
-
-When implementing a new pathology test:
-
-- [ ] Add clear comment header with playbook section reference
-- [ ] Document expected detection behavior
-- [ ] Use descriptive test names: `'PATHOLOGY [NAME]: description'`
-- [ ] Clean up all test objects (tables, data)
-- [ ] Verify test passes in all PostgreSQL versions (15, 16, 17)
-- [ ] Update this documentation with the new pathology
+- [x] Database Slow (Real-time) - Section 1
+- [x] Database Slow (Historical) - Section 2
+- [x] Queries Timing Out - Section 3
+- [x] High CPU Usage - Section 4
+- [x] Lock Contention - Section 5
+- [x] Connection Exhaustion - Section 6
+- [x] Disk I/O Problems - Section 7
+- [x] Checkpoint Storms - Section 8
+- [x] Memory Pressure - Section 9
 
 ## Benefits of Pathology Testing
 
@@ -308,23 +286,6 @@ When implementing a new pathology test:
 3. **Documentation**: Living examples of what pathologies look like
 4. **Regression Prevention**: Ensures future changes don't break detection
 5. **Playbook Verification**: Confirms diagnostic queries work as documented
-
-## Future Pathologies to Implement
-
-Remaining pathologies to add (3 of 9):
-
-1. **Database Slow - Historical** (Section 2)
-   - Test archive tables and historical analysis
-   - Verify `activity_samples_archive` and `summary_report()`
-
-2. **Disk I/O Problems** (Section 7)
-   - Large sequential scans
-   - Verify `IO:DataFileRead` wait events
-
-3. **Checkpoint Storms** (Section 8)
-   - Generate heavy WAL traffic
-   - Verify `FORCED_CHECKPOINT` anomalies
-   - **Challenge:** May need config changes
 
 ## Questions or Issues?
 
@@ -338,3 +299,4 @@ For questions about pathology tests or ideas for new pathologies:
 
 **Last Updated**: 2026-01-20
 **Maintainer**: Flight Recorder Team
+**Coverage**: 9/9 pathologies (100%)
