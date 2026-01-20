@@ -228,10 +228,10 @@ CREATE INDEX IF NOT EXISTS lock_aggregates_time_idx
 COMMENT ON TABLE flight_recorder.lock_aggregates IS 'TIER 2: Durable lock pattern summaries (5-min windows, survives crashes)';
 
 
--- Aggregates query execution patterns within 5-minute time windows
+-- Aggregates activity samples within 5-minute time windows
 -- Stores query preview, occurrence count, and duration metrics (max/avg)
--- Provides durable query performance summaries that survive database crashes
-CREATE TABLE IF NOT EXISTS flight_recorder.query_aggregates (
+-- Provides durable activity summaries that survive database crashes
+CREATE TABLE IF NOT EXISTS flight_recorder.activity_aggregates (
     id                  BIGSERIAL PRIMARY KEY,
     start_time          TIMESTAMPTZ NOT NULL,
     end_time            TIMESTAMPTZ NOT NULL,
@@ -240,9 +240,9 @@ CREATE TABLE IF NOT EXISTS flight_recorder.query_aggregates (
     max_duration        INTERVAL,
     avg_duration        INTERVAL
 );
-CREATE INDEX IF NOT EXISTS query_aggregates_time_idx
-    ON flight_recorder.query_aggregates(start_time, end_time);
-COMMENT ON TABLE flight_recorder.query_aggregates IS 'TIER 2: Durable query pattern summaries (5-min windows, survives crashes)';
+CREATE INDEX IF NOT EXISTS activity_aggregates_time_idx
+    ON flight_recorder.activity_aggregates(start_time, end_time);
+COMMENT ON TABLE flight_recorder.activity_aggregates IS 'TIER 2: Durable activity summaries (5-min windows, survives crashes)';
 
 
 -- Stores snapshot samples of PostgreSQL backend activity for forensic analysis
@@ -1750,7 +1750,7 @@ BEGIN
     WHERE s.captured_at BETWEEN v_start_time AND v_end_time
       AND l.blocked_pid IS NOT NULL
     GROUP BY l.blocked_user, l.blocking_user, l.lock_type, l.locked_relation_oid;
-    INSERT INTO flight_recorder.query_aggregates (
+    INSERT INTO flight_recorder.activity_aggregates (
         start_time, end_time, query_preview, occurrence_count, max_duration, avg_duration
     )
     SELECT
@@ -1908,7 +1908,7 @@ COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'TIER 1.5: Archive
 
 
 -- Removes aged aggregate and archived sample data based on configured retention periods
--- Deletes expired records from wait_event_aggregates, lock_aggregates, query_aggregates, and all *_samples_archive tables
+-- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, and all *_samples_archive tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
 RETURNS VOID
 LANGUAGE plpgsql AS $$
@@ -1936,7 +1936,7 @@ BEGIN
     DELETE FROM flight_recorder.lock_aggregates
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_locks = ROW_COUNT;
-    DELETE FROM flight_recorder.query_aggregates
+    DELETE FROM flight_recorder.activity_aggregates
     WHERE start_time < now() - v_aggregate_retention;
     GET DIAGNOSTICS v_deleted_queries = ROW_COUNT;
     DELETE FROM flight_recorder.activity_samples_archive

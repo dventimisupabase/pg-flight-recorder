@@ -128,7 +128,7 @@ Durable summaries of ring buffer data for medium-term analysis.
 |-------|---------|
 | `wait_event_aggregates` | Wait patterns over 5-minute windows |
 | `lock_aggregates` | Lock contention patterns |
-| `query_aggregates` | Query execution patterns |
+| `activity_aggregates` | Activity/query execution patterns |
 
 Query via: `wait_summary(start, end)` function.
 

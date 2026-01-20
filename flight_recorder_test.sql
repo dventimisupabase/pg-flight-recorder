@@ -30,7 +30,7 @@ SELECT has_table('flight_recorder', 'lock_samples_ring', 'TIER 1: Table flight_r
 -- TIER 2: Aggregates (REGULAR/durable)
 SELECT has_table('flight_recorder', 'wait_event_aggregates', 'TIER 2: Table flight_recorder.wait_event_aggregates should exist');
 SELECT has_table('flight_recorder', 'lock_aggregates', 'TIER 2: Table flight_recorder.lock_aggregates should exist');
-SELECT has_table('flight_recorder', 'query_aggregates', 'TIER 2: Table flight_recorder.query_aggregates should exist');
+SELECT has_table('flight_recorder', 'activity_aggregates', 'TIER 2: Table flight_recorder.activity_aggregates should exist');
 -- TIER 1.5: Raw sample archives (REGULAR/durable)
 SELECT has_table('flight_recorder', 'activity_samples_archive', 'TIER 1.5: Table flight_recorder.activity_samples_archive should exist');
 SELECT has_table('flight_recorder', 'lock_samples_archive', 'TIER 1.5: Table flight_recorder.lock_samples_archive should exist');
