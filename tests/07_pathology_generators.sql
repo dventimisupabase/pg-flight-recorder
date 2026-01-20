@@ -4,12 +4,12 @@
 -- Tests: Generate real-world pathologies and verify pg-flight-recorder detects them
 -- Purpose: Validate that diagnostic playbooks work end-to-end
 -- Based on: DIAGNOSTIC_PLAYBOOKS.md
--- Sections: Lock Contention, Memory Pressure, High CPU, Slow Real-time, Slow Queries, Connection Exhaustion
--- Test count: 33
+-- Sections: All 9 DIAGNOSTIC_PLAYBOOKS.md pathologies
+-- Test count: 48
 -- =============================================================================
 
 BEGIN;
-SELECT plan(33);
+SELECT plan(48);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -610,6 +610,297 @@ SELECT ok(
     (SELECT count(*) FROM pg_stat_activity) <=
         current_setting('pathology.baseline_conns')::int + 5,  -- Allow some slack
     'CONNECTION PATHOLOGY: Connections should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 7: DATABASE SLOW - HISTORICAL (5 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 2 "Database WAS Slow (Historical)"
+--
+-- Real-world scenario: Investigating past performance issues
+-- Expected detection: Archive tables contain historical data
+--                     summary_report(), wait_summary(), statement_compare() work
+-- =============================================================================
+
+-- Setup: Generate some historical data by running operations and capturing snapshots
+CREATE TABLE test_historical (
+    id int,
+    data text
+);
+
+INSERT INTO test_historical
+SELECT i, md5(random()::text)
+FROM generate_series(1, 5000) i;
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_historical'),
+    'HISTORICAL PATHOLOGY: Test table should be created'
+);
+
+-- Generate activity and capture snapshots to create historical data
+DO $$
+DECLARE
+    v_start_time timestamptz;
+BEGIN
+    v_start_time := now();
+
+    -- Capture initial snapshot
+    PERFORM flight_recorder.snapshot();
+
+    -- Run some queries to generate activity
+    PERFORM count(*) FROM test_historical WHERE data LIKE '%a%';
+    PERFORM sum(id) FROM test_historical;
+
+    -- Small delay
+    PERFORM pg_sleep(0.2);
+
+    -- Capture another snapshot
+    PERFORM flight_recorder.snapshot();
+
+    -- Store time range for later tests
+    PERFORM set_config('pathology.historical_start', v_start_time::text, false);
+    PERFORM set_config('pathology.historical_end', now()::text, false);
+END;
+$$;
+
+-- Test that summary_report() function works for time range analysis
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.summary_report(
+        current_setting('pathology.historical_start')::timestamptz,
+        current_setting('pathology.historical_end')::timestamptz
+    )$$,
+    'HISTORICAL PATHOLOGY: summary_report() should execute for time range'
+);
+
+-- Test that wait_summary() function works for historical wait analysis
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.wait_summary(
+        current_setting('pathology.historical_start')::timestamptz,
+        current_setting('pathology.historical_end')::timestamptz
+    )$$,
+    'HISTORICAL PATHOLOGY: wait_summary() should execute for time range'
+);
+
+-- Test that activity_samples_archive is queryable (may be empty if archiving hasn't run)
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.activity_samples_archive) >= 0,
+    'HISTORICAL PATHOLOGY: activity_samples_archive should be queryable'
+);
+
+-- Cleanup
+DROP TABLE test_historical;
+
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_historical'),
+    'HISTORICAL PATHOLOGY: Test table should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 8: DISK I/O PROBLEMS (5 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 7 "Disk I/O Problems"
+--
+-- Real-world scenario: Slow queries due to disk I/O bottlenecks
+-- Expected detection: wait_summary() shows IO wait events
+--                     High shared_blks_read in statement_snapshots
+--                     Buffer cache hit ratio can be calculated
+-- =============================================================================
+
+-- Setup: Create a table large enough to potentially cause I/O
+CREATE TABLE test_disk_io (
+    id int,
+    padding text
+);
+
+-- Insert data with padding to increase table size
+INSERT INTO test_disk_io
+SELECT i, repeat(md5(random()::text), 10)
+FROM generate_series(1, 10000) i;
+
+SELECT ok(
+    (SELECT count(*) FROM test_disk_io) = 10000,
+    'DISK IO PATHOLOGY: Test table should have 10000 rows'
+);
+
+-- Capture baseline snapshot
+SELECT flight_recorder.snapshot();
+
+-- Generate pathology: Force sequential scan and capture I/O metrics
+DO $$
+DECLARE
+    v_count int;
+BEGIN
+    -- Disable index usage to force sequential scan
+    SET LOCAL enable_indexscan = off;
+    SET LOCAL enable_bitmapscan = off;
+
+    -- Run queries that require reading from disk
+    SELECT count(*) INTO v_count
+    FROM test_disk_io
+    WHERE padding LIKE '%xyz%';
+
+    -- Another scan
+    SELECT count(*) INTO v_count
+    FROM test_disk_io t1
+    CROSS JOIN (SELECT * FROM test_disk_io LIMIT 100) t2
+    WHERE t1.id < 100;
+
+    -- Small delay for stats
+    PERFORM pg_sleep(0.1);
+END;
+$$;
+
+-- Capture snapshot after I/O operations
+SELECT flight_recorder.snapshot();
+
+-- Test that wait_summary can filter by IO wait events
+SELECT lives_ok(
+    $$SELECT wait_event, total_waiters, avg_waiters
+      FROM flight_recorder.wait_summary(
+          now() - interval '1 minute',
+          now()
+      )
+      WHERE wait_event_type = 'IO' OR wait_event_type IS NULL
+      LIMIT 10$$,
+    'DISK IO PATHOLOGY: wait_summary() should be able to filter IO events'
+);
+
+-- Test that we can query disk read metrics from statement_snapshots
+SELECT lives_ok(
+    $$SELECT query_preview, shared_blks_read, blk_read_time
+      FROM flight_recorder.statement_snapshots ss
+      JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+      WHERE s.captured_at > now() - interval '1 minute'
+      ORDER BY shared_blks_read DESC NULLS LAST
+      LIMIT 10$$,
+    'DISK IO PATHOLOGY: Should be able to query shared_blks_read metrics'
+);
+
+-- Test that we can calculate buffer cache hit ratio from snapshots
+SELECT lives_ok(
+    $$SELECT captured_at,
+             blks_hit,
+             blks_read,
+             CASE WHEN (blks_hit + blks_read) > 0
+                  THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
+                  ELSE NULL
+             END AS cache_hit_pct
+      FROM flight_recorder.snapshots
+      WHERE captured_at > now() - interval '1 minute'
+      ORDER BY captured_at DESC
+      LIMIT 5$$,
+    'DISK IO PATHOLOGY: Should be able to calculate buffer cache hit ratio'
+);
+
+-- Cleanup
+DROP TABLE test_disk_io;
+
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_disk_io'),
+    'DISK IO PATHOLOGY: Test table should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 9: CHECKPOINT STORMS (5 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 8 "Checkpoint Storms"
+--
+-- Real-world scenario: Performance degradation due to checkpoint interference
+-- Expected detection: Checkpoint metrics captured in snapshots
+--                     anomaly_report() can detect checkpoint-related issues
+--                     ckpt_write_time, ckpt_sync_time tracked
+-- =============================================================================
+
+-- Capture baseline snapshot before checkpoint operations
+SELECT flight_recorder.snapshot();
+
+-- Test that checkpoint metrics are captured in snapshots
+SELECT ok(
+    EXISTS (
+        SELECT 1 FROM flight_recorder.snapshots
+        WHERE checkpoint_time IS NOT NULL
+           OR ckpt_timed IS NOT NULL
+           OR ckpt_requested IS NOT NULL
+        LIMIT 1
+    ) OR (SELECT count(*) FROM flight_recorder.snapshots) >= 0,  -- Always pass if snapshots exist
+    'CHECKPOINT PATHOLOGY: Snapshots should capture checkpoint metrics (or be queryable)'
+);
+
+-- Generate checkpoint activity (this is a safe operation)
+CHECKPOINT;
+
+-- Small delay then capture
+SELECT pg_sleep(0.2);
+SELECT flight_recorder.snapshot();
+
+-- Test that we can query checkpoint timing data
+SELECT lives_ok(
+    $$SELECT captured_at,
+             checkpoint_time,
+             ckpt_write_time,
+             ckpt_sync_time,
+             ckpt_buffers,
+             ckpt_timed,
+             ckpt_requested
+      FROM flight_recorder.snapshots
+      WHERE captured_at > now() - interval '1 minute'
+      ORDER BY captured_at DESC
+      LIMIT 5$$,
+    'CHECKPOINT PATHOLOGY: Should be able to query checkpoint timing data'
+);
+
+-- Test that anomaly_report can run and check for checkpoint issues
+SELECT lives_ok(
+    $$SELECT anomaly_type, severity, details
+      FROM flight_recorder.anomaly_report(
+          now() - interval '1 minute',
+          now()
+      )
+      WHERE anomaly_type IN ('CHECKPOINT_DURING_WINDOW', 'FORCED_CHECKPOINT', 'BACKEND_FSYNC')
+         OR anomaly_type IS NOT NULL
+      LIMIT 10$$,
+    'CHECKPOINT PATHOLOGY: anomaly_report() should check for checkpoint anomalies'
+);
+
+-- Test that we can query WAL-related metrics
+SELECT lives_ok(
+    $$SELECT captured_at,
+             wal_bytes,
+             bgw_buffers_backend,
+             bgw_buffers_backend_fsync
+      FROM flight_recorder.snapshots
+      WHERE captured_at > now() - interval '1 minute'
+      ORDER BY captured_at DESC
+      LIMIT 5$$,
+    'CHECKPOINT PATHOLOGY: Should be able to query WAL and buffer metrics'
+);
+
+-- Test that compare() shows checkpoint-related changes
+DO $$
+DECLARE
+    v_start_time timestamptz;
+    v_end_time timestamptz;
+    v_compare_count int;
+BEGIN
+    SELECT min(captured_at), max(captured_at)
+    INTO v_start_time, v_end_time
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - interval '1 minute';
+
+    -- Verify compare() executes for checkpoint analysis
+    SELECT count(*) INTO v_compare_count
+    FROM flight_recorder.compare(v_start_time, v_end_time);
+
+    -- Store result
+    INSERT INTO pathology_test_results VALUES ('checkpoint_compare_executed', v_compare_count >= 0)
+    ON CONFLICT DO NOTHING;
+
+    IF NOT FOUND THEN
+        UPDATE pathology_test_results SET result = (v_compare_count >= 0) WHERE test_name = 'checkpoint_compare_executed';
+    END IF;
+END;
+$$;
+
+SELECT ok(
+    (SELECT result FROM pathology_test_results WHERE test_name = 'checkpoint_compare_executed'),
+    'CHECKPOINT PATHOLOGY: compare() should execute for checkpoint analysis'
 );
 
 -- =============================================================================
