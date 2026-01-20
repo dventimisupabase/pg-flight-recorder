@@ -4,12 +4,12 @@
 -- Tests: Generate real-world pathologies and verify pg-flight-recorder detects them
 -- Purpose: Validate that diagnostic playbooks work end-to-end
 -- Based on: DIAGNOSTIC_PLAYBOOKS.md
--- Sections: Lock Contention, Memory Pressure, High CPU, Slow Real-time, Slow Queries
--- Test count: 27
+-- Sections: Lock Contention, Memory Pressure, High CPU, Slow Real-time, Slow Queries, Connection Exhaustion
+-- Test count: 33
 -- =============================================================================
 
 BEGIN;
-SELECT plan(27);
+SELECT plan(33);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -420,9 +420,11 @@ BEGIN
 
     -- Another sequential scan with sorting (no index to help)
     SELECT count(*) INTO v_count
-    FROM test_slow_queries
-    WHERE data LIKE '%abc%'
-    ORDER BY created_at;
+    FROM (
+        SELECT * FROM test_slow_queries
+        WHERE data LIKE '%abc%'
+        ORDER BY created_at
+    ) subq;
 
     -- Expensive aggregation requiring full table scan
     SELECT count(DISTINCT category) INTO v_count
@@ -494,6 +496,121 @@ DROP TABLE test_slow_queries;
 SELECT ok(
     NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_slow_queries'),
     'SLOW QUERIES PATHOLOGY: Test table should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 6: CONNECTION EXHAUSTION (6 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 6 "Connection Exhaustion"
+--
+-- Real-world scenario: Too many connections approaching max_connections
+-- Expected detection: snapshots.connections_total near connections_max
+--                     recent_activity_current() shows many sessions
+--                     Connection utilization metrics captured
+--
+-- NOTE: Uses dblink extension to create multiple real connections from within
+--       a single pgTAP test session. This is the "wine glass worthy" approach!
+-- =============================================================================
+
+-- Setup: Enable dblink extension for multi-connection testing
+CREATE EXTENSION IF NOT EXISTS dblink;
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'dblink'),
+    'CONNECTION PATHOLOGY: dblink extension should be available'
+);
+
+-- Record baseline connection count
+DO $$
+DECLARE
+    v_baseline_connections int;
+BEGIN
+    SELECT count(*) INTO v_baseline_connections FROM pg_stat_activity;
+    -- Store for later comparison
+    INSERT INTO pathology_test_results VALUES ('baseline_connections', true);
+    PERFORM set_config('pathology.baseline_conns', v_baseline_connections::text, false);
+END;
+$$;
+
+-- Generate pathology: Open multiple connections using dblink
+-- We'll open 15 connections to simulate connection pressure
+DO $$
+DECLARE
+    v_connstr text;
+    v_conn_name text;
+    i int;
+BEGIN
+    -- Build connection string for local connection
+    -- Using trust auth since we're connecting locally in the container
+    v_connstr := 'dbname=postgres user=postgres';
+
+    -- Open multiple connections
+    FOR i IN 1..15 LOOP
+        v_conn_name := 'pathology_conn_' || i;
+        BEGIN
+            PERFORM dblink_connect(v_conn_name, v_connstr);
+        EXCEPTION WHEN OTHERS THEN
+            -- If connection fails, record it but continue
+            RAISE NOTICE 'Connection % failed: %', v_conn_name, SQLERRM;
+        END;
+    END LOOP;
+END;
+$$;
+
+-- Capture snapshot with elevated connection count
+SELECT flight_recorder.snapshot();
+
+-- Test that we have more connections now
+SELECT ok(
+    (SELECT count(*) FROM pg_stat_activity) >
+        current_setting('pathology.baseline_conns')::int,
+    'CONNECTION PATHOLOGY: Connection count should increase with dblink connections'
+);
+
+-- Test that snapshots capture connection metrics
+SELECT ok(
+    (SELECT connections_total FROM flight_recorder.snapshots
+     ORDER BY captured_at DESC LIMIT 1) IS NOT NULL,
+    'CONNECTION PATHOLOGY: Snapshot should capture connections_total'
+);
+
+-- Test that recent_activity_current() shows the connections
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.recent_activity_current()) > 0,
+    'CONNECTION PATHOLOGY: recent_activity_current() should show active connections'
+);
+
+-- Test we can see connection utilization data
+SELECT lives_ok(
+    $$SELECT connections_active, connections_total, connections_max,
+             round(100.0 * connections_total / NULLIF(connections_max, 0), 1) AS utilization_pct
+      FROM flight_recorder.snapshots
+      ORDER BY captured_at DESC
+      LIMIT 1$$,
+    'CONNECTION PATHOLOGY: Should be able to query connection utilization metrics'
+);
+
+-- Cleanup: Close all the dblink connections
+DO $$
+DECLARE
+    v_conn_name text;
+    i int;
+BEGIN
+    FOR i IN 1..15 LOOP
+        v_conn_name := 'pathology_conn_' || i;
+        BEGIN
+            PERFORM dblink_disconnect(v_conn_name);
+        EXCEPTION WHEN OTHERS THEN
+            -- Connection might not exist if it failed to open
+            NULL;
+        END;
+    END LOOP;
+END;
+$$;
+
+SELECT ok(
+    (SELECT count(*) FROM pg_stat_activity) <=
+        current_setting('pathology.baseline_conns')::int + 5,  -- Allow some slack
+    'CONNECTION PATHOLOGY: Connections should be cleaned up'
 );
 
 -- =============================================================================
