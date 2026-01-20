@@ -2137,18 +2137,51 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Only insert parameters that have changed since the most recent snapshot
+    -- This reduces storage by 99%+ in stable environments while maintaining
+    -- full point-in-time query capability via DISTINCT ON (cs.name) pattern
     INSERT INTO flight_recorder.config_snapshots (
         snapshot_id, name, setting, unit, source, sourcefile
     )
+    WITH latest_config AS (
+        SELECT DISTINCT ON (cs.name)
+            cs.name,
+            cs.setting,
+            cs.unit,
+            cs.source,
+            cs.sourcefile
+        FROM flight_recorder.config_snapshots cs
+        JOIN flight_recorder.snapshots s ON s.id = cs.snapshot_id
+        WHERE s.id < p_snapshot_id  -- Previous snapshots only
+        ORDER BY cs.name, s.id DESC
+    )
     SELECT
         p_snapshot_id,
-        name,
-        setting,
-        unit,
-        source,
-        sourcefile
-    FROM pg_settings
-    WHERE name = ANY(v_relevant_params);
+        pg.name,
+        pg.setting,
+        pg.unit,
+        pg.source,
+        pg.sourcefile
+    FROM pg_settings pg
+    WHERE pg.name = ANY(v_relevant_params)
+    AND (
+        -- No previous snapshot exists (first run)
+        NOT EXISTS (SELECT 1 FROM latest_config)
+        OR
+        -- Parameter didn't exist in previous snapshot (new parameter tracked)
+        NOT EXISTS (SELECT 1 FROM latest_config lc WHERE lc.name = pg.name)
+        OR
+        -- Parameter value changed
+        EXISTS (
+            SELECT 1 FROM latest_config lc
+            WHERE lc.name = pg.name
+            AND (
+                lc.setting IS DISTINCT FROM pg.setting
+                OR lc.source IS DISTINCT FROM pg.source
+                OR lc.sourcefile IS DISTINCT FROM pg.sourcefile
+            )
+        )
+    );
 END;
 $$;
 
@@ -2170,20 +2203,78 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Only insert database/role config overrides that have changed since the most recent snapshot
+    -- This reduces storage significantly in stable environments
     INSERT INTO flight_recorder.db_role_config_snapshots (
         snapshot_id, database_name, role_name, parameter_name, parameter_value
     )
+    WITH latest_db_role_config AS (
+        SELECT DISTINCT ON (drc.database_name, drc.role_name, drc.parameter_name)
+            drc.database_name,
+            drc.role_name,
+            drc.parameter_name,
+            drc.parameter_value
+        FROM flight_recorder.db_role_config_snapshots drc
+        JOIN flight_recorder.snapshots s ON s.id = drc.snapshot_id
+        WHERE s.id < p_snapshot_id  -- Previous snapshots only
+        ORDER BY drc.database_name, drc.role_name, drc.parameter_name, s.id DESC
+    ),
+    current_config AS (
+        SELECT
+            p_snapshot_id AS snapshot_id,
+            COALESCE(d.datname, '') AS database_name,
+            COALESCE(r.rolname, '') AS role_name,
+            split_part(setting, '=', 1) AS parameter_name,
+            split_part(setting, '=', 2) AS parameter_value
+        FROM pg_db_role_setting drs
+        CROSS JOIN LATERAL unnest(drs.setconfig) AS setting
+        LEFT JOIN pg_database d ON d.oid = drs.setdatabase
+        LEFT JOIN pg_roles r ON r.oid = drs.setrole
+        WHERE drs.setconfig IS NOT NULL
+    )
+    SELECT
+        cc.snapshot_id,
+        cc.database_name,
+        cc.role_name,
+        cc.parameter_name,
+        cc.parameter_value
+    FROM current_config cc
+    WHERE (
+        -- No previous snapshot exists (first run)
+        NOT EXISTS (SELECT 1 FROM latest_db_role_config)
+        OR
+        -- Override didn't exist in previous snapshot (new override)
+        NOT EXISTS (
+            SELECT 1 FROM latest_db_role_config lc
+            WHERE lc.database_name = cc.database_name
+            AND lc.role_name = cc.role_name
+            AND lc.parameter_name = cc.parameter_name
+        )
+        OR
+        -- Override value changed
+        EXISTS (
+            SELECT 1 FROM latest_db_role_config lc
+            WHERE lc.database_name = cc.database_name
+            AND lc.role_name = cc.role_name
+            AND lc.parameter_name = cc.parameter_name
+            AND lc.parameter_value IS DISTINCT FROM cc.parameter_value
+        )
+    )
+    UNION ALL
+    -- Capture removed overrides as NULL value to track deletions
     SELECT
         p_snapshot_id,
-        COALESCE(d.datname, '') AS database_name,
-        COALESCE(r.rolname, '') AS role_name,
-        split_part(setting, '=', 1) AS parameter_name,
-        split_part(setting, '=', 2) AS parameter_value
-    FROM pg_db_role_setting drs
-    CROSS JOIN LATERAL unnest(drs.setconfig) AS setting
-    LEFT JOIN pg_database d ON d.oid = drs.setdatabase
-    LEFT JOIN pg_roles r ON r.oid = drs.setrole
-    WHERE drs.setconfig IS NOT NULL;
+        lc.database_name,
+        lc.role_name,
+        lc.parameter_name,
+        NULL AS parameter_value
+    FROM latest_db_role_config lc
+    WHERE NOT EXISTS (
+        SELECT 1 FROM current_config cc
+        WHERE cc.database_name = lc.database_name
+        AND cc.role_name = lc.role_name
+        AND cc.parameter_name = lc.parameter_name
+    );
 END;
 $$;
 
