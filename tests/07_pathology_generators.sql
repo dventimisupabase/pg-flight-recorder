@@ -848,7 +848,7 @@ SELECT lives_ok(
 
 -- Test that anomaly_report can run and check for checkpoint issues
 SELECT lives_ok(
-    $$SELECT anomaly_type, severity, details
+    $$SELECT anomaly_type, severity, description
       FROM flight_recorder.anomaly_report(
           now() - interval '1 minute',
           now()
