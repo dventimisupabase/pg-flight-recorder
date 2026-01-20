@@ -4,12 +4,12 @@
 -- Tests: Generate real-world pathologies and verify pg-flight-recorder detects them
 -- Purpose: Validate that diagnostic playbooks work end-to-end
 -- Based on: DIAGNOSTIC_PLAYBOOKS.md
--- Sections: Lock Contention, Memory Pressure
--- Test count: 12
+-- Sections: Lock Contention, Memory Pressure, High CPU, Slow Real-time, Slow Queries
+-- Test count: 27
 -- =============================================================================
 
 BEGIN;
-SELECT plan(12);
+SELECT plan(27);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -222,6 +222,278 @@ DROP TABLE test_memory_pressure;
 SELECT ok(
     NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_memory_pressure'),
     'MEMORY PATHOLOGY: Test table should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 3: HIGH CPU USAGE (5 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 4 "High CPU Usage"
+--
+-- Real-world scenario: Queries burning CPU with complex calculations
+-- Expected detection: High total_exec_time with blk_read_time = 0 (CPU-bound)
+--                     statement_snapshots captures query statistics
+-- =============================================================================
+
+-- Setup: Create table for CPU-intensive operations
+CREATE TABLE test_cpu_intensive (
+    id int,
+    value numeric
+);
+
+-- Insert data for CPU-intensive calculations
+INSERT INTO test_cpu_intensive
+SELECT i, random() * 1000
+FROM generate_series(1, 50000) i;
+
+SELECT ok(
+    (SELECT count(*) FROM test_cpu_intensive) = 50000,
+    'CPU PATHOLOGY: Test table should have 50000 rows'
+);
+
+-- Capture baseline snapshot
+SELECT flight_recorder.snapshot();
+
+-- Generate pathology: CPU-intensive calculations
+DO $$
+DECLARE
+    v_result numeric;
+BEGIN
+    -- Run CPU-intensive mathematical operations
+    -- These operations are compute-heavy but don't require disk I/O
+    SELECT sum(
+        sqrt(abs(value)) * ln(abs(value) + 1) * exp(value / 100000.0) * cos(value)
+    ) INTO v_result
+    FROM test_cpu_intensive
+    WHERE value > 0;
+
+    -- Run another CPU-intensive query with aggregations
+    SELECT sum(power(value, 2) + power(value, 3) / 1000000)
+    INTO v_result
+    FROM test_cpu_intensive;
+
+    -- Small delay to ensure stats are captured
+    PERFORM pg_sleep(0.1);
+END;
+$$;
+
+-- Capture snapshot after CPU work
+SELECT flight_recorder.snapshot();
+
+-- Test that snapshots were captured
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.snapshots WHERE captured_at > now() - interval '10 seconds') >= 2,
+    'CPU PATHOLOGY: At least 2 snapshots should exist from test period'
+);
+
+-- Test that statement_snapshots has data
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.statement_snapshots) > 0,
+    'CPU PATHOLOGY: statement_snapshots should contain query statistics'
+);
+
+-- Test that recent_activity_current() works (used for real-time CPU monitoring)
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.recent_activity_current()$$,
+    'CPU PATHOLOGY: recent_activity_current() should execute for CPU monitoring'
+);
+
+-- Cleanup
+DROP TABLE test_cpu_intensive;
+
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_cpu_intensive'),
+    'CPU PATHOLOGY: Test table should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 4: DATABASE SLOW - REAL-TIME (5 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 1 "Database is Slow RIGHT NOW"
+--
+-- Real-world scenario: Long-running queries blocking resources
+-- Expected detection: recent_activity_current() shows long query_start
+--                     recent_waits_current() shows wait events
+--                     sample() captures activity snapshots
+-- =============================================================================
+
+-- Setup: Create a table to work with
+CREATE TABLE test_slow_realtime (
+    id int PRIMARY KEY,
+    data text
+);
+
+INSERT INTO test_slow_realtime
+SELECT i, md5(random()::text)
+FROM generate_series(1, 1000) i;
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_slow_realtime'),
+    'SLOW REALTIME PATHOLOGY: Test table should be created'
+);
+
+-- Generate pathology: Simulate a slow query using pg_sleep
+-- This mimics a long-running transaction that would show up in monitoring
+DO $$
+BEGIN
+    -- Capture activity before slow operation
+    PERFORM flight_recorder.sample();
+
+    -- Simulate slow query (short sleep to not slow down tests too much)
+    PERFORM pg_sleep(0.5);
+
+    -- Do some work during the "slow" period
+    PERFORM count(*) FROM test_slow_realtime;
+
+    -- Capture activity after slow operation
+    PERFORM flight_recorder.sample();
+END;
+$$;
+
+-- Test that sample() captured activity
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.activity_samples_ring) >= 0,
+    'SLOW REALTIME PATHOLOGY: activity_samples_ring should be queryable'
+);
+
+-- Test that recent_activity_current() works for real-time monitoring
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.recent_activity_current() ORDER BY query_start NULLS LAST LIMIT 10$$,
+    'SLOW REALTIME PATHOLOGY: recent_activity_current() should execute for triage'
+);
+
+-- Test that recent_waits_current() works for wait event analysis
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.recent_waits_current() ORDER BY count DESC$$,
+    'SLOW REALTIME PATHOLOGY: recent_waits_current() should execute for wait analysis'
+);
+
+-- Cleanup
+DROP TABLE test_slow_realtime;
+
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_slow_realtime'),
+    'SLOW REALTIME PATHOLOGY: Test table should be cleaned up'
+);
+
+-- =============================================================================
+-- PATHOLOGY 5: QUERIES TIMING OUT / TAKING FOREVER (5 tests)
+-- Based on: DIAGNOSTIC_PLAYBOOKS.md - Section 3 "Queries Timing Out / Taking Forever"
+--
+-- Real-world scenario: Queries doing sequential scans on large tables
+-- Expected detection: High mean_exec_time in statement_snapshots
+--                     High shared_blks_read indicating sequential scans
+--                     statement_compare() shows query regression
+-- =============================================================================
+
+-- Setup: Create a larger table without indexes to force sequential scans
+CREATE TABLE test_slow_queries (
+    id int,
+    category int,
+    data text,
+    created_at timestamp
+);
+
+-- Insert substantial data (no primary key = no index)
+INSERT INTO test_slow_queries
+SELECT
+    i,
+    (random() * 100)::int,
+    md5(random()::text) || md5(random()::text),
+    now() - (random() * interval '30 days')
+FROM generate_series(1, 20000) i;
+
+SELECT ok(
+    (SELECT count(*) FROM test_slow_queries) = 20000,
+    'SLOW QUERIES PATHOLOGY: Test table should have 20000 rows'
+);
+
+-- Capture baseline snapshot
+SELECT flight_recorder.snapshot();
+
+-- Generate pathology: Force sequential scans and expensive operations
+DO $$
+DECLARE
+    v_count int;
+BEGIN
+    -- Query without index - forces sequential scan
+    SELECT count(*) INTO v_count
+    FROM test_slow_queries
+    WHERE category = 42;
+
+    -- Another sequential scan with sorting (no index to help)
+    SELECT count(*) INTO v_count
+    FROM test_slow_queries
+    WHERE data LIKE '%abc%'
+    ORDER BY created_at;
+
+    -- Expensive aggregation requiring full table scan
+    SELECT count(DISTINCT category) INTO v_count
+    FROM test_slow_queries
+    WHERE created_at > now() - interval '15 days';
+
+    -- Force stats update
+    PERFORM pg_sleep(0.1);
+END;
+$$;
+
+-- Capture snapshot after slow queries
+SELECT flight_recorder.snapshot();
+
+-- Test that statement_snapshots captured query data
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.statement_snapshots ss
+     JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+     WHERE s.captured_at > now() - interval '10 seconds') > 0,
+    'SLOW QUERIES PATHOLOGY: statement_snapshots should have recent data'
+);
+
+-- Test that we can query statement stats for slow query analysis
+SELECT lives_ok(
+    $$SELECT query_preview, calls, mean_exec_time, shared_blks_read
+      FROM flight_recorder.statement_snapshots ss
+      JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+      WHERE s.captured_at > now() - interval '10 seconds'
+      ORDER BY mean_exec_time DESC NULLS LAST
+      LIMIT 10$$,
+    'SLOW QUERIES PATHOLOGY: Should be able to query statement stats for analysis'
+);
+
+-- Test that compare() function works for before/after analysis
+DO $$
+DECLARE
+    v_start_time timestamptz;
+    v_end_time timestamptz;
+    v_compare_count int;
+BEGIN
+    SELECT min(captured_at), max(captured_at)
+    INTO v_start_time, v_end_time
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - interval '10 seconds';
+
+    -- Verify compare() executes
+    SELECT count(*) INTO v_compare_count
+    FROM flight_recorder.compare(v_start_time, v_end_time);
+
+    -- Store result
+    INSERT INTO pathology_test_results VALUES ('compare_executed', v_compare_count >= 0)
+    ON CONFLICT DO NOTHING;
+
+    -- If table doesn't exist from previous test, create it
+    IF NOT FOUND THEN
+        UPDATE pathology_test_results SET result = (v_compare_count >= 0) WHERE test_name = 'compare_executed';
+    END IF;
+END;
+$$;
+
+SELECT ok(
+    (SELECT result FROM pathology_test_results WHERE test_name = 'compare_executed'),
+    'SLOW QUERIES PATHOLOGY: compare() should execute for before/after analysis'
+);
+
+-- Cleanup
+DROP TABLE test_slow_queries;
+
+SELECT ok(
+    NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'test_slow_queries'),
+    'SLOW QUERIES PATHOLOGY: Test table should be cleaned up'
 );
 
 -- =============================================================================

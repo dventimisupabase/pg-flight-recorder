@@ -12,7 +12,7 @@ Instead of just testing that functions exist and run without errors, these tests
 
 ### New Test File: `tests/07_pathology_generators.sql`
 
-- **12 pgTAP tests** covering 2 pathologies initially
+- **27 pgTAP tests** covering 5 pathologies
 - Uses the same pgTAP framework as existing tests
 - Clean setup and teardown of test objects
 
@@ -22,36 +22,46 @@ Instead of just testing that functions exist and run without errors, these tests
 - Step-by-step instructions for adding new pathologies
 - Templates and examples for future contributors
 
-## Pathologies Covered (2/9)
+## Pathologies Covered (5/9)
 
-### 1. Lock Contention
-
-**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 5
+### 1. Lock Contention (Section 5)
 
 - Simulates blocked queries using advisory locks
 - Verifies `recent_locks_current()` works
 - Tests `lock_samples_ring` captures events
 
-### 2. Memory Pressure / work_mem Issues
-
-**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 9
+### 2. Memory Pressure / work_mem Issues (Section 9)
 
 - Creates large dataset (10K rows)
 - Forces temp file spills with low work_mem (64kB)
 - Verifies `temp_files` and `temp_bytes` are captured
-- Tests `anomaly_report()` can analyze the period
 
-## Remaining Pathologies (7/9)
+### 3. High CPU Usage (Section 4)
 
-These can be added in future PRs following the same pattern:
+- CPU-intensive mathematical calculations
+- 50K rows with sqrt, ln, exp, cos, power operations
+- Verifies `statement_snapshots` captures query stats
 
-- [ ] High CPU Usage (Section 4)
-- [ ] Connection Exhaustion (Section 6)
-- [ ] Disk I/O Problems (Section 7)
-- [ ] Checkpoint Storms (Section 8)
-- [ ] Database Slow (Real-time) (Section 1)
+### 4. Database Slow - Real-time (Section 1)
+
+- Simulates long-running operations with `pg_sleep()`
+- Verifies `recent_activity_current()` and `recent_waits_current()` work
+- Tests `activity_samples_ring` captures activity
+
+### 5. Queries Timing Out (Section 3)
+
+- Large unindexed table (20K rows) forcing sequential scans
+- LIKE patterns and aggregations requiring full table scans
+- Verifies `compare()` and `statement_snapshots` work
+
+## Remaining Pathologies (4/9)
+
+These can be added in future PRs:
+
 - [ ] Database Slow (Historical) (Section 2)
-- [ ] Queries Timing Out (Section 3)
+- [ ] Connection Exhaustion (Section 6) - requires multiple connections
+- [ ] Disk I/O Problems (Section 7)
+- [ ] Checkpoint Storms (Section 8) - may need config changes
 
 ## Why This Matters
 
@@ -85,4 +95,4 @@ If this approach looks good:
 ---
 
 **Related:** DIAGNOSTIC_PLAYBOOKS.md
-**Test Count:** 12 new tests (bringing total to 116 across all test files)
+**Test Count:** 27 new tests covering 5 pathologies

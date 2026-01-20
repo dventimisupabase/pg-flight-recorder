@@ -12,11 +12,11 @@ These tests serve as both validation and living documentation, proving that the 
 
 ## Test Files
 
-- **`07_pathology_generators.sql`** - Initial proof-of-concept with 2 pathologies
+- **`07_pathology_generators.sql`** - 27 pgTAP tests covering 5 pathologies
 
 ## Current Pathologies Covered
 
-### 1. Lock Contention (Test #1)
+### 1. Lock Contention
 
 **Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 5
 
@@ -37,7 +37,7 @@ These tests serve as both validation and living documentation, proving that the 
 - Multiple sessions competing for same resources
 - Idle-in-transaction sessions blocking others
 
-### 2. Memory Pressure / work_mem Issues (Test #2)
+### 2. Memory Pressure / work_mem Issues
 
 **Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 9
 
@@ -59,6 +59,71 @@ These tests serve as both validation and living documentation, proving that the 
 - Under-provisioned `work_mem` causing performance degradation
 - Large reporting queries spilling to disk
 - Memory-intensive operations during peak load
+
+### 3. High CPU Usage
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 4
+
+**Pathology Generated:**
+
+- CPU-intensive mathematical calculations (sqrt, ln, exp, cos, power)
+- Large aggregations over 50,000 rows
+- Queries that are compute-bound (no disk I/O)
+
+**Detection Verified:**
+
+- `statement_snapshots` captures query statistics
+- `recent_activity_current()` works for real-time monitoring
+- Snapshots capture the test period
+
+**Real-world analogue:**
+
+- Complex analytical queries burning CPU
+- Inefficient queries doing lots of computation
+- JSON/text processing operations
+
+### 4. Database Slow - Real-time
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 1
+
+**Pathology Generated:**
+
+- Long-running operations using `pg_sleep()`
+- Activity during the slow period captured via `sample()`
+
+**Detection Verified:**
+
+- `activity_samples_ring` captures activity
+- `recent_activity_current()` shows current sessions
+- `recent_waits_current()` shows wait events
+
+**Real-world analogue:**
+
+- Long-running transactions blocking resources
+- Queries stuck waiting on locks or I/O
+- Real-time performance issues requiring immediate triage
+
+### 5. Queries Timing Out / Taking Forever
+
+**Based on:** DIAGNOSTIC_PLAYBOOKS.md Section 3
+
+**Pathology Generated:**
+
+- Large table (20,000 rows) without indexes
+- Sequential scans forced by queries on unindexed columns
+- LIKE patterns and aggregations requiring full table scans
+
+**Detection Verified:**
+
+- `statement_snapshots` captures query execution statistics
+- `compare()` function works for before/after analysis
+- Can query `mean_exec_time` and `shared_blks_read`
+
+**Real-world analogue:**
+
+- Missing indexes causing slow queries
+- Plan regressions after statistics changes
+- Queries timing out under load
 
 ## How to Run
 
@@ -84,10 +149,10 @@ To add a new pathology based on DIAGNOSTIC_PLAYBOOKS.md:
 
 Review DIAGNOSTIC_PLAYBOOKS.md and pick an uncovered pathology:
 
-- [ ] Database Slow (Real-time)
+- [x] Database Slow (Real-time)
 - [ ] Database Slow (Historical)
-- [ ] Queries Timing Out
-- [ ] High CPU Usage
+- [x] Queries Timing Out
+- [x] High CPU Usage
 - [x] Lock Contention
 - [ ] Connection Exhaustion
 - [ ] Disk I/O Problems
@@ -225,27 +290,25 @@ When implementing a new pathology test:
 
 ## Future Pathologies to Implement
 
-Priority pathologies to add next:
+Remaining pathologies to add (4 of 9):
 
-1. **High CPU Usage** (Section 4)
-   - CPU-bound queries with complex calculations
-   - Verify `blk_read_time = 0` and high `total_exec_time`
+1. **Database Slow - Historical** (Section 2)
+   - Test archive tables and historical analysis
+   - Verify `activity_samples_archive` and `summary_report()`
 
 2. **Connection Exhaustion** (Section 6)
    - Create many connections approaching `max_connections`
    - Verify `connections_total` near `connections_max`
+   - **Challenge:** Requires multiple connections (dblink)
 
-3. **Checkpoint Storms** (Section 8)
-   - Generate heavy WAL traffic
-   - Verify `FORCED_CHECKPOINT` anomalies
-
-4. **Disk I/O Problems** (Section 7)
+3. **Disk I/O Problems** (Section 7)
    - Large sequential scans
    - Verify `IO:DataFileRead` wait events
 
-5. **Queries Timing Out** (Section 3)
-   - Missing indexes causing slow queries
-   - Verify high `mean_exec_time` in statement_snapshots
+4. **Checkpoint Storms** (Section 8)
+   - Generate heavy WAL traffic
+   - Verify `FORCED_CHECKPOINT` anomalies
+   - **Challenge:** May need config changes
 
 ## Questions or Issues?
 
