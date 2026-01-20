@@ -22,19 +22,19 @@ SELECT has_schema('flight_recorder', 'Schema flight_recorder should exist');
 SELECT has_table('flight_recorder', 'snapshots', 'Table flight_recorder.snapshots should exist');
 SELECT has_table('flight_recorder', 'replication_snapshots', 'Table flight_recorder.replication_snapshots should exist');
 SELECT has_table('flight_recorder', 'statement_snapshots', 'Table flight_recorder.statement_snapshots should exist');
--- TIER 1: Ring buffers (UNLOGGED)
-SELECT has_table('flight_recorder', 'samples_ring', 'TIER 1: Table flight_recorder.samples_ring should exist');
-SELECT has_table('flight_recorder', 'wait_samples_ring', 'TIER 1: Table flight_recorder.wait_samples_ring should exist');
-SELECT has_table('flight_recorder', 'activity_samples_ring', 'TIER 1: Table flight_recorder.activity_samples_ring should exist');
-SELECT has_table('flight_recorder', 'lock_samples_ring', 'TIER 1: Table flight_recorder.lock_samples_ring should exist');
--- TIER 2: Aggregates (REGULAR/durable)
-SELECT has_table('flight_recorder', 'wait_event_aggregates', 'TIER 2: Table flight_recorder.wait_event_aggregates should exist');
-SELECT has_table('flight_recorder', 'lock_aggregates', 'TIER 2: Table flight_recorder.lock_aggregates should exist');
-SELECT has_table('flight_recorder', 'activity_aggregates', 'TIER 2: Table flight_recorder.activity_aggregates should exist');
--- TIER 1.5: Raw sample archives (REGULAR/durable)
-SELECT has_table('flight_recorder', 'activity_samples_archive', 'TIER 1.5: Table flight_recorder.activity_samples_archive should exist');
-SELECT has_table('flight_recorder', 'lock_samples_archive', 'TIER 1.5: Table flight_recorder.lock_samples_archive should exist');
-SELECT has_table('flight_recorder', 'wait_samples_archive', 'TIER 1.5: Table flight_recorder.wait_samples_archive should exist');
+-- Ring buffers (UNLOGGED)
+SELECT has_table('flight_recorder', 'samples_ring', 'Ring buffer: Table flight_recorder.samples_ring should exist');
+SELECT has_table('flight_recorder', 'wait_samples_ring', 'Ring buffer: Table flight_recorder.wait_samples_ring should exist');
+SELECT has_table('flight_recorder', 'activity_samples_ring', 'Ring buffer: Table flight_recorder.activity_samples_ring should exist');
+SELECT has_table('flight_recorder', 'lock_samples_ring', 'Ring buffer: Table flight_recorder.lock_samples_ring should exist');
+-- Aggregates (REGULAR/durable)
+SELECT has_table('flight_recorder', 'wait_event_aggregates', 'Aggregates: Table flight_recorder.wait_event_aggregates should exist');
+SELECT has_table('flight_recorder', 'lock_aggregates', 'Aggregates: Table flight_recorder.lock_aggregates should exist');
+SELECT has_table('flight_recorder', 'activity_aggregates', 'Aggregates: Table flight_recorder.activity_aggregates should exist');
+-- Raw archives (REGULAR/durable)
+SELECT has_table('flight_recorder', 'activity_samples_archive', 'Raw archives: Table flight_recorder.activity_samples_archive should exist');
+SELECT has_table('flight_recorder', 'lock_samples_archive', 'Raw archives: Table flight_recorder.lock_samples_archive should exist');
+SELECT has_table('flight_recorder', 'wait_samples_archive', 'Raw archives: Table flight_recorder.wait_samples_archive should exist');
 -- Config and monitoring
 SELECT has_table('flight_recorder', 'config', 'Table flight_recorder.config should exist');
 SELECT has_table('flight_recorder', 'collection_stats', 'P0 Safety: Table flight_recorder.collection_stats should exist');
@@ -99,9 +99,9 @@ SELECT has_function('flight_recorder', 'get_mode', 'Function flight_recorder.get
 SELECT has_function('flight_recorder', 'set_mode', 'Function flight_recorder.set_mode should exist');
 SELECT has_function('flight_recorder', 'cleanup', 'Function flight_recorder.cleanup should exist');
 -- Ring buffer functions
-SELECT has_function('flight_recorder', 'flush_ring_to_aggregates', 'TIER 2: Function flight_recorder.flush_ring_to_aggregates should exist');
-SELECT has_function('flight_recorder', 'archive_ring_samples', 'TIER 1.5: Function flight_recorder.archive_ring_samples should exist');
-SELECT has_function('flight_recorder', 'cleanup_aggregates', 'TIER 2: Function flight_recorder.cleanup_aggregates should exist');
+SELECT has_function('flight_recorder', 'flush_ring_to_aggregates', 'Aggregates: Function flight_recorder.flush_ring_to_aggregates should exist');
+SELECT has_function('flight_recorder', 'archive_ring_samples', 'Raw archives: Function flight_recorder.archive_ring_samples should exist');
+SELECT has_function('flight_recorder', 'cleanup_aggregates', 'Cleanup: Function flight_recorder.cleanup_aggregates should exist');
 
 -- =============================================================================
 -- 3. CORE FUNCTIONALITY (10 tests)

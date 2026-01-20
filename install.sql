@@ -112,7 +112,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     captured_at         TIMESTAMPTZ NOT NULL,
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
-COMMENT ON TABLE flight_recorder.samples_ring IS 'TIER 1: Ring buffer master (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. Conservative 120s with proactive throttling. Fill factor 70 enables HOT updates.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'Ring buffer: Master slot tracker (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. Conservative 120s with proactive throttling. Fill factor 70 enables HOT updates.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -124,7 +124,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     count               INTEGER,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'TIER 1: Wait events ring buffer (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'Ring buffer: Wait events (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -141,7 +141,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     query_preview       TEXT,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'TIER 1: Active sessions ring buffer (UPDATE-only pattern). Pre-populated with 3,000 rows (120 slots × 25 rows). Top 25 active sessions per sample. UPSERTs enable HOT updates, zero dead tuples. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'Ring buffer: Active sessions (UPDATE-only pattern). Pre-populated with 3,000 rows (120 slots × 25 rows). Top 25 active sessions per sample. UPSERTs enable HOT updates, zero dead tuples. NULLs indicate unused slots.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     slot_id                 INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -159,7 +159,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     locked_relation_oid     OID,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'TIER 1: Lock contention ring buffer (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'Ring buffer: Lock contention (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
 
 INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
 SELECT
@@ -185,7 +185,7 @@ CROSS JOIN generate_series(0, 99) r(row_num)
 ON CONFLICT (slot_id, row_num) DO NOTHING;
 -- Aggregates wait event statistics over 5-minute windows, enabling analysis of wait event patterns
 -- Stores metrics like average/max concurrent waiters per event type, state, and backend type
--- TIER 2: durable and survives crashes, with indexes for efficient time-range and event-type queries
+-- Aggregates: durable and survives crashes, with indexes for efficient time-range and event-type queries
 CREATE TABLE IF NOT EXISTS flight_recorder.wait_event_aggregates (
     id              BIGSERIAL PRIMARY KEY,
     start_time      TIMESTAMPTZ NOT NULL,
@@ -204,7 +204,7 @@ CREATE INDEX IF NOT EXISTS wait_aggregates_time_idx
     ON flight_recorder.wait_event_aggregates(start_time, end_time);
 CREATE INDEX IF NOT EXISTS wait_aggregates_event_idx
     ON flight_recorder.wait_event_aggregates(wait_event_type, wait_event);
-COMMENT ON TABLE flight_recorder.wait_event_aggregates IS 'TIER 2: Durable wait event summaries (5-min windows, survives crashes)';
+COMMENT ON TABLE flight_recorder.wait_event_aggregates IS 'Aggregates: Durable wait event summaries (5-min windows, survives crashes)';
 
 
 -- Stores aggregated lock contention patterns within time windows
@@ -225,7 +225,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.lock_aggregates (
 );
 CREATE INDEX IF NOT EXISTS lock_aggregates_time_idx
     ON flight_recorder.lock_aggregates(start_time, end_time);
-COMMENT ON TABLE flight_recorder.lock_aggregates IS 'TIER 2: Durable lock pattern summaries (5-min windows, survives crashes)';
+COMMENT ON TABLE flight_recorder.lock_aggregates IS 'Aggregates: Durable lock pattern summaries (5-min windows, survives crashes)';
 
 
 -- Aggregates activity samples within 5-minute time windows
@@ -242,7 +242,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.activity_aggregates (
 );
 CREATE INDEX IF NOT EXISTS activity_aggregates_time_idx
     ON flight_recorder.activity_aggregates(start_time, end_time);
-COMMENT ON TABLE flight_recorder.activity_aggregates IS 'TIER 2: Durable activity summaries (5-min windows, survives crashes)';
+COMMENT ON TABLE flight_recorder.activity_aggregates IS 'Aggregates: Durable activity summaries (5-min windows, survives crashes)';
 
 
 -- Stores snapshot samples of PostgreSQL backend activity for forensic analysis
@@ -269,7 +269,7 @@ CREATE INDEX IF NOT EXISTS activity_archive_sample_id_idx
     ON flight_recorder.activity_samples_archive(sample_id);
 CREATE INDEX IF NOT EXISTS activity_archive_pid_idx
     ON flight_recorder.activity_samples_archive(pid, captured_at);
-COMMENT ON TABLE flight_recorder.activity_samples_archive IS 'TIER 1.5: Raw activity samples for forensic analysis (15-min cadence, full resolution)';
+COMMENT ON TABLE flight_recorder.activity_samples_archive IS 'Raw archives: Activity samples for forensic analysis (15-min cadence, full resolution)';
 
 
 -- Archives lock contention incidents with complete blocking chains (blocked and blocking process details)
@@ -299,7 +299,7 @@ CREATE INDEX IF NOT EXISTS lock_archive_blocked_pid_idx
     ON flight_recorder.lock_samples_archive(blocked_pid, captured_at);
 CREATE INDEX IF NOT EXISTS lock_archive_blocking_pid_idx
     ON flight_recorder.lock_samples_archive(blocking_pid, captured_at);
-COMMENT ON TABLE flight_recorder.lock_samples_archive IS 'TIER 1.5: Raw lock samples for forensic analysis (15-min cadence, full blocking chains)';
+COMMENT ON TABLE flight_recorder.lock_samples_archive IS 'Raw archives: Lock samples for forensic analysis (15-min cadence, full blocking chains)';
 
 
 -- Archives raw wait event samples at full resolution for forensic analysis
@@ -321,7 +321,7 @@ CREATE INDEX IF NOT EXISTS wait_archive_sample_id_idx
     ON flight_recorder.wait_samples_archive(sample_id);
 CREATE INDEX IF NOT EXISTS wait_archive_wait_event_idx
     ON flight_recorder.wait_samples_archive(wait_event_type, wait_event, captured_at);
-COMMENT ON TABLE flight_recorder.wait_samples_archive IS 'TIER 1.5: Raw wait event samples for forensic analysis (15-min cadence, full resolution)';
+COMMENT ON TABLE flight_recorder.wait_samples_archive IS 'Raw archives: Wait event samples for forensic analysis (15-min cadence, full resolution)';
 
 
 -- Captures table-level statistics from pg_stat_user_tables for hotspot tracking
@@ -1187,7 +1187,7 @@ $$;
 COMMENT ON FUNCTION flight_recorder._should_skip_collection() IS 'Pre-flight checks for replication lag, checkpoints, and backups';
 
 
--- TIER 1: Collect performance samples (wait events, active sessions, locks) into ring buffers
+-- Sampled activity: Collect performance samples (wait events, active sessions, locks) into ring buffers
 -- Applies load shedding, circuit breaker, and pre-flight checks before collection
 CREATE OR REPLACE FUNCTION flight_recorder.sample()
 RETURNS TIMESTAMPTZ
@@ -1686,10 +1686,10 @@ EXCEPTION
         RETURN v_captured_at;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.sample() IS 'TIER 1: Collect samples into ring buffer (60s intervals, 3 sections: waits, activity, locks)';
+COMMENT ON FUNCTION flight_recorder.sample() IS 'Sampled activity: Collect samples into ring buffer (60s intervals, 3 sections: waits, activity, locks)';
 
 
--- TIER 2: Aggregate wait events, lock conflicts, and query activity from ring buffers into durable aggregate tables
+-- Aggregates: Aggregate wait events, lock conflicts, and query activity from ring buffers into durable aggregate tables
 CREATE OR REPLACE FUNCTION flight_recorder.flush_ring_to_aggregates()
 RETURNS VOID
 LANGUAGE plpgsql AS $$
@@ -1770,7 +1770,7 @@ BEGIN
         v_start_time, v_end_time, v_total_samples;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.flush_ring_to_aggregates() IS 'TIER 2: Flush ring buffer to durable aggregates every 5 minutes';
+COMMENT ON FUNCTION flight_recorder.flush_ring_to_aggregates() IS 'Aggregates: Flush ring buffer to durable aggregates every 5 minutes';
 
 
 -- Archives activity, lock, and wait samples from ring buffers to persistent storage for forensic analysis
@@ -1904,7 +1904,7 @@ BEGIN
         v_samples_to_archive, v_activity_rows, v_lock_rows, v_wait_rows;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'TIER 1.5: Archive raw samples for high-resolution forensic analysis (default: every 15 minutes)';
+COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'Raw archives: Archive raw samples for high-resolution forensic analysis (default: every 15 minutes)';
 
 
 -- Removes aged aggregate and archived sample data based on configured retention periods
@@ -1955,7 +1955,7 @@ BEGIN
     END IF;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'TIER 2: Clean up old aggregate data based on retention period';
+COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate and archive data based on retention period';
 
 
 -- Collects table-level statistics from pg_stat_user_tables
@@ -2279,7 +2279,7 @@ END;
 $$;
 
 
--- TIER 1: Collect comprehensive snapshot of PostgreSQL system metrics (WAL, checkpoints, I/O, replication, statements)
+-- Snapshots: Collect comprehensive snapshot of PostgreSQL system metrics (WAL, checkpoints, I/O, replication, statements)
 -- Returns the captured timestamp for downstream processing and analysis
 CREATE OR REPLACE FUNCTION flight_recorder.snapshot()
 RETURNS TIMESTAMPTZ

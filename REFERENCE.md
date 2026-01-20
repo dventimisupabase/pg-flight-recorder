@@ -45,7 +45,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 ### Purpose and Scope
 
-pg-flight-recorder continuously samples PostgreSQL system state, storing data in a four-tier architecture optimized for minimal overhead and flexible retention. Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
+pg-flight-recorder continuously samples PostgreSQL system state using two independent collection systems: sampled activity (wait events, sessions, locks) and cumulative snapshots (WAL, checkpoints, I/O). Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
 
 ### Requirements
 
@@ -70,27 +70,52 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ## Core Concepts
 
-### Four-Tier Data Architecture
+### Data Architecture
 
-Flight Recorder organizes data into four tiers optimized for different access patterns:
+Flight Recorder uses two independent collection systems that answer different questions:
+
+- **Sampled Activity**: "What's happening right now?" (wait events, sessions, locks)
+- **Cumulative Snapshots**: "How much has happened over time?" (WAL, checkpoints, I/O, transactions)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ TIER 1: Ring Buffers (UNLOGGED)                                         │
-│   High-frequency sampling, 6-10 hour retention, auto-overwrites         │
+│ SAMPLED ACTIVITY SYSTEM                                                 │
+│   Collects: wait events, active sessions, locks                         │
+│   Job: sample() every 3 minutes                                         │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ Ring Buffers (hot storage)                                      │   │
+│   │   UNLOGGED, 6-10 hour retention, auto-overwrites                │   │
+│   └──────────────────────┬──────────────────────────────────────────┘   │
+│                          │                                              │
+│            ┌─────────────┴─────────────┐                                │
+│            ▼                           ▼                                │
+│   ┌─────────────────────┐     ┌─────────────────────┐                   │
+│   │ Raw Archives        │     │ Aggregates          │                   │
+│   │   Detail preserved  │     │   Summarized        │                   │
+│   │   7-day retention   │     │   7-day retention   │                   │
+│   │   Forensic analysis │     │   Pattern analysis  │                   │
+│   └─────────────────────┘     └─────────────────────┘                   │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ TIER 1.5: Raw Archives (LOGGED)                                         │
-│   Periodic raw sample snapshots, 7-day retention, forensic detail       │
-├─────────────────────────────────────────────────────────────────────────┤
-│ TIER 2: Aggregates (LOGGED)                                             │
-│   Summarized data, 7-day retention, pattern analysis                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│ TIER 3: Snapshots (LOGGED)                                              │
-│   Cumulative stats, 30-day retention, trend analysis                    │
+│ CUMULATIVE SNAPSHOT SYSTEM                                              │
+│   Collects: pg_stat_* counters (WAL, checkpoints, I/O, transactions)    │
+│   Job: snapshot() every 5 minutes                                       │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ Snapshots                                                       │   │
+│   │   Point-in-time counter values, 30-day retention                │   │
+│   │   Compare two snapshots to compute deltas                       │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**TIER 1: Ring Buffers**
+---
+
+### Sampled Activity System
+
+Samples current database state every 3 minutes, capturing three categories of observational data: wait events, active sessions, and locks. Data lands in ring buffers (hot storage), then flows to two parallel outputs for longer-term retention.
+
+**Ring Buffers (hot storage)**
 
 Low-overhead, high-frequency sampling using a fixed 120-slot circular buffer.
 
@@ -108,33 +133,45 @@ Characteristics:
 - **Modular arithmetic** (`epoch / interval % 120`) auto-overwrites old slots
 - Query via: `recent_waits`, `recent_activity`, `recent_locks` views
 
-**TIER 1.5: Raw Archives**
+**Raw Archives (cold storage, detail preserved)**
 
-Periodic preservation of raw samples for forensic analysis beyond ring buffer retention.
+Periodic preservation of ring buffer samples for forensic analysis. Captured every 15 minutes.
 
 | Table | Purpose |
 |-------|---------|
+| `wait_samples_archive` | Wait patterns with counts |
 | `activity_samples_archive` | PIDs, queries, session details |
 | `lock_samples_archive` | Complete blocking chains |
-| `wait_samples_archive` | Wait patterns with counts |
 
-Preserves details that aggregates lose: specific PIDs, exact timestamps, complete blocking chains. Query directly for forensic analysis.
+Preserves details that aggregates lose: specific PIDs, exact timestamps, complete blocking chains. Query directly for forensic analysis ("what exactly was happening at 14:32:17?").
 
-**TIER 2: Aggregates**
+**Aggregates (cold storage, summarized)**
 
-Durable summaries of ring buffer data for medium-term analysis.
+Durable summaries of ring buffer data. Flushed every 5 minutes.
 
 | Table | Purpose |
 |-------|---------|
 | `wait_event_aggregates` | Wait patterns over 5-minute windows |
-| `lock_aggregates` | Lock contention patterns |
 | `activity_aggregates` | Activity/query execution patterns |
+| `lock_aggregates` | Lock contention patterns |
 
-Query via: `wait_summary(start, end)` function.
+Compresses data for pattern analysis ("Lock:transactionid wait occurred 47 times this hour"). Query via `wait_summary(start, end)` function.
 
-**TIER 3: Snapshots**
+**Data flow:**
 
-Point-in-time cumulative statistics for long-term trends.
+| Category | Ring Buffer | → Archive | → Aggregate |
+|----------|-------------|-----------|-------------|
+| Wait events | `wait_samples_ring` | `wait_samples_archive` | `wait_event_aggregates` |
+| Activity | `activity_samples_ring` | `activity_samples_archive` | `activity_aggregates` |
+| Locks | `lock_samples_ring` | `lock_samples_archive` | `lock_aggregates` |
+
+Note: Archives and aggregates both derive directly from ring buffers—they are parallel outputs, not sequential stages.
+
+---
+
+### Cumulative Snapshot System
+
+Records point-in-time values of monotonically increasing counters from `pg_stat_*` views. Unlike sampled activity (which captures "what's happening now"), snapshots capture "how much has happened since server start." Compare two snapshots to compute deltas.
 
 | Table | Purpose |
 |-------|---------|
@@ -146,6 +183,8 @@ Point-in-time cumulative statistics for long-term trends.
 | `config_snapshots` | PostgreSQL configuration parameters |
 
 Query via: `compare(start, end)`, `statement_compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`, `config_at(timestamp)`.
+
+Example: "How many checkpoints occurred between 10:00 and 11:00?" → `SELECT * FROM flight_recorder.compare('10:00', '11:00')`
 
 ### Ring Buffer Mechanism
 
@@ -344,15 +383,15 @@ SELECT * FROM flight_recorder.config;
 
 Single authoritative reference for all retention periods:
 
-| Setting | Default | Tier | Purpose |
-|---------|---------|------|---------|
-| `aggregate_retention_days` | 7 | TIER 2 | Aggregated summaries |
-| `archive_retention_days` | 7 | TIER 1.5 | Raw sample archives |
-| `retention_snapshots_days` | 30 | TIER 3 | System stat snapshots |
-| `retention_statements_days` | 30 | TIER 3 | Query snapshots |
+| Setting | Default | Storage | Purpose |
+|---------|---------|---------|---------|
+| `aggregate_retention_days` | 7 | Aggregates | Aggregated summaries |
+| `archive_retention_days` | 7 | Raw Archives | Raw sample archives |
+| `retention_snapshots_days` | 30 | Snapshots | System stat snapshots |
+| `retention_statements_days` | 30 | Snapshots | Query snapshots |
 | `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
 
-Ring buffer (TIER 1) self-cleans via slot overwrite—no retention setting needed.
+Ring buffers self-clean via slot overwrite—no retention setting needed.
 
 ### Sample Intervals
 
