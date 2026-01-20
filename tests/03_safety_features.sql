@@ -363,10 +363,11 @@ SELECT ok(
     'P4: export_json() should include db_role_config_changes in result'
 );
 
--- Test P4: Export version is 1.1-ai
+-- Test P4: Export version matches schema_version from config
 SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now())->'meta'->>'version' = '1.1-ai'),
-    'P4: export_json() should have version 1.1-ai'
+    (SELECT flight_recorder.export_json(now() - interval '1 hour', now())->'meta'->>'version' =
+            (SELECT value FROM flight_recorder.config WHERE key = 'schema_version')),
+    'P4: export_json() version should match schema_version from config'
 );
 
 -- Test P4: Config recommendations function exists

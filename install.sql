@@ -6,6 +6,31 @@ BEGIN
         RAISE EXCEPTION E'\n\nFlight Recorder requires pg_cron extension.\n\nInstall pg_cron first:\n  CREATE EXTENSION pg_cron;\n\nSee: https://github.com/citusdata/pg_cron\n';
     END IF;
 END $$;
+
+-- Check for existing installation and warn about upgrade path
+DO $$
+DECLARE
+    existing_version TEXT;
+BEGIN
+    SELECT value INTO existing_version
+    FROM flight_recorder.config WHERE key = 'schema_version';
+
+    IF existing_version IS NOT NULL THEN
+        RAISE NOTICE E'\n=== Existing installation detected (v%) ===', existing_version;
+        RAISE NOTICE 'This install script will update functions and views.';
+        RAISE NOTICE 'Your data will be preserved.';
+        RAISE NOTICE 'For schema changes, use: psql -f migrations/upgrade.sql';
+        RAISE NOTICE E'===\n';
+    END IF;
+EXCEPTION
+    WHEN undefined_table THEN
+        -- Fresh install, continue normally
+        NULL;
+    WHEN invalid_schema_name THEN
+        -- Schema doesn't exist yet, fresh install
+        NULL;
+END $$;
+
 CREATE SCHEMA IF NOT EXISTS flight_recorder;
 
 -- Stores periodic snapshots of PostgreSQL system performance metrics
@@ -443,6 +468,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
+    ('schema_version', '2.0'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -4889,7 +4915,12 @@ DECLARE
     v_index_efficiency JSONB;
     v_config_changes JSONB;
     v_db_role_config_changes JSONB;
+    v_version TEXT;
 BEGIN
+    -- Get schema version from config
+    SELECT value INTO v_version FROM flight_recorder.config WHERE key = 'schema_version';
+    v_version := COALESCE(v_version, 'unknown');
+
     -- Anomaly detection
     SELECT jsonb_agg(to_jsonb(r)) INTO v_anomalies
     FROM flight_recorder.anomaly_report(p_start_time, p_end_time) r;
@@ -4962,7 +4993,7 @@ BEGIN
     v_result := jsonb_build_object(
         'meta', jsonb_build_object(
             'generated_at', now(),
-            'version', '1.1-ai',
+            'version', v_version,
             'schemas', jsonb_build_object(
                 'samples', '[captured_at, wait_events[[backend, type, event, count]], locks[[blocked_pid, blocking_pid, type, duration]]]',
                 'snapshots', '[captured_at, wal_bytes, ckpt_timed, ckpt_req, bgw_backend_writes]',
@@ -4983,6 +5014,89 @@ BEGIN
         'snapshots', COALESCE(v_snapshots, '[]'::jsonb)
     );
     RETURN v_result;
+END;
+$$;
+
+-- Exports all data before an upgrade, saving to a file for backup
+-- Returns summary of what was exported and the recommended restore command
+CREATE OR REPLACE FUNCTION flight_recorder.export_for_upgrade()
+RETURNS TABLE(
+    data_type TEXT,
+    row_count BIGINT,
+    date_range TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_version TEXT;
+BEGIN
+    SELECT value INTO v_version FROM flight_recorder.config WHERE key = 'schema_version';
+
+    RAISE NOTICE '';
+    RAISE NOTICE '=== Flight Recorder Export for Upgrade ===';
+    RAISE NOTICE 'Current version: %', COALESCE(v_version, 'unknown');
+    RAISE NOTICE '';
+    RAISE NOTICE 'To export all data, run:';
+    RAISE NOTICE '  psql -c "COPY (SELECT flight_recorder.export_json(now() - interval ''30 days'', now())) TO STDOUT" > backup.json';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Or for specific tables:';
+    RAISE NOTICE '  pg_dump -t flight_recorder.snapshots -t flight_recorder.statement_snapshots ... > backup.sql';
+    RAISE NOTICE '';
+
+    -- Return summary of data that would be exported
+    RETURN QUERY
+    SELECT 'snapshots'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.snapshots;
+
+    RETURN QUERY
+    SELECT 'statement_snapshots'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.statement_snapshots;
+
+    RETURN QUERY
+    SELECT 'table_snapshots'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.table_snapshots;
+
+    RETURN QUERY
+    SELECT 'index_snapshots'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.index_snapshots;
+
+    RETURN QUERY
+    SELECT 'activity_samples_archive'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.activity_samples_archive;
+
+    RETURN QUERY
+    SELECT 'lock_samples_archive'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.lock_samples_archive;
+
+    RETURN QUERY
+    SELECT 'wait_samples_archive'::TEXT, count(*)::BIGINT,
+           min(captured_at)::TEXT || ' to ' || max(captured_at)::TEXT
+    FROM flight_recorder.wait_samples_archive;
+
+    RETURN QUERY
+    SELECT 'wait_event_aggregates'::TEXT, count(*)::BIGINT,
+           min(window_start)::TEXT || ' to ' || max(window_end)::TEXT
+    FROM flight_recorder.wait_event_aggregates;
+
+    RETURN QUERY
+    SELECT 'activity_aggregates'::TEXT, count(*)::BIGINT,
+           min(window_start)::TEXT || ' to ' || max(window_end)::TEXT
+    FROM flight_recorder.activity_aggregates;
+
+    RETURN QUERY
+    SELECT 'lock_aggregates'::TEXT, count(*)::BIGINT,
+           min(window_start)::TEXT || ' to ' || max(window_end)::TEXT
+    FROM flight_recorder.lock_aggregates;
+
+    RETURN QUERY
+    SELECT 'config'::TEXT, count(*)::BIGINT,
+           'current settings'::TEXT
+    FROM flight_recorder.config;
 END;
 $$;
 

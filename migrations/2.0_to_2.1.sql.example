@@ -1,0 +1,124 @@
+-- =============================================================================
+-- Migration: 2.0 to 2.1 (EXAMPLE - rename this to 2.0_to_2.1.sql when needed)
+-- =============================================================================
+-- Description: Example migration showing common patterns
+--
+-- Changes:
+--   - Adds cpu_percent column to snapshots table
+--   - Adds memory_percent column to snapshots table
+--   - Creates new resource_alerts table
+--   - Updates snapshot() function to collect new metrics
+--
+-- Data preservation: All existing data preserved. New columns default to NULL.
+-- =============================================================================
+
+\set ON_ERROR_STOP on
+
+BEGIN;
+
+-- =============================================================================
+-- Step 1: Version Guard
+-- =============================================================================
+DO $$
+DECLARE
+    v_current TEXT;
+    v_expected TEXT := '2.0';
+    v_target TEXT := '2.1';
+BEGIN
+    SELECT value INTO v_current
+    FROM flight_recorder.config WHERE key = 'schema_version';
+
+    IF v_current IS NULL THEN
+        RAISE EXCEPTION 'schema_version not found. Is Flight Recorder installed?';
+    END IF;
+
+    IF v_current != v_expected THEN
+        RAISE EXCEPTION 'Migration 2.0→2.1 requires version %, found %', v_expected, v_current;
+    END IF;
+
+    RAISE NOTICE 'Migrating from % to %...', v_expected, v_target;
+END $$;
+
+-- =============================================================================
+-- Step 2: Schema Changes
+-- =============================================================================
+
+-- Add resource monitoring columns to snapshots
+-- Using ADD COLUMN IF NOT EXISTS for idempotency
+ALTER TABLE flight_recorder.snapshots
+    ADD COLUMN IF NOT EXISTS cpu_percent NUMERIC(5,2);
+
+ALTER TABLE flight_recorder.snapshots
+    ADD COLUMN IF NOT EXISTS memory_percent NUMERIC(5,2);
+
+-- Create new alerts table for resource threshold violations
+CREATE TABLE IF NOT EXISTS flight_recorder.resource_alerts (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    alert_type      TEXT NOT NULL,
+    metric_name     TEXT NOT NULL,
+    threshold       NUMERIC NOT NULL,
+    actual_value    NUMERIC NOT NULL,
+    snapshot_id     INTEGER REFERENCES flight_recorder.snapshots(id) ON DELETE CASCADE,
+    acknowledged    BOOLEAN DEFAULT FALSE,
+    acknowledged_at TIMESTAMPTZ,
+    notes           TEXT
+);
+
+-- Index for querying unacknowledged alerts
+CREATE INDEX IF NOT EXISTS idx_resource_alerts_unacked
+    ON flight_recorder.resource_alerts (created_at)
+    WHERE acknowledged = FALSE;
+
+-- =============================================================================
+-- Step 3: Add new config keys
+-- =============================================================================
+INSERT INTO flight_recorder.config (key, value) VALUES
+    ('resource_alerting_enabled', 'true'),
+    ('cpu_alert_threshold_pct', '90'),
+    ('memory_alert_threshold_pct', '85')
+ON CONFLICT (key) DO NOTHING;
+
+-- =============================================================================
+-- Step 4: Update Version
+-- =============================================================================
+UPDATE flight_recorder.config
+SET value = '2.1', updated_at = now()
+WHERE key = 'schema_version';
+
+COMMIT;
+
+-- =============================================================================
+-- Step 5: Post-migration verification
+-- =============================================================================
+DO $$
+DECLARE
+    v_version TEXT;
+    v_has_cpu BOOLEAN;
+    v_has_alerts BOOLEAN;
+BEGIN
+    SELECT value INTO v_version
+    FROM flight_recorder.config WHERE key = 'schema_version';
+
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flight_recorder'
+        AND table_name = 'snapshots'
+        AND column_name = 'cpu_percent'
+    ) INTO v_has_cpu;
+
+    SELECT EXISTS (
+        SELECT 1 FROM pg_tables
+        WHERE schemaname = 'flight_recorder'
+        AND tablename = 'resource_alerts'
+    ) INTO v_has_alerts;
+
+    RAISE NOTICE '';
+    RAISE NOTICE '=== Migration Complete ===';
+    RAISE NOTICE 'Version: %', v_version;
+    RAISE NOTICE 'CPU column added: %', v_has_cpu;
+    RAISE NOTICE 'Alerts table created: %', v_has_alerts;
+    RAISE NOTICE '';
+    RAISE NOTICE 'NOTE: Run install.sql to update functions with new collection logic.';
+    RAISE NOTICE '';
+END $$;
