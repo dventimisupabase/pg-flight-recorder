@@ -5116,7 +5116,7 @@ BEGIN
     RAISE NOTICE 'Current version: %', COALESCE(v_version, 'unknown');
     RAISE NOTICE '';
     RAISE NOTICE 'To export all data, run:';
-    RAISE NOTICE '  psql -c "COPY (SELECT flight_recorder.export_json(now() - interval ''30 days'', now())) TO STDOUT" > backup.json';
+    RAISE NOTICE '  psql -At -c "SELECT flight_recorder.export_markdown(now() - interval ''30 days'', now())" > backup.md';
     RAISE NOTICE '';
     RAISE NOTICE 'Or for specific tables:';
     RAISE NOTICE '  pg_dump -t flight_recorder.snapshots -t flight_recorder.statement_snapshots ... > backup.sql';

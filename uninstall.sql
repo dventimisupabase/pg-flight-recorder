@@ -132,7 +132,7 @@ DROP FUNCTION IF EXISTS flight_recorder.index_efficiency(TIMESTAMPTZ, TIMESTAMPT
 DROP FUNCTION IF EXISTS flight_recorder.config_changes(TIMESTAMPTZ, TIMESTAMPTZ) CASCADE;
 DROP FUNCTION IF EXISTS flight_recorder.db_role_config_changes(TIMESTAMPTZ, TIMESTAMPTZ) CASCADE;
 DROP FUNCTION IF EXISTS flight_recorder.anomaly_report(TIMESTAMPTZ, TIMESTAMPTZ) CASCADE;
-DROP FUNCTION IF EXISTS flight_recorder.export_json(TIMESTAMPTZ, TIMESTAMPTZ) CASCADE;
+DROP FUNCTION IF EXISTS flight_recorder.export_markdown(TIMESTAMPTZ, TIMESTAMPTZ) CASCADE;
 DROP FUNCTION IF EXISTS flight_recorder.export_for_upgrade() CASCADE;
 DROP FUNCTION IF EXISTS flight_recorder.health_check() CASCADE;
 

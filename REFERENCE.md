@@ -533,7 +533,7 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `performance_report(interval)` | Flight recorder's own performance |
 | `check_alerts(interval)` | Active alerts (if enabled) |
 | `config_recommendations()` | Optimization suggestions |
-| `export_json(start, end)` | AI-friendly data export |
+| `export_markdown(start, end)` | Human/AI-readable report export |
 
 ### Internal Functions (pg_cron scheduled)
 
@@ -545,42 +545,46 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `archive_ring_samples()` | Archive raw samples for forensic analysis |
 | `cleanup_aggregates()` | Clean old aggregate and archive data |
 
-### export_json() Output Structure
+### export_markdown() Output Structure
 
-The `export_json(start, end)` function returns a JSONB object optimized for AI analysis. It aggregates data from multiple analysis functions into a single payload.
+The `export_markdown(start, end)` function returns a Markdown report with tables that are readable by both humans and AI systems. Headers sit directly above data, making the output self-documenting.
 
-**Output sections:**
+**Report sections:**
 
 | Section | Source | Content |
 |---------|--------|---------|
-| `meta` | Generated | Version, timestamp, schema documentation |
-| `range` | Parameters | Start/end timestamps of the export window |
-| `anomalies` | `anomaly_report()` | Auto-detected issues (checkpoints, buffer pressure, etc.) |
-| `wait_summary` | `wait_summary()` | Aggregated wait events by type |
-| `table_hotspots` | `table_hotspots()` | Table issues: seq scan storms, bloat, low HOT ratio |
-| `index_efficiency` | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
-| `config_changes` | `config_changes()` | PostgreSQL parameter changes during window |
-| `db_role_config_changes` | `db_role_config_changes()` | Database/role override changes during window |
-| `samples` | Ring buffers | Raw wait events and lock samples (compact array format) |
-| `snapshots` | Snapshots table | System stats: WAL, checkpoints, bgwriter (compact array format) |
+| Header | Generated | Version, timestamp, time range |
+| Anomalies | `anomaly_report()` | Auto-detected issues (checkpoints, buffer pressure, etc.) |
+| Wait Event Summary | `wait_summary()` | Aggregated wait events by type |
+| Snapshots | Snapshots table | System stats: WAL, checkpoints, bgwriter |
+| Table Hotspots | `table_hotspots()` | Table issues: seq scan storms, bloat, low HOT ratio |
+| Index Efficiency | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
+| Configuration Changes | `config_changes()` | PostgreSQL parameter changes during window |
+| Role Configuration Changes | `db_role_config_changes()` | Database/role override changes during window |
 
 **Example usage:**
 
 ```sql
--- Export last hour for AI analysis
-SELECT flight_recorder.export_json(
+-- Export last hour as Markdown report
+SELECT flight_recorder.export_markdown(
     now() - interval '1 hour',
     now()
 );
 
 -- Export incident window
-SELECT flight_recorder.export_json(
+SELECT flight_recorder.export_markdown(
     '2024-01-15 14:00:00'::timestamptz,
     '2024-01-15 15:00:00'::timestamptz
 );
-```
 
-**Schema documentation** is embedded in the `meta.schemas` field to help AI consumers interpret compact array formats.
+-- Save to file
+\o /tmp/incident_report.md
+SELECT flight_recorder.export_markdown(
+    '2024-01-15 14:00:00'::timestamptz,
+    '2024-01-15 15:00:00'::timestamptz
+);
+\o
+```
 
 ## Views Reference
 
