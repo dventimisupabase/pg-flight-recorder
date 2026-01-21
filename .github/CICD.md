@@ -101,16 +101,13 @@ PostgreSQL 17: ✓ 118 tests
 The CI workflows use the same scripts you can run locally:
 
 ```bash
-# Test on PostgreSQL 16 (default)
+# Test on all versions in parallel (default)
 ./test.sh
 
 # Test on specific version
 ./test.sh 15
+./test.sh 16
 ./test.sh 17
-
-# Test on all versions (same as CI)
-./test.sh all
-
 ```
 
 ### Creating a Release
@@ -254,7 +251,7 @@ if [ "$VERSION" = "all" ]; then
 
 **For Contributors:**
 
-- Run tests locally before pushing: `./test.sh all`
+- Run tests locally before pushing: `./test.sh`
 - Run linters before committing
 - Keep commit messages descriptive (used in changelog)
 - Don't push broken code to `main`
