@@ -4921,6 +4921,7 @@ BEGIN
     v_result := v_result || '**Version:** ' || v_version || E'\n';
     v_result := v_result || '**Range:** ' || to_char(p_start_time, 'YYYY-MM-DD HH24:MI:SS') ||
                            ' to ' || to_char(p_end_time, 'YYYY-MM-DD HH24:MI:SS') || E'\n\n';
+    v_result := v_result || 'Analyze this data. The database may be healthy—only flag genuine issues.' || E'\n\n';
 
     -- ==========================================================================
     -- Anomalies Section
@@ -4929,7 +4930,7 @@ BEGIN
 
     SELECT count(*) INTO v_count FROM flight_recorder.anomaly_report(p_start_time, p_end_time);
     IF v_count = 0 THEN
-        v_result := v_result || '(none detected)' || E'\n\n';
+        v_result := v_result || '**No anomalies detected.** System appears healthy.' || E'\n\n';
     ELSE
         v_result := v_result || '| Type | Severity | Description | Metric | Recommendation |' || E'\n';
         v_result := v_result || '|------|----------|-------------|--------|----------------|' || E'\n';
