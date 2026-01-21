@@ -3,84 +3,86 @@ set -e
 
 # Test runner for pg-flight-recorder
 # Usage: ./test.sh [version]
-#   version: 15, 16, 17, "all", or "parallel" (default: 16)
+#   version: 15, 16, 17 (runs single version)
+#   no args: runs all versions in parallel (default)
 #
 # Examples:
-#   ./test.sh           # Test on PostgreSQL 16
-#   ./test.sh 15        # Test on PostgreSQL 15
-#   ./test.sh all       # Test on all versions sequentially (15, 16, 17)
-#   ./test.sh parallel  # Test on all versions in parallel (fastest)
-#
-# Note: PostgreSQL 18 support pending (requires Docker volume layout changes)
+#   ./test.sh           # Test on PostgreSQL 15, 16, 17 in parallel
+#   ./test.sh 16        # Test on PostgreSQL 16 only
 
-VERSION="${1:-16}"
+VERSION="${1:-all}"
 
-run_tests() {
+run_single_version() {
     local pg_version=$1
+    local service="postgres${pg_version}"
+    local profile="pg${pg_version}"
+
     echo ""
     echo "========================================="
     echo "Testing on PostgreSQL $pg_version"
     echo "========================================="
 
-    # Clean up any existing container
-    docker-compose down -v 2>/dev/null || true
+    # Clean up any existing containers
+    docker-compose --profile $profile down -v 2>/dev/null || true
 
-    # Build image with pg_cron
+    # Build and start
     echo "Building PostgreSQL $pg_version image with pg_cron..."
-    PG_VERSION=$pg_version docker-compose build --quiet
+    docker-compose --profile $profile build --quiet
 
-    # Start PostgreSQL with specified version
-    echo "Starting PostgreSQL $pg_version with pg_cron..."
-    PG_VERSION=$pg_version docker-compose up -d
+    echo "Starting PostgreSQL $pg_version..."
+    docker-compose --profile $profile up -d
 
     echo "Waiting for PostgreSQL to be ready..."
     for _ in {1..30}; do
-        if docker-compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; then
+        if docker-compose --profile $profile exec -T $service pg_isready -U postgres > /dev/null 2>&1; then
             break
         fi
         sleep 1
     done
 
     echo "Installing pg_cron extension..."
-    docker-compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /dev/null
+    docker-compose --profile $profile exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /dev/null
 
     echo "Installing pg-flight-recorder..."
-    docker-compose exec -T postgres psql -U postgres -d postgres -f /install.sql > /dev/null
+    docker-compose --profile $profile exec -T $service psql -U postgres -d postgres -f /install.sql > /dev/null
 
     echo "Installing pgTAP extension..."
-    docker-compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
+    docker-compose --profile $profile exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
 
     echo "Disabling scheduled jobs for testing..."
-    docker-compose exec -T postgres psql -U postgres -d postgres -c "SELECT flight_recorder.disable();" > /dev/null
+    docker-compose --profile $profile exec -T $service psql -U postgres -d postgres -c "SELECT flight_recorder.disable();" > /dev/null
 
     echo "Running tests with per-file timing..."
-    docker-compose exec -T postgres sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql'
+    docker-compose --profile $profile exec -T $service sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql'
 
     echo "PostgreSQL $pg_version: PASS"
+
+    # Clean up
+    docker-compose --profile $profile down -v
 }
 
-run_parallel_tests() {
+run_all_parallel() {
     echo ""
     echo "========================================="
     echo "Running parallel tests on PG 15, 16, 17"
     echo "========================================="
 
     # Clean up any existing containers
-    docker-compose -f docker-compose.parallel.yml down -v 2>/dev/null || true
+    docker-compose --profile all down -v 2>/dev/null || true
 
     # Build all images in parallel
     echo "Building PostgreSQL images with pg_cron..."
-    docker-compose -f docker-compose.parallel.yml build --quiet --parallel
+    docker-compose --profile all build --quiet --parallel
 
     # Start all PostgreSQL instances
     echo "Starting all PostgreSQL instances..."
-    docker-compose -f docker-compose.parallel.yml up -d
+    docker-compose --profile all up -d
 
     # Wait for all instances to be ready
     echo "Waiting for all PostgreSQL instances to be ready..."
     for service in postgres15 postgres16 postgres17; do
         for _ in {1..30}; do
-            if docker-compose -f docker-compose.parallel.yml exec -T $service pg_isready -U postgres > /dev/null 2>&1; then
+            if docker-compose --profile all exec -T $service pg_isready -U postgres > /dev/null 2>&1; then
                 break
             fi
             sleep 1
@@ -91,10 +93,10 @@ run_parallel_tests() {
     echo "Setting up extensions on all instances..."
     for service in postgres15 postgres16 postgres17; do
         (
-            docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /dev/null
-            docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -f /install.sql > /dev/null
-            docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
-            docker-compose -f docker-compose.parallel.yml exec -T $service psql -U postgres -d postgres -c "SELECT flight_recorder.disable();" > /dev/null
+            docker-compose --profile all exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /dev/null
+            docker-compose --profile all exec -T $service psql -U postgres -d postgres -f /install.sql > /dev/null
+            docker-compose --profile all exec -T $service psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;" > /dev/null
+            docker-compose --profile all exec -T $service psql -U postgres -d postgres -c "SELECT flight_recorder.disable();" > /dev/null
         ) &
     done
     wait
@@ -112,7 +114,7 @@ run_parallel_tests() {
             echo "=========================================" > "$RESULTS_DIR/$version.log"
             echo "PostgreSQL $version" >> "$RESULTS_DIR/$version.log"
             echo "=========================================" >> "$RESULTS_DIR/$version.log"
-            if docker-compose -f docker-compose.parallel.yml exec -T $service sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql' >> "$RESULTS_DIR/$version.log" 2>&1; then
+            if docker-compose --profile all exec -T $service sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql' >> "$RESULTS_DIR/$version.log" 2>&1; then
                 echo "PASS" > "$RESULTS_DIR/$version.status"
             else
                 echo "FAIL" > "$RESULTS_DIR/$version.status"
@@ -144,7 +146,7 @@ run_parallel_tests() {
     rm -rf "$RESULTS_DIR"
 
     # Clean up
-    docker-compose -f docker-compose.parallel.yml down -v
+    docker-compose --profile all down -v
 
     if [ $FAILED -eq 1 ]; then
         echo "========================================="
@@ -158,20 +160,12 @@ run_parallel_tests() {
     echo "========================================="
 }
 
-if [ "$VERSION" = "parallel" ]; then
-    run_parallel_tests
-elif [ "$VERSION" = "all" ]; then
-    for v in 15 16 17; do
-        run_tests $v
-    done
-    echo ""
-    echo "========================================="
-    echo "All versions passed!"
-    echo "========================================="
-    # Clean up
-    docker-compose down -v
+if [ "$VERSION" = "all" ]; then
+    run_all_parallel
+elif [ "$VERSION" = "15" ] || [ "$VERSION" = "16" ] || [ "$VERSION" = "17" ]; then
+    run_single_version $VERSION
 else
-    run_tests $VERSION
-    # Clean up
-    docker-compose down -v
+    echo "Usage: ./test.sh [version]"
+    echo "  version: 15, 16, 17 (single version) or omit for all versions in parallel"
+    exit 1
 fi
