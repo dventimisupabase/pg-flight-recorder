@@ -24,54 +24,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build PostgreSQL ${{ matrix.pg_version }} image with pg_cron
+      - name: Run tests on PostgreSQL ${{ matrix.pg_version }}
         run: |
-          docker compose --profile pg${{ matrix.pg_version }} build
-
-      - name: Start PostgreSQL ${{ matrix.pg_version }} with pg_cron
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} up -d
-
-      - name: Wait for PostgreSQL to be ready
-        run: |
-          for i in {1..30}; do
-            if docker compose --profile pg${{ matrix.pg_version }} exec -T postgres${{ matrix.pg_version }} pg_isready -U postgres > /dev/null 2>&1; then
-              echo "PostgreSQL is ready"
-              break
-            fi
-            echo "Waiting for PostgreSQL... ($i/30)"
-            sleep 1
-          done
-
-      - name: Install pg_cron extension
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} exec -T postgres${{ matrix.pg_version }} psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
-
-      - name: Install pg-flight-recorder
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} exec -T postgres${{ matrix.pg_version }} psql -U postgres -d postgres -f /install.sql
-
-      - name: Install pgTAP extension
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} exec -T postgres${{ matrix.pg_version }} psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
-
-      - name: Disable scheduled jobs for testing
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} exec -T postgres${{ matrix.pg_version }} psql -U postgres -d postgres -c "SELECT flight_recorder.disable();"
-
-      - name: Run pgTAP tests
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} exec -T postgres${{ matrix.pg_version }} sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql'
-
-      - name: Show PostgreSQL logs on failure
-        if: failure()
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} logs postgres${{ matrix.pg_version }}
-
-      - name: Clean up
-        if: always()
-        run: |
-          docker compose --profile pg${{ matrix.pg_version }} down -v
+          ./test.sh ${{ matrix.pg_version }}
 
   test-summary:
     name: Test Summary
