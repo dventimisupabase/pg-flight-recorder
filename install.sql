@@ -5017,6 +5017,206 @@ BEGIN
 END;
 $$;
 
+-- Exports flight recorder diagnostic data as human-readable Markdown
+-- Produces a report with tables that is legible to both humans and AI
+CREATE OR REPLACE FUNCTION flight_recorder.export_markdown(
+    p_start_time TIMESTAMPTZ,
+    p_end_time TIMESTAMPTZ
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_result TEXT := '';
+    v_version TEXT;
+    v_row RECORD;
+    v_count INTEGER;
+BEGIN
+    -- Get schema version from config
+    SELECT value INTO v_version FROM flight_recorder.config WHERE key = 'schema_version';
+    v_version := COALESCE(v_version, 'unknown');
+
+    -- Header
+    v_result := v_result || '# PostgreSQL Flight Recorder Report' || E'\n\n';
+    v_result := v_result || '**Generated:** ' || to_char(now(), 'YYYY-MM-DD HH24:MI:SS TZ') || E'\n';
+    v_result := v_result || '**Version:** ' || v_version || E'\n';
+    v_result := v_result || '**Range:** ' || to_char(p_start_time, 'YYYY-MM-DD HH24:MI:SS') ||
+                           ' to ' || to_char(p_end_time, 'YYYY-MM-DD HH24:MI:SS') || E'\n\n';
+
+    -- ==========================================================================
+    -- Anomalies Section
+    -- ==========================================================================
+    v_result := v_result || '## Anomalies' || E'\n\n';
+
+    SELECT count(*) INTO v_count FROM flight_recorder.anomaly_report(p_start_time, p_end_time);
+    IF v_count = 0 THEN
+        v_result := v_result || '(none detected)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Type | Severity | Description | Metric | Recommendation |' || E'\n';
+        v_result := v_result || '|------|----------|-------------|--------|----------------|' || E'\n';
+        FOR v_row IN SELECT * FROM flight_recorder.anomaly_report(p_start_time, p_end_time) LOOP
+            v_result := v_result || '| ' ||
+                COALESCE(v_row.anomaly_type, '-') || ' | ' ||
+                COALESCE(v_row.severity, '-') || ' | ' ||
+                COALESCE(v_row.description, '-') || ' | ' ||
+                COALESCE(v_row.metric_value, '-') || ' | ' ||
+                COALESCE(v_row.recommendation, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Wait Event Summary Section
+    -- ==========================================================================
+    v_result := v_result || '## Wait Event Summary' || E'\n\n';
+
+    SELECT count(*) INTO v_count FROM flight_recorder.wait_summary(p_start_time, p_end_time);
+    IF v_count = 0 THEN
+        v_result := v_result || '(no wait events recorded)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Backend | Event Type | Event | Samples | Avg Waiters | Max | % |' || E'\n';
+        v_result := v_result || '|---------|------------|-------|---------|-------------|-----|---|' || E'\n';
+        FOR v_row IN SELECT * FROM flight_recorder.wait_summary(p_start_time, p_end_time) LOOP
+            v_result := v_result || '| ' ||
+                COALESCE(v_row.backend_type, '-') || ' | ' ||
+                COALESCE(v_row.wait_event_type, '-') || ' | ' ||
+                COALESCE(v_row.wait_event, '-') || ' | ' ||
+                COALESCE(v_row.sample_count::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.avg_waiters::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.max_waiters::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.pct_of_samples::TEXT, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Snapshots Section
+    -- ==========================================================================
+    v_result := v_result || '## Snapshots' || E'\n\n';
+
+    SELECT count(*) INTO v_count
+    FROM flight_recorder.snapshots
+    WHERE captured_at BETWEEN p_start_time AND p_end_time;
+
+    IF v_count = 0 THEN
+        v_result := v_result || '(no snapshots in range)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Captured At | WAL Bytes | Ckpt (Timed) | Ckpt (Req) | Backend Writes |' || E'\n';
+        v_result := v_result || '|-------------|-----------|--------------|------------|----------------|' || E'\n';
+        FOR v_row IN
+            SELECT captured_at, wal_bytes, ckpt_timed, ckpt_requested, bgw_buffers_backend
+            FROM flight_recorder.snapshots
+            WHERE captured_at BETWEEN p_start_time AND p_end_time
+            ORDER BY captured_at
+        LOOP
+            v_result := v_result || '| ' ||
+                to_char(v_row.captured_at, 'YYYY-MM-DD HH24:MI:SS') || ' | ' ||
+                COALESCE(to_char(v_row.wal_bytes, 'FM999,999,999,999'), '-') || ' | ' ||
+                COALESCE(v_row.ckpt_timed::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.ckpt_requested::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.bgw_buffers_backend::TEXT, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Table Hotspots Section
+    -- ==========================================================================
+    v_result := v_result || '## Table Hotspots' || E'\n\n';
+
+    SELECT count(*) INTO v_count FROM flight_recorder.table_hotspots(p_start_time, p_end_time);
+    IF v_count = 0 THEN
+        v_result := v_result || '(no issues detected)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Schema | Table | Issue | Severity | Description | Recommendation |' || E'\n';
+        v_result := v_result || '|--------|-------|-------|----------|-------------|----------------|' || E'\n';
+        FOR v_row IN SELECT * FROM flight_recorder.table_hotspots(p_start_time, p_end_time) LOOP
+            v_result := v_result || '| ' ||
+                COALESCE(v_row.schemaname, '-') || ' | ' ||
+                COALESCE(v_row.relname, '-') || ' | ' ||
+                COALESCE(v_row.issue_type, '-') || ' | ' ||
+                COALESCE(v_row.severity, '-') || ' | ' ||
+                COALESCE(v_row.description, '-') || ' | ' ||
+                COALESCE(v_row.recommendation, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Index Efficiency Section
+    -- ==========================================================================
+    v_result := v_result || '## Index Efficiency' || E'\n\n';
+
+    SELECT count(*) INTO v_count FROM flight_recorder.index_efficiency(p_start_time, p_end_time);
+    IF v_count = 0 THEN
+        v_result := v_result || '(no index activity in range)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Schema | Table | Index | Scans | Selectivity | Size | Scans/GB |' || E'\n';
+        v_result := v_result || '|--------|-------|-------|-------|-------------|------|----------|' || E'\n';
+        FOR v_row IN SELECT * FROM flight_recorder.index_efficiency(p_start_time, p_end_time) LOOP
+            v_result := v_result || '| ' ||
+                COALESCE(v_row.schemaname, '-') || ' | ' ||
+                COALESCE(v_row.relname, '-') || ' | ' ||
+                COALESCE(v_row.indexrelname, '-') || ' | ' ||
+                COALESCE(v_row.idx_scan_delta::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.selectivity::TEXT || '%', '-') || ' | ' ||
+                COALESCE(v_row.index_size, '-') || ' | ' ||
+                COALESCE(v_row.scans_per_gb::TEXT, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Configuration Changes Section
+    -- ==========================================================================
+    v_result := v_result || '## Configuration Changes' || E'\n\n';
+
+    SELECT count(*) INTO v_count FROM flight_recorder.config_changes(p_start_time, p_end_time);
+    IF v_count = 0 THEN
+        v_result := v_result || '(no changes detected)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Parameter | Old Value | New Value | Old Source | New Source | Changed At |' || E'\n';
+        v_result := v_result || '|-----------|-----------|-----------|------------|------------|------------|' || E'\n';
+        FOR v_row IN SELECT * FROM flight_recorder.config_changes(p_start_time, p_end_time) LOOP
+            v_result := v_result || '| ' ||
+                COALESCE(v_row.parameter_name, '-') || ' | ' ||
+                COALESCE(v_row.old_value, '-') || ' | ' ||
+                COALESCE(v_row.new_value, '-') || ' | ' ||
+                COALESCE(v_row.old_source, '-') || ' | ' ||
+                COALESCE(v_row.new_source, '-') || ' | ' ||
+                COALESCE(to_char(v_row.changed_at, 'YYYY-MM-DD HH24:MI:SS'), '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Role Configuration Changes Section
+    -- ==========================================================================
+    v_result := v_result || '## Role Configuration Changes' || E'\n\n';
+
+    SELECT count(*) INTO v_count FROM flight_recorder.db_role_config_changes(p_start_time, p_end_time);
+    IF v_count = 0 THEN
+        v_result := v_result || '(no changes detected)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Database | Role | Parameter | Old Value | New Value | Type |' || E'\n';
+        v_result := v_result || '|----------|------|-----------|-----------|-----------|------|' || E'\n';
+        FOR v_row IN SELECT * FROM flight_recorder.db_role_config_changes(p_start_time, p_end_time) LOOP
+            v_result := v_result || '| ' ||
+                COALESCE(v_row.database_name, '-') || ' | ' ||
+                COALESCE(v_row.role_name, '-') || ' | ' ||
+                COALESCE(v_row.parameter_name, '-') || ' | ' ||
+                COALESCE(v_row.old_value, '-') || ' | ' ||
+                COALESCE(v_row.new_value, '-') || ' | ' ||
+                COALESCE(v_row.change_type, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    RETURN v_result;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.export_markdown(TIMESTAMPTZ, TIMESTAMPTZ) IS
+'Export flight recorder diagnostic data as human-readable Markdown report. Produces tables legible to both humans and AI systems.';
+
 -- Exports all data before an upgrade, saving to a file for backup
 -- Returns summary of what was exported and the recommended restore command
 CREATE OR REPLACE FUNCTION flight_recorder.export_for_upgrade()
