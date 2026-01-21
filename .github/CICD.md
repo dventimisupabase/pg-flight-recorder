@@ -46,7 +46,7 @@ PostgreSQL 17: ✓ 118 tests
 
 **SQL Syntax Check:**
 
-- Validates `install.sql`, `uninstall.sql`, and `flight_recorder_test.sql`
+- Validates `install.sql` and `uninstall.sql`
 - Checks for unterminated strings and comments
 - Basic syntax error detection
 

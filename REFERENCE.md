@@ -1407,8 +1407,7 @@ GROUP BY collection_type;
 pg-flight-recorder/
 ├── install.sql                  # Installation script
 ├── uninstall.sql                # Uninstall script
-├── flight_recorder_test.sql     # Original monolithic test file (kept as backup)
-├── tests/                       # Split test files for per-file timing
+├── tests/                       # pgTAP test files (run via test.sh)
 │   ├── 01_foundation.sql
 │   ├── 02_ring_buffer_analysis.sql
 │   ├── 03_safety_features.sql
