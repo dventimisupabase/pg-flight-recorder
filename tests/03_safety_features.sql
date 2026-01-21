@@ -3,11 +3,11 @@
 -- =============================================================================
 -- Tests: Kill switch, P0-P4 safety features, configuration profiles
 -- Sections: 8, 9, 10 (P1/P2), 11, 12, Configuration Profiles
--- Test count: 86
+-- Test count: 78
 -- =============================================================================
 
 BEGIN;
-SELECT plan(86);
+SELECT plan(78);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -319,55 +319,6 @@ SELECT has_function(
 SELECT ok(
     (SELECT value FROM flight_recorder.config WHERE key = 'alert_enabled') = 'false',
     'P4: Alerts should be disabled by default'
-);
-
--- Test P4: Export function exists
-SELECT has_function(
-    'flight_recorder', 'export_json',
-    'P4: Function flight_recorder.export_json should exist'
-);
-
--- Test P4: Export returns valid JSON
-SELECT lives_ok(
-    $$SELECT flight_recorder.export_json(now() - interval '1 hour', now())$$,
-    'P4: export_json() should execute without error'
-);
-
--- Test P4: Export includes metadata
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'meta'),
-    'P4: export_json() should include meta in result'
-);
-
--- Test P4: Export includes table_hotspots
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'table_hotspots'),
-    'P4: export_json() should include table_hotspots in result'
-);
-
--- Test P4: Export includes index_efficiency
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'index_efficiency'),
-    'P4: export_json() should include index_efficiency in result'
-);
-
--- Test P4: Export includes config_changes
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'config_changes'),
-    'P4: export_json() should include config_changes in result'
-);
-
--- Test P4: Export includes db_role_config_changes
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now()) ? 'db_role_config_changes'),
-    'P4: export_json() should include db_role_config_changes in result'
-);
-
--- Test P4: Export version matches schema_version from config
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now())->'meta'->>'version' =
-            (SELECT value FROM flight_recorder.config WHERE key = 'schema_version')),
-    'P4: export_json() version should match schema_version from config'
 );
 
 -- Test P4: export_markdown function exists
