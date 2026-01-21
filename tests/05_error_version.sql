@@ -758,7 +758,7 @@ END $$;
 
 SELECT ok(true, 'Phase 4: PG15 anomaly_report() works without io_* data (skipped if not PG15)');
 
--- Test PG15: export_markdown() works without io_* fields
+-- Test PG15: report() works without io_* fields
 DO $$
 DECLARE
     v_pg_version INTEGER;
@@ -769,15 +769,15 @@ BEGIN
     IF v_pg_version = 15 THEN
         PERFORM flight_recorder.snapshot();
 
-        SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) INTO v_markdown;
+        SELECT flight_recorder.report(now() - interval '1 hour', now()) INTO v_markdown;
 
         IF v_markdown IS NULL THEN
-            RAISE EXCEPTION 'Phase 4: PG15 export_markdown() should return valid Markdown';
+            RAISE EXCEPTION 'Phase 4: PG15 report() should return valid Markdown';
         END IF;
     END IF;
 END $$;
 
-SELECT ok(true, 'Phase 4: PG15 export_markdown() generates valid Markdown (skipped if not PG15)');
+SELECT ok(true, 'Phase 4: PG15 report() generates valid Markdown (skipped if not PG15)');
 
 -- Test PG15: all analysis functions work without io_* data
 DO $$

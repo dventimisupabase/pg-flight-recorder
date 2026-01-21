@@ -3,11 +3,11 @@
 -- =============================================================================
 -- Tests: Kill switch, P0-P4 safety features, configuration profiles
 -- Sections: 8, 9, 10 (P1/P2), 11, 12, Configuration Profiles
--- Test count: 78
+-- Test count: 83
 -- =============================================================================
 
 BEGIN;
-SELECT plan(78);
+SELECT plan(83);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -321,71 +321,101 @@ SELECT ok(
     'P4: Alerts should be disabled by default'
 );
 
--- Test P4: export_markdown function exists
+-- Test P4: report function exists
 SELECT has_function(
-    'flight_recorder', 'export_markdown',
-    'P4: Function flight_recorder.export_markdown should exist'
+    'flight_recorder', 'report',
+    'P4: Function flight_recorder.report should exist'
 );
 
--- Test P4: export_markdown returns TEXT
+-- Test P4: report returns TEXT
 SELECT lives_ok(
-    $$SELECT flight_recorder.export_markdown(now() - interval '1 hour', now())$$,
-    'P4: export_markdown() should execute without error'
+    $$SELECT flight_recorder.report(now() - interval '1 hour', now())$$,
+    'P4: report() should execute without error'
 );
 
--- Test P4: export_markdown includes header
+-- Test P4: report includes header
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '# PostgreSQL Flight Recorder Report%'),
-    'P4: export_markdown() should start with report header'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '# PostgreSQL Flight Recorder Report%'),
+    'P4: report() should start with report header'
 );
 
--- Test P4: export_markdown includes Wait Event Summary section
+-- Test P4: report includes Wait Event Summary section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Wait Event Summary%'),
-    'P4: export_markdown() should include Wait Event Summary section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Wait Event Summary%'),
+    'P4: report() should include Wait Event Summary section'
 );
 
--- Test P4: export_markdown includes Snapshots section
+-- Test P4: report includes Snapshots section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Snapshots%'),
-    'P4: export_markdown() should include Snapshots section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Snapshots%'),
+    'P4: report() should include Snapshots section'
 );
 
--- Test P4: export_markdown includes Anomalies section
+-- Test P4: report includes Anomalies section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Anomalies%'),
-    'P4: export_markdown() should include Anomalies section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Anomalies%'),
+    'P4: report() should include Anomalies section'
 );
 
--- Test P4: export_markdown includes Table Hotspots section
+-- Test P4: report includes Table Hotspots section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Table Hotspots%'),
-    'P4: export_markdown() should include Table Hotspots section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Table Hotspots%'),
+    'P4: report() should include Table Hotspots section'
 );
 
--- Test P4: export_markdown includes Index Efficiency section
+-- Test P4: report includes Index Efficiency section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Index Efficiency%'),
-    'P4: export_markdown() should include Index Efficiency section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Index Efficiency%'),
+    'P4: report() should include Index Efficiency section'
 );
 
--- Test P4: export_markdown includes Configuration Changes section
+-- Test P4: report includes Configuration Changes section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Configuration Changes%'),
-    'P4: export_markdown() should include Configuration Changes section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Configuration Changes%'),
+    'P4: report() should include Configuration Changes section'
 );
 
--- Test P4: export_markdown includes Role Configuration section
+-- Test P4: report includes Role Configuration section
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE '%## Role Configuration Changes%'),
-    'P4: export_markdown() should include Role Configuration Changes section'
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Role Configuration Changes%'),
+    'P4: report() should include Role Configuration Changes section'
 );
 
--- Test P4: export_markdown version matches schema_version from config
+-- Test P4: report version matches schema_version from config
 SELECT ok(
-    (SELECT flight_recorder.export_markdown(now() - interval '1 hour', now()) LIKE
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE
             '%**Version:** ' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || '%'),
-    'P4: export_markdown() should include version from config'
+    'P4: report() should include version from config'
+);
+
+-- Test P4: report includes Statement Performance section
+SELECT ok(
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Statement Performance%'),
+    'P4: report() should include Statement Performance section'
+);
+
+-- Test P4: report includes Lock Contention section
+SELECT ok(
+    (SELECT flight_recorder.report(now() - interval '1 hour', now()) LIKE '%## Lock Contention%'),
+    'P4: report() should include Lock Contention section'
+);
+
+-- Test P4: report interval overload exists
+SELECT has_function(
+    'flight_recorder', 'report', ARRAY['interval'],
+    'P4: Function flight_recorder.report(INTERVAL) should exist'
+);
+
+-- Test P4: report interval overload works
+SELECT lives_ok(
+    $$SELECT flight_recorder.report('1 hour'::interval)$$,
+    'P4: report(INTERVAL) should execute without error'
+);
+
+-- Test P4: report interval overload returns same structure as timestamp version
+SELECT ok(
+    (SELECT flight_recorder.report('1 hour'::interval) LIKE '# PostgreSQL Flight Recorder Report%'),
+    'P4: report(INTERVAL) should return proper report header'
 );
 
 -- Test P4: Config recommendations function exists

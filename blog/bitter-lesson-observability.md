@@ -76,7 +76,7 @@ If you're building monitoring tools today, consider:
 
 **1. Bias toward retention over curation.** Storage is cheap. The data you don't record is the data you can't analyze later. When in doubt, keep it.
 
-**2. Expose raw data, not just summaries.** Dashboards are still useful for humans, but make sure the underlying data is accessible for programmatic analysis. An `export_markdown()` function might be more valuable than a pretty graph.
+**2. Expose raw data, not just summaries.** Dashboards are still useful for humans, but make sure the underlying data is accessible for programmatic analysis. A `report()` function might be more valuable than a pretty graph.
 
 **3. Timestamps and structure matter.** AI can handle volume, but it needs data to be structured and temporally coherent. "What was the configuration when the incident started?" requires that configuration changes are recorded with timestamps.
 
@@ -104,4 +104,4 @@ The lesson is bitter, but the future is interesting.
 
 ---
 
-*This post emerged from a conversation about [pg-flight-recorder](https://github.com/dventimisupabase/pg-flight-recorder), a PostgreSQL monitoring extension designed around comprehensive telemetry capture. The `export_markdown()` function mentioned above is a real feature—because sometimes the best interface for a monitoring tool is structured data in a format readable by both humans and AI.*
+*This post emerged from a conversation about [pg-flight-recorder](https://github.com/dventimisupabase/pg-flight-recorder), a PostgreSQL monitoring extension designed around comprehensive telemetry capture. The `report()` function mentioned above is a real feature—because sometimes the best interface for a monitoring tool is structured data in a format readable by both humans and AI.*

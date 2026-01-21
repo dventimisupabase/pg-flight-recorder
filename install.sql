@@ -4899,7 +4899,7 @@ $$;
 
 -- Exports flight recorder diagnostic data as human-readable Markdown
 -- Produces a report with tables that is legible to both humans and AI
-CREATE OR REPLACE FUNCTION flight_recorder.export_markdown(
+CREATE OR REPLACE FUNCTION flight_recorder.report(
     p_start_time TIMESTAMPTZ,
     p_end_time TIMESTAMPTZ
 )
@@ -5046,6 +5046,69 @@ BEGIN
     END IF;
 
     -- ==========================================================================
+    -- Statement Performance Section (requires pg_stat_statements)
+    -- ==========================================================================
+    v_result := v_result || '## Statement Performance' || E'\n\n';
+
+    BEGIN
+        SELECT count(*) INTO v_count FROM flight_recorder.statement_compare(p_start_time, p_end_time, 100, 25);
+        IF v_count = 0 THEN
+            v_result := v_result || '(no significant query changes)' || E'\n\n';
+        ELSE
+            v_result := v_result || '| Query | Calls Δ | Total Time Δ (ms) | Mean (ms) | Temp Writes | Hit % |' || E'\n';
+            v_result := v_result || '|-------|---------|-------------------|-----------|-------------|-------|' || E'\n';
+            FOR v_row IN
+                SELECT * FROM flight_recorder.statement_compare(p_start_time, p_end_time, 100, 25)
+                ORDER BY total_exec_time_delta_ms DESC NULLS LAST
+            LOOP
+                v_result := v_result || '| ' ||
+                    COALESCE(left(v_row.query_preview, 60), '-') || ' | ' ||
+                    COALESCE(v_row.calls_delta::TEXT, '-') || ' | ' ||
+                    COALESCE(round(v_row.total_exec_time_delta_ms::NUMERIC, 1)::TEXT, '-') || ' | ' ||
+                    COALESCE(round(v_row.mean_exec_time_end_ms::NUMERIC, 2)::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.temp_blks_written_delta::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.hit_ratio_pct::TEXT, '-') || ' |' || E'\n';
+            END LOOP;
+            v_result := v_result || E'\n';
+        END IF;
+    EXCEPTION
+        WHEN undefined_table OR undefined_function THEN
+            v_result := v_result || '(pg_stat_statements not available)' || E'\n\n';
+    END;
+
+    -- ==========================================================================
+    -- Lock Contention Section
+    -- ==========================================================================
+    v_result := v_result || '## Lock Contention' || E'\n\n';
+
+    SELECT count(*) INTO v_count
+    FROM flight_recorder.lock_samples_archive
+    WHERE captured_at BETWEEN p_start_time AND p_end_time;
+
+    IF v_count = 0 THEN
+        v_result := v_result || '(no lock contention recorded)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Time | Blocked PID | Blocking PID | Lock Type | Duration | Blocked Query |' || E'\n';
+        v_result := v_result || '|------|-------------|--------------|-----------|----------|---------------|' || E'\n';
+        FOR v_row IN
+            SELECT *
+            FROM flight_recorder.lock_samples_archive
+            WHERE captured_at BETWEEN p_start_time AND p_end_time
+            ORDER BY captured_at DESC
+            LIMIT 50
+        LOOP
+            v_result := v_result || '| ' ||
+                to_char(v_row.captured_at, 'HH24:MI:SS') || ' | ' ||
+                COALESCE(v_row.blocked_pid::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.blocking_pid::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.lock_type, '-') || ' | ' ||
+                COALESCE(v_row.blocked_duration::TEXT, '-') || ' | ' ||
+                COALESCE(left(v_row.blocked_query_preview, 40), '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
     -- Configuration Changes Section
     -- ==========================================================================
     v_result := v_result || '## Configuration Changes' || E'\n\n';
@@ -5094,8 +5157,19 @@ BEGIN
     RETURN v_result;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.export_markdown(TIMESTAMPTZ, TIMESTAMPTZ) IS
-'Export flight recorder diagnostic data as human-readable Markdown report. Produces tables legible to both humans and AI systems.';
+COMMENT ON FUNCTION flight_recorder.report(TIMESTAMPTZ, TIMESTAMPTZ) IS
+'Generate diagnostic report from flight recorder data. Readable by humans and AI systems.';
+
+-- Interval convenience overload: report('1 hour') instead of timestamps
+CREATE OR REPLACE FUNCTION flight_recorder.report(
+    p_interval INTERVAL
+)
+RETURNS TEXT
+LANGUAGE sql STABLE AS $$
+    SELECT flight_recorder.report(now() - p_interval, now());
+$$;
+COMMENT ON FUNCTION flight_recorder.report(INTERVAL) IS
+'Generate diagnostic report for the specified interval ending now. Usage: SELECT flight_recorder.report(''1 hour'')';
 
 -- Exports all data before an upgrade, saving to a file for backup
 -- Returns summary of what was exported and the recommended restore command
@@ -5116,7 +5190,7 @@ BEGIN
     RAISE NOTICE 'Current version: %', COALESCE(v_version, 'unknown');
     RAISE NOTICE '';
     RAISE NOTICE 'To export all data, run:';
-    RAISE NOTICE '  psql -At -c "SELECT flight_recorder.export_markdown(now() - interval ''30 days'', now())" > backup.md';
+    RAISE NOTICE '  psql -At -c "SELECT flight_recorder.report(now() - interval ''30 days'', now())" > backup.md';
     RAISE NOTICE '';
     RAISE NOTICE 'Or for specific tables:';
     RAISE NOTICE '  pg_dump -t flight_recorder.snapshots -t flight_recorder.statement_snapshots ... > backup.sql';

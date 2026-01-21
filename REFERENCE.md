@@ -533,7 +533,8 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `performance_report(interval)` | Flight recorder's own performance |
 | `check_alerts(interval)` | Active alerts (if enabled) |
 | `config_recommendations()` | Optimization suggestions |
-| `export_markdown(start, end)` | Human/AI-readable report export |
+| `report(start, end)` | Human/AI-readable diagnostic report |
+| `report(interval)` | Same as above, for interval ending now |
 
 ### Internal Functions (pg_cron scheduled)
 
@@ -545,9 +546,9 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `archive_ring_samples()` | Archive raw samples for forensic analysis |
 | `cleanup_aggregates()` | Clean old aggregate and archive data |
 
-### export_markdown() Output Structure
+### report() Output Structure
 
-The `export_markdown(start, end)` function returns a Markdown report with tables that are readable by both humans and AI systems. Headers sit directly above data, making the output self-documenting.
+The `report(interval)` and `report(start, end)` functions return a diagnostic report readable by both humans and AI systems.
 
 **Report sections:**
 
@@ -559,30 +560,26 @@ The `export_markdown(start, end)` function returns a Markdown report with tables
 | Snapshots | Snapshots table | System stats: WAL, checkpoints, bgwriter |
 | Table Hotspots | `table_hotspots()` | Table issues: seq scan storms, bloat, low HOT ratio |
 | Index Efficiency | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
+| Statement Performance | `statement_compare()` | Query performance changes (requires pg_stat_statements) |
+| Lock Contention | `lock_samples_archive` | Lock blocking events |
 | Configuration Changes | `config_changes()` | PostgreSQL parameter changes during window |
 | Role Configuration Changes | `db_role_config_changes()` | Database/role override changes during window |
 
 **Example usage:**
 
 ```sql
--- Export last hour as Markdown report
-SELECT flight_recorder.export_markdown(
-    now() - interval '1 hour',
-    now()
-);
+-- Report for the last hour
+SELECT flight_recorder.report('1 hour');
 
--- Export incident window
-SELECT flight_recorder.export_markdown(
+-- Report for specific time window
+SELECT flight_recorder.report(
     '2024-01-15 14:00:00'::timestamptz,
     '2024-01-15 15:00:00'::timestamptz
 );
 
 -- Save to file
 \o /tmp/incident_report.md
-SELECT flight_recorder.export_markdown(
-    '2024-01-15 14:00:00'::timestamptz,
-    '2024-01-15 15:00:00'::timestamptz
-);
+SELECT flight_recorder.report('1 hour');
 \o
 ```
 
