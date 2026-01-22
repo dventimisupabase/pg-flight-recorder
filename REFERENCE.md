@@ -119,21 +119,22 @@ Samples current database state every 3 minutes, capturing three categories of ob
 
 **Ring Buffers (hot storage)**
 
-Low-overhead, high-frequency sampling using a fixed 120-slot circular buffer.
+Low-overhead, high-frequency sampling using a configurable circular buffer (default 120 slots, range 72-2880).
 
-| Table | Rows | Purpose |
-|-------|------|---------|
-| `samples_ring` | 120 | Master slot tracker |
-| `wait_samples_ring` | 12,000 | Wait events (120 slots × 100 rows) |
-| `activity_samples_ring` | 3,000 | Active sessions (120 slots × 25 rows) |
-| `lock_samples_ring` | 12,000 | Lock contention (120 slots × 100 rows) |
+| Table | Default Rows | Purpose |
+|-------|--------------|---------|
+| `samples_ring` | slots | Master slot tracker |
+| `wait_samples_ring` | slots × 100 | Wait events |
+| `activity_samples_ring` | slots × 25 | Active sessions |
+| `lock_samples_ring` | slots × 100 | Lock contention |
 
 Characteristics:
 
 - **UNLOGGED tables** eliminate WAL overhead (data lost on crash—acceptable for telemetry)
 - **Pre-populated rows** with UPDATE-only pattern achieve high HOT update ratios (no index bloat)
 - **Autovacuum configurable** via `configure_ring_autovacuum()`; can be disabled since fixed-size tables have bounded bloat
-- **Modular arithmetic** (`epoch / interval % 120`) auto-overwrites old slots
+- **Modular arithmetic** (`epoch / interval % ring_buffer_slots`) auto-overwrites old slots
+- **Configurable size** via `ring_buffer_slots` config and `rebuild_ring_buffers()` function
 - Query via: `recent_waits`, `recent_activity`, `recent_locks` views
 
 **Raw Archives (cold storage, detail preserved)**
@@ -437,6 +438,7 @@ SELECT * FROM flight_recorder.config;
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `sample_interval_seconds` | 180 | Ring buffer sample frequency |
+| `ring_buffer_slots` | 120 | Number of ring buffer slots (72-2880) |
 | `statements_interval_minutes` | 15 | pg_stat_statements collection interval |
 | `statements_top_n` | 20 | Number of top queries to capture |
 | `snapshot_based_collection` | true | Use temp table snapshot (reduces catalog locks) |
@@ -470,18 +472,20 @@ Single authoritative reference for all retention periods:
 | `retention_statements_days` | 30 | Snapshots | Query snapshots |
 | `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
 
-Ring buffers self-clean via slot overwrite—no retention setting needed.
+Ring buffers self-clean via slot overwrite—no retention setting needed. Size is configurable via `ring_buffer_slots` (see [Ring Buffer Optimization](#ring-buffer-optimization)).
 
 ### Sample Intervals
 
 Single authoritative reference for sample timing:
 
-| Mode | Interval | Slots | Retention | Collections/Day |
-|------|----------|-------|-----------|-----------------|
+| Mode | Default Interval | Default Slots | Default Retention | Collections/Day |
+|------|------------------|---------------|-------------------|-----------------|
 | `normal` | 180s | 120 | 6 hours | 480 |
 | `emergency` | 300s | 120 | 10 hours | 288 |
 
-Formula: `retention = slots × interval` (120 × 180s = 21,600s = 6 hours)
+Formula: `retention = ring_buffer_slots × sample_interval_seconds`
+
+Both `ring_buffer_slots` and `sample_interval_seconds` are configurable. Use optimization profiles for common configurations (see [Ring Buffer Optimization](#ring-buffer-optimization)).
 
 ### Archive Settings
 
