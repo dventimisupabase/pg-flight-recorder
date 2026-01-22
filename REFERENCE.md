@@ -208,13 +208,22 @@ Query via: `statement_compare(start, end)`.
 The ring buffer uses modular arithmetic for slot rotation:
 
 ```
-slot_id = (epoch_seconds / sample_interval_seconds) % 120
+slot_id = (epoch_seconds / sample_interval_seconds) % ring_buffer_slots
 ```
 
-With 120 slots:
+The slot count is configurable (default 120, range 72-2880):
 
-- At 180s intervals: 120 × 180s = 6 hours retention
-- At 300s intervals: 120 × 300s = 10 hours retention
+```
+retention_hours = (ring_buffer_slots × sample_interval_seconds) / 3600
+```
+
+Example configurations:
+
+| Slots | Interval | Retention | Memory |
+|-------|----------|-----------|--------|
+| 120 | 180s | 6 hours | ~15 MB |
+| 360 | 60s | 6 hours | ~45 MB |
+| 720 | 30s | 6 hours | ~90 MB |
 
 **Why UNLOGGED tables?** Eliminates WAL overhead. Telemetry data lost on crash is acceptable—the system recovers and resumes collection.
 
@@ -233,6 +242,50 @@ Ring buffer tables use PostgreSQL's default autovacuum behavior. Since they're f
 SELECT flight_recorder.configure_ring_autovacuum(false); -- Disable autovacuum
 SELECT flight_recorder.configure_ring_autovacuum(true);  -- Re-enable (default)
 ```
+
+### Ring Buffer Optimization
+
+Ring buffer size can be configured for different monitoring scenarios. Use optimization profiles for common configurations:
+
+```sql
+-- View available optimization profiles
+SELECT * FROM flight_recorder.get_optimization_profiles();
+
+-- Apply a profile (updates config, warns if rebuild needed)
+SELECT * FROM flight_recorder.apply_optimization_profile('fine_grained');
+
+-- Rebuild ring buffers to new size (clears ring buffer data)
+SELECT flight_recorder.rebuild_ring_buffers();
+
+-- Validate current ring buffer configuration
+SELECT * FROM flight_recorder.validate_ring_configuration();
+```
+
+**Optimization Profiles:**
+
+| Profile | Slots | Interval | Retention | Use Case |
+|---------|-------|----------|-----------|----------|
+| `standard` | 120 | 180s | 6h | Default, balanced |
+| `fine_grained` | 360 | 60s | 6h | 1-min granularity |
+| `ultra_fine` | 720 | 30s | 6h | 30-sec granularity |
+| `low_overhead` | 72 | 300s | 6h | Minimal footprint |
+| `high_retention` | 240 | 180s | 12h | Extended retention |
+| `forensic` | 1440 | 15s | 6h | Temporary debugging |
+
+**Ring Buffer Configuration:**
+
+| Setting | Default | Range | Purpose |
+|---------|---------|-------|---------|
+| `ring_buffer_slots` | 120 | 72-2880 | Number of ring buffer slots |
+
+**Validation Checks:**
+
+The `validate_ring_configuration()` function checks:
+
+- **ring_buffer_retention**: WARN if <4h, ERROR if <2h
+- **batching_efficiency**: WARN if <3:1 or >15:1 ratio
+- **cpu_overhead**: WARN if >0.1%
+- **memory_usage**: WARN if >200MB
 
 ### Collection Modes
 
@@ -532,6 +585,10 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `cleanup(interval)` | Delete old data (default: 7 days) |
 | `validate_config()` | Validate configuration settings |
 | `configure_ring_autovacuum(enabled)` | Toggle autovacuum on ring buffer tables (default: true) |
+| `validate_ring_configuration()` | Validate ring buffer config (retention, batching, overhead) |
+| `get_optimization_profiles()` | List available ring buffer optimization profiles |
+| `apply_optimization_profile(name)` | Apply a ring buffer optimization profile |
+| `rebuild_ring_buffers(slots)` | Resize ring buffers (clears ring buffer data) |
 
 ### Health & Monitoring Functions
 

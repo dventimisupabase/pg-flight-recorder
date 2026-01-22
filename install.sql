@@ -141,11 +141,11 @@ CREATE TABLE IF NOT EXISTS flight_recorder.statement_snapshots (
 CREATE INDEX IF NOT EXISTS statement_snapshots_queryid_idx
     ON flight_recorder.statement_snapshots(queryid);
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
-    slot_id             INTEGER PRIMARY KEY CHECK (slot_id >= 0 AND slot_id < 120),
+    slot_id             INTEGER PRIMARY KEY CHECK (slot_id >= 0 AND slot_id < 2880),
     captured_at         TIMESTAMPTZ NOT NULL,
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
-COMMENT ON TABLE flight_recorder.samples_ring IS 'Ring buffer: Master slot tracker (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. Fillfactor 70 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'Ring buffer: Master slot tracker (configurable slots via ring_buffer_slots, default 120). Supports up to 2880 slots for extended retention or fine-grained sampling. Fillfactor 70 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -157,7 +157,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     count               INTEGER,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'Ring buffer: Wait events (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'Ring buffer: Wait events (UPDATE-only pattern). Pre-populated rows (slots × 100 rows, default 12,000). Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -174,7 +174,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     query_preview       TEXT,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'Ring buffer: Active sessions (UPDATE-only pattern). Pre-populated with 3,000 rows (120 slots × 25 rows). Top 25 active sessions per sample. Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'Ring buffer: Active sessions (UPDATE-only pattern). Pre-populated rows (slots × 25 rows, default 3,000). Top 25 active sessions per sample. Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     slot_id                 INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -192,7 +192,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     locked_relation_oid     OID,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'Ring buffer: Lock contention (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'Ring buffer: Lock contention (UPDATE-only pattern). Pre-populated rows (slots × 100 rows, default 12,000). Max 100 blocked/blocking pairs per sample. Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
 
 INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
 SELECT
@@ -476,7 +476,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.0'),
+    ('schema_version', '2.2'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -547,7 +547,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('table_stats_top_n', '50'),
     ('index_stats_enabled', 'true'),
     ('config_snapshots_enabled', 'true'),
-    ('db_role_config_snapshots_enabled', 'true')
+    ('db_role_config_snapshots_enabled', 'true'),
+    ('ring_buffer_slots', '120')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -672,6 +673,17 @@ LANGUAGE sql STABLE AS $$
         p_default
     )
 $$;
+
+-- Returns the configured ring buffer slot count, clamped to valid range (72-2880)
+-- Default is 120 slots for backwards compatibility
+CREATE OR REPLACE FUNCTION flight_recorder._get_ring_buffer_slots()
+RETURNS INTEGER
+LANGUAGE sql STABLE AS $$
+    SELECT GREATEST(72, LEAST(2880,
+        COALESCE(flight_recorder._get_config('ring_buffer_slots', '120')::integer, 120)
+    ))
+$$;
+COMMENT ON FUNCTION flight_recorder._get_ring_buffer_slots() IS 'Returns configured ring buffer slot count (72-2880 range). Default 120 for backwards compatibility. Use ring_buffer_slots config to change.';
 
 -- Sets statement timeout for section recording based on configuration, defaulting to 250ms
 CREATE OR REPLACE FUNCTION flight_recorder._set_section_timeout()
@@ -876,6 +888,110 @@ BEGIN
     END;
 END;
 $$;
+
+-- Validates ring buffer configuration and returns diagnostic checks
+-- Checks retention, batching efficiency, CPU overhead, and memory usage
+CREATE OR REPLACE FUNCTION flight_recorder.validate_ring_configuration()
+RETURNS TABLE(
+    check_name TEXT,
+    status TEXT,
+    message TEXT,
+    recommendation TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_slots INTEGER;
+    v_sample_interval INTEGER;
+    v_archive_interval INTEGER;
+    v_retention_hours NUMERIC;
+    v_samples_per_archive NUMERIC;
+    v_memory_mb NUMERIC;
+    v_cpu_pct NUMERIC;
+BEGIN
+    -- Get current configuration
+    v_slots := flight_recorder._get_ring_buffer_slots();
+    v_sample_interval := COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '180')::integer,
+        180
+    );
+    v_archive_interval := COALESCE(
+        flight_recorder._get_config('archive_sample_frequency_minutes', '15')::integer,
+        15
+    );
+
+    -- Calculate derived metrics
+    v_retention_hours := (v_slots * v_sample_interval) / 3600.0;
+    v_samples_per_archive := (v_archive_interval * 60.0) / v_sample_interval;
+    v_memory_mb := v_slots * 0.09 * 1.5;  -- slots × 90KB × 1.5 overhead factor
+    v_cpu_pct := (25.0 / v_sample_interval) * 100.0 / 1000.0;  -- 25ms per collection
+
+    -- Check 1: Ring buffer retention
+    RETURN QUERY SELECT
+        'ring_buffer_retention'::text,
+        CASE
+            WHEN v_retention_hours < 2 THEN 'ERROR'
+            WHEN v_retention_hours < 4 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('%s hours retention (%s slots × %ss interval)',
+               ROUND(v_retention_hours, 1), v_slots, v_sample_interval)::text,
+        CASE
+            WHEN v_retention_hours < 4 THEN
+                format('Consider increasing ring_buffer_slots to %s for 6-hour retention',
+                    CEIL((6 * 3600.0 / v_sample_interval))::integer)
+            ELSE 'Retention is adequate for most incident investigations'
+        END::text;
+
+    -- Check 2: Batching efficiency (samples per archive)
+    RETURN QUERY SELECT
+        'batching_efficiency'::text,
+        CASE
+            WHEN v_samples_per_archive < 3 THEN 'WARNING'
+            WHEN v_samples_per_archive > 15 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('%s:1 samples per archive (%s min archive / %ss sample)',
+               ROUND(v_samples_per_archive, 1), v_archive_interval, v_sample_interval)::text,
+        CASE
+            WHEN v_samples_per_archive < 3 THEN
+                'Archive frequency too high relative to sampling—consider less frequent archiving'
+            WHEN v_samples_per_archive > 15 THEN
+                'Large data loss window on crash—consider more frequent archiving'
+            ELSE 'Batching ratio is optimal (3-15 samples per archive)'
+        END::text;
+
+    -- Check 3: CPU overhead
+    RETURN QUERY SELECT
+        'cpu_overhead'::text,
+        CASE
+            WHEN v_cpu_pct > 0.1 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('%s%% sustained CPU overhead (~25ms per collection every %ss)',
+               ROUND(v_cpu_pct, 3), v_sample_interval)::text,
+        CASE
+            WHEN v_cpu_pct > 0.1 THEN
+                'High sampling frequency—consider increasing sample_interval_seconds for production'
+            ELSE 'CPU overhead is negligible'
+        END::text;
+
+    -- Check 4: Memory usage
+    RETURN QUERY SELECT
+        'memory_usage'::text,
+        CASE
+            WHEN v_memory_mb > 200 THEN 'WARNING'
+            ELSE 'OK'
+        END::text,
+        format('~%s MB estimated ring buffer memory (%s slots)',
+               ROUND(v_memory_mb, 0), v_slots)::text,
+        CASE
+            WHEN v_memory_mb > 200 THEN
+                'Large ring buffer—ensure adequate shared_buffers headroom'
+            ELSE 'Memory usage is within normal bounds'
+        END::text;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.validate_ring_configuration() IS 'Validates ring buffer configuration and returns diagnostic checks for retention, batching efficiency, CPU overhead, and memory usage.';
 
 -- Check if the pg_stat_statements extension is installed
 -- Returns TRUE if available, FALSE otherwise
@@ -1247,7 +1363,7 @@ BEGIN
     ELSIF v_sample_interval_seconds > 3600 THEN
         v_sample_interval_seconds := 3600;
     END IF;
-    v_slot_id := (v_epoch / v_sample_interval_seconds) % 120;
+    v_slot_id := (v_epoch / v_sample_interval_seconds) % flight_recorder._get_ring_buffer_slots();
     DECLARE
         v_jitter_enabled BOOLEAN;
         v_jitter_max INTEGER;
@@ -3824,6 +3940,128 @@ LANGUAGE sql STABLE AS $$
     ) AS t(profile_name, description, use_case, sample_interval, overhead_level)
 $$;
 
+-- Returns ring buffer optimization profiles for different use cases
+-- Profiles provide pre-configured ring_buffer_slots, sample_interval, and archive settings
+CREATE OR REPLACE FUNCTION flight_recorder.get_optimization_profiles()
+RETURNS TABLE(
+    profile_name            TEXT,
+    slots                   INTEGER,
+    sample_interval_seconds INTEGER,
+    archive_frequency_min   INTEGER,
+    retention_hours         NUMERIC,
+    description             TEXT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM (VALUES
+        ('standard',
+         120, 180, 15,
+         ROUND(120 * 180 / 3600.0, 1),
+         'Default: 6h retention, 3min granularity, 0.014% CPU'),
+        ('fine_grained',
+         360, 60, 15,
+         ROUND(360 * 60 / 3600.0, 1),
+         'Fine: 6h retention, 1min granularity, 0.042% CPU'),
+        ('ultra_fine',
+         720, 30, 10,
+         ROUND(720 * 30 / 3600.0, 1),
+         'Ultra-fine: 6h retention, 30s granularity, 0.083% CPU'),
+        ('low_overhead',
+         72, 300, 30,
+         ROUND(72 * 300 / 3600.0, 1),
+         'Low overhead: 6h retention, 5min granularity, 0.008% CPU'),
+        ('high_retention',
+         240, 180, 30,
+         ROUND(240 * 180 / 3600.0, 1),
+         'High retention: 12h retention, 3min granularity, 0.014% CPU'),
+        ('forensic',
+         1440, 15, 5,
+         ROUND(1440 * 15 / 3600.0, 1),
+         'Forensic: 6h retention, 15s granularity, 0.167% CPU (temporary use only)')
+    ) AS t(profile_name, slots, sample_interval_seconds, archive_frequency_min, retention_hours, description)
+$$;
+COMMENT ON FUNCTION flight_recorder.get_optimization_profiles() IS 'Returns ring buffer optimization profiles for different use cases. Profiles configure ring_buffer_slots, sample_interval_seconds, and archive_sample_frequency_minutes for specific monitoring scenarios.';
+
+-- Applies a ring buffer optimization profile
+-- Updates config values and warns if rebuild is needed
+CREATE OR REPLACE FUNCTION flight_recorder.apply_optimization_profile(p_profile TEXT)
+RETURNS TABLE(
+    setting_key     TEXT,
+    old_value       TEXT,
+    new_value       TEXT,
+    changed         BOOLEAN
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_profile RECORD;
+    v_old_slots TEXT;
+    v_old_interval TEXT;
+    v_old_archive TEXT;
+    v_current_slots INTEGER;
+    v_rebuild_needed BOOLEAN := false;
+BEGIN
+    -- Validate profile exists
+    SELECT * INTO v_profile
+    FROM flight_recorder.get_optimization_profiles()
+    WHERE profile_name = p_profile;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown optimization profile: %. Available: standard, fine_grained, ultra_fine, low_overhead, high_retention, forensic', p_profile;
+    END IF;
+
+    -- Get current values
+    v_old_slots := flight_recorder._get_config('ring_buffer_slots', '120');
+    v_old_interval := flight_recorder._get_config('sample_interval_seconds', '180');
+    v_old_archive := flight_recorder._get_config('archive_sample_frequency_minutes', '15');
+
+    -- Check if rebuild will be needed
+    SELECT COUNT(*) INTO v_current_slots FROM flight_recorder.samples_ring;
+    IF v_current_slots != v_profile.slots THEN
+        v_rebuild_needed := true;
+    END IF;
+
+    -- Update ring_buffer_slots
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('ring_buffer_slots', v_profile.slots::text, now())
+    ON CONFLICT (key) DO UPDATE SET value = v_profile.slots::text, updated_at = now();
+
+    RETURN QUERY SELECT
+        'ring_buffer_slots'::text,
+        v_old_slots,
+        v_profile.slots::text,
+        (v_old_slots IS DISTINCT FROM v_profile.slots::text);
+
+    -- Update sample_interval_seconds
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('sample_interval_seconds', v_profile.sample_interval_seconds::text, now())
+    ON CONFLICT (key) DO UPDATE SET value = v_profile.sample_interval_seconds::text, updated_at = now();
+
+    RETURN QUERY SELECT
+        'sample_interval_seconds'::text,
+        v_old_interval,
+        v_profile.sample_interval_seconds::text,
+        (v_old_interval IS DISTINCT FROM v_profile.sample_interval_seconds::text);
+
+    -- Update archive_sample_frequency_minutes
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('archive_sample_frequency_minutes', v_profile.archive_frequency_min::text, now())
+    ON CONFLICT (key) DO UPDATE SET value = v_profile.archive_frequency_min::text, updated_at = now();
+
+    RETURN QUERY SELECT
+        'archive_sample_frequency_minutes'::text,
+        v_old_archive,
+        v_profile.archive_frequency_min::text,
+        (v_old_archive IS DISTINCT FROM v_profile.archive_frequency_min::text);
+
+    -- Warn if rebuild is needed
+    IF v_rebuild_needed THEN
+        RAISE WARNING 'Ring buffer slot count changed. Run flight_recorder.rebuild_ring_buffers() to resize. Data in ring buffers will be lost.';
+    END IF;
+
+    RAISE NOTICE 'Applied optimization profile: % (%)', p_profile, v_profile.description;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.apply_optimization_profile(TEXT) IS 'Applies a ring buffer optimization profile. Updates ring_buffer_slots, sample_interval_seconds, and archive_sample_frequency_minutes. Call rebuild_ring_buffers() after if slot count changed.';
+
 -- Preview the configuration changes from applying a specified profile
 -- Compares current settings against profile values to show impact before applying
 CREATE OR REPLACE FUNCTION flight_recorder.explain_profile(p_profile_name TEXT)
@@ -4428,6 +4666,93 @@ $$;
 COMMENT ON FUNCTION flight_recorder.configure_ring_autovacuum(BOOLEAN) IS
 'Toggle autovacuum on ring buffer tables. Enabled by default (PostgreSQL standard behavior). Ring buffers are fixed-size UNLOGGED tables with bounded bloat, so autovacuum can be disabled to minimize observer effect if desired.';
 
+-- Rebuilds ring buffers to match configured slot count
+-- WARNING: This clears all data in ring buffers (archives and aggregates are preserved)
+CREATE OR REPLACE FUNCTION flight_recorder.rebuild_ring_buffers(p_slots INTEGER DEFAULT NULL)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_target_slots INTEGER;
+    v_current_slots INTEGER;
+    v_autovacuum_enabled BOOLEAN := true;
+BEGIN
+    -- Get target slot count from param or config
+    v_target_slots := COALESCE(p_slots, flight_recorder._get_ring_buffer_slots());
+
+    -- Validate range
+    IF v_target_slots < 72 OR v_target_slots > 2880 THEN
+        RAISE EXCEPTION 'Ring buffer slots must be between 72 and 2880. Got: %', v_target_slots;
+    END IF;
+
+    -- Get current slot count
+    SELECT COUNT(*) INTO v_current_slots FROM flight_recorder.samples_ring;
+
+    -- Check if resize is needed
+    IF v_current_slots = v_target_slots THEN
+        RETURN format('Ring buffers already sized for %s slots. No rebuild needed.', v_target_slots);
+    END IF;
+
+    -- Preserve autovacuum setting
+    SELECT COALESCE(
+        (SELECT reloptions::text LIKE '%autovacuum_enabled=false%'
+         FROM pg_class WHERE relname = 'samples_ring' AND relnamespace = 'flight_recorder'::regnamespace),
+        false
+    ) INTO v_autovacuum_enabled;
+    v_autovacuum_enabled := NOT v_autovacuum_enabled;  -- Invert because we checked for false
+
+    RAISE NOTICE 'Rebuilding ring buffers from % to % slots...', v_current_slots, v_target_slots;
+
+    -- TRUNCATE CASCADE clears all child tables via FK
+    TRUNCATE flight_recorder.samples_ring CASCADE;
+
+    -- Rebuild samples_ring
+    INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
+    SELECT
+        generate_series AS slot_id,
+        '1970-01-01'::timestamptz,
+        0
+    FROM generate_series(0, v_target_slots - 1);
+
+    -- Rebuild wait_samples_ring
+    INSERT INTO flight_recorder.wait_samples_ring (slot_id, row_num)
+    SELECT s.slot_id, r.row_num
+    FROM generate_series(0, v_target_slots - 1) s(slot_id)
+    CROSS JOIN generate_series(0, 99) r(row_num);
+
+    -- Rebuild activity_samples_ring
+    INSERT INTO flight_recorder.activity_samples_ring (slot_id, row_num)
+    SELECT s.slot_id, r.row_num
+    FROM generate_series(0, v_target_slots - 1) s(slot_id)
+    CROSS JOIN generate_series(0, 24) r(row_num);
+
+    -- Rebuild lock_samples_ring
+    INSERT INTO flight_recorder.lock_samples_ring (slot_id, row_num)
+    SELECT s.slot_id, r.row_num
+    FROM generate_series(0, v_target_slots - 1) s(slot_id)
+    CROSS JOIN generate_series(0, 99) r(row_num);
+
+    -- Restore autovacuum setting
+    IF NOT v_autovacuum_enabled THEN
+        PERFORM flight_recorder.configure_ring_autovacuum(false);
+    END IF;
+
+    -- Update config if p_slots was provided
+    IF p_slots IS NOT NULL THEN
+        INSERT INTO flight_recorder.config (key, value, updated_at)
+        VALUES ('ring_buffer_slots', p_slots::text, now())
+        ON CONFLICT (key) DO UPDATE SET value = p_slots::text, updated_at = now();
+    END IF;
+
+    RETURN format('Ring buffers rebuilt: %s → %s slots. Tables: samples_ring (%s), wait_samples_ring (%s), activity_samples_ring (%s), lock_samples_ring (%s)',
+        v_current_slots, v_target_slots,
+        v_target_slots,
+        v_target_slots * 100,
+        v_target_slots * 25,
+        v_target_slots * 100);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.rebuild_ring_buffers(INTEGER) IS 'Rebuilds ring buffers to match configured slot count (72-2880). WARNING: Clears all ring buffer data. Archives and aggregates are preserved. Pass slot count as parameter or use ring_buffer_slots config.';
+
 -- Enables flight recorder by scheduling periodic cron jobs for collection, archival, and cleanup
 -- Requires pg_cron extension; returns status message on success
 CREATE OR REPLACE FUNCTION flight_recorder.enable()
@@ -4488,6 +4813,20 @@ BEGIN
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('enabled', 'true', now())
         ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
+        -- Emit warnings for suboptimal ring buffer configuration
+        DECLARE
+            v_check RECORD;
+        BEGIN
+            FOR v_check IN
+                SELECT * FROM flight_recorder.validate_ring_configuration()
+                WHERE status IN ('WARNING', 'ERROR')
+            LOOP
+                RAISE WARNING '% [%]: % - %', v_check.check_name, v_check.status, v_check.message, v_check.recommendation;
+            END LOOP;
+        EXCEPTION WHEN OTHERS THEN
+            -- Don't fail enable() if validation has issues
+            NULL;
+        END;
         RETURN format('Flight Recorder collection restarted. Scheduled %s cron jobs in %s mode (sample: %s).',
                      v_scheduled, v_mode, v_sample_schedule);
     EXCEPTION
