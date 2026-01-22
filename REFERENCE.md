@@ -35,7 +35,6 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
 - [Testing and Benchmarking](#testing-and-benchmarking)
-- [Project Structure](#project-structure)
 
 ---
 
@@ -1495,26 +1494,3 @@ WHERE started_at > now() - interval '1 day'
 GROUP BY collection_type;
 ```
 
-## Project Structure
-
-```
-pg-flight-recorder/
-├── install.sql                  # Installation script
-├── uninstall.sql                # Uninstall script
-├── tests/                       # pgTAP test files (run via test.sh)
-│   ├── 01_foundation.sql
-│   ├── 02_ring_buffer_analysis.sql
-│   ├── 03_safety_features.sql
-│   ├── 04_boundary_critical.sql
-│   ├── 05_error_version.sql
-│   └── 06_load_archive_capacity.sql
-├── docker-compose.yml           # PostgreSQL + pg_cron for testing
-├── docker-compose.parallel.yml  # Parallel testing across PG 15, 16, 17
-├── test.sh                      # Test runner (supports parallel mode)
-├── README.md                    # Quick start guide
-├── REFERENCE.md                 # This file
-├── FEATURE_DESIGNS.md           # Technical designs for new features
-└── benchmark/
-    ├── measure_absolute.sh      # Overhead measurement
-    └── measure_ddl_impact.sh    # DDL interaction testing
-```
