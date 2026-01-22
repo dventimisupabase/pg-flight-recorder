@@ -11,7 +11,7 @@
 DO $$
 DECLARE
     v_current_version TEXT;
-    v_target_version TEXT := '2.0';  -- Update this when adding migrations
+    v_target_version TEXT := '2.1';  -- Update this when adding migrations
 BEGIN
     -- Check if flight_recorder schema exists
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recorder') THEN
@@ -66,9 +66,8 @@ END $$;
 -- \i migrations/1.1_to_2.0.sql
 -- =============================================================================
 
--- Currently no migrations needed (fresh 2.0 installations)
--- When you need to migrate from 2.0 to 2.1, add:
--- \i migrations/2.0_to_2.1.sql
+-- Migration from 2.0 to 2.1: Add I/O read timing columns
+\i migrations/2.0_to_2.1.sql
 
 -- =============================================================================
 -- Post-upgrade verification

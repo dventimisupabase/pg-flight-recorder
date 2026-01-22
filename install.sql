@@ -60,14 +60,22 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
     autovacuum_workers      INTEGER,
     slots_count             INTEGER,
     slots_max_retained_wal  BIGINT,
+    io_checkpointer_reads       BIGINT,
+    io_checkpointer_read_time   DOUBLE PRECISION,
     io_checkpointer_writes      BIGINT,
     io_checkpointer_write_time  DOUBLE PRECISION,
     io_checkpointer_fsyncs      BIGINT,
     io_checkpointer_fsync_time  DOUBLE PRECISION,
+    io_autovacuum_reads         BIGINT,
+    io_autovacuum_read_time     DOUBLE PRECISION,
     io_autovacuum_writes        BIGINT,
     io_autovacuum_write_time    DOUBLE PRECISION,
+    io_client_reads             BIGINT,
+    io_client_read_time         DOUBLE PRECISION,
     io_client_writes            BIGINT,
     io_client_write_time        DOUBLE PRECISION,
+    io_bgwriter_reads           BIGINT,
+    io_bgwriter_read_time       DOUBLE PRECISION,
     io_bgwriter_writes          BIGINT,
     io_bgwriter_write_time      DOUBLE PRECISION,
     temp_files                  BIGINT,
@@ -2319,14 +2327,22 @@ DECLARE
     v_slots_max_retained BIGINT;
     v_temp_files BIGINT;
     v_temp_bytes BIGINT;
+    v_io_ckpt_reads BIGINT;
+    v_io_ckpt_read_time DOUBLE PRECISION;
     v_io_ckpt_writes BIGINT;
     v_io_ckpt_write_time DOUBLE PRECISION;
     v_io_ckpt_fsyncs BIGINT;
     v_io_ckpt_fsync_time DOUBLE PRECISION;
+    v_io_av_reads BIGINT;
+    v_io_av_read_time DOUBLE PRECISION;
     v_io_av_writes BIGINT;
     v_io_av_write_time DOUBLE PRECISION;
+    v_io_client_reads BIGINT;
+    v_io_client_read_time DOUBLE PRECISION;
     v_io_client_writes BIGINT;
     v_io_client_write_time DOUBLE PRECISION;
+    v_io_bgw_reads BIGINT;
+    v_io_bgw_read_time DOUBLE PRECISION;
     v_io_bgw_writes BIGINT;
     v_io_bgw_write_time DOUBLE PRECISION;
     v_stat_id INTEGER;
@@ -2440,32 +2456,48 @@ BEGIN
     BEGIN
         PERFORM flight_recorder._set_section_timeout();
         SELECT
+            COALESCE(sum(reads) FILTER (WHERE backend_type = 'checkpointer'), 0),
+            COALESCE(sum(read_time) FILTER (WHERE backend_type = 'checkpointer'), 0),
             COALESCE(sum(writes) FILTER (WHERE backend_type = 'checkpointer'), 0),
             COALESCE(sum(write_time) FILTER (WHERE backend_type = 'checkpointer'), 0),
             COALESCE(sum(fsyncs) FILTER (WHERE backend_type = 'checkpointer'), 0),
             COALESCE(sum(fsync_time) FILTER (WHERE backend_type = 'checkpointer'), 0),
+            COALESCE(sum(reads) FILTER (WHERE backend_type = 'autovacuum worker'), 0),
+            COALESCE(sum(read_time) FILTER (WHERE backend_type = 'autovacuum worker'), 0),
             COALESCE(sum(writes) FILTER (WHERE backend_type = 'autovacuum worker'), 0),
             COALESCE(sum(write_time) FILTER (WHERE backend_type = 'autovacuum worker'), 0),
+            COALESCE(sum(reads) FILTER (WHERE backend_type = 'client backend'), 0),
+            COALESCE(sum(read_time) FILTER (WHERE backend_type = 'client backend'), 0),
             COALESCE(sum(writes) FILTER (WHERE backend_type = 'client backend'), 0),
             COALESCE(sum(write_time) FILTER (WHERE backend_type = 'client backend'), 0),
+            COALESCE(sum(reads) FILTER (WHERE backend_type = 'background writer'), 0),
+            COALESCE(sum(read_time) FILTER (WHERE backend_type = 'background writer'), 0),
             COALESCE(sum(writes) FILTER (WHERE backend_type = 'background writer'), 0),
             COALESCE(sum(write_time) FILTER (WHERE backend_type = 'background writer'), 0)
         INTO
-            v_io_ckpt_writes, v_io_ckpt_write_time, v_io_ckpt_fsyncs, v_io_ckpt_fsync_time,
-            v_io_av_writes, v_io_av_write_time,
-            v_io_client_writes, v_io_client_write_time,
-            v_io_bgw_writes, v_io_bgw_write_time
+            v_io_ckpt_reads, v_io_ckpt_read_time, v_io_ckpt_writes, v_io_ckpt_write_time, v_io_ckpt_fsyncs, v_io_ckpt_fsync_time,
+            v_io_av_reads, v_io_av_read_time, v_io_av_writes, v_io_av_write_time,
+            v_io_client_reads, v_io_client_read_time, v_io_client_writes, v_io_client_write_time,
+            v_io_bgw_reads, v_io_bgw_read_time, v_io_bgw_writes, v_io_bgw_write_time
         FROM pg_stat_io;
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: pg_stat_io collection failed: %', SQLERRM;
+        v_io_ckpt_reads := 0;
+        v_io_ckpt_read_time := 0;
         v_io_ckpt_writes := 0;
         v_io_ckpt_write_time := 0;
         v_io_ckpt_fsyncs := 0;
         v_io_ckpt_fsync_time := 0;
+        v_io_av_reads := 0;
+        v_io_av_read_time := 0;
         v_io_av_writes := 0;
         v_io_av_write_time := 0;
+        v_io_client_reads := 0;
+        v_io_client_read_time := 0;
         v_io_client_writes := 0;
         v_io_client_write_time := 0;
+        v_io_bgw_reads := 0;
+        v_io_bgw_read_time := 0;
         v_io_bgw_writes := 0;
         v_io_bgw_write_time := 0;
     END;
@@ -2524,9 +2556,13 @@ BEGIN
             bgw_buffers_clean, bgw_maxwritten_clean, bgw_buffers_alloc,
             bgw_buffers_backend, bgw_buffers_backend_fsync,
             autovacuum_workers, slots_count, slots_max_retained_wal,
+            io_checkpointer_reads, io_checkpointer_read_time,
             io_checkpointer_writes, io_checkpointer_write_time, io_checkpointer_fsyncs, io_checkpointer_fsync_time,
+            io_autovacuum_reads, io_autovacuum_read_time,
             io_autovacuum_writes, io_autovacuum_write_time,
+            io_client_reads, io_client_read_time,
             io_client_writes, io_client_write_time,
+            io_bgwriter_reads, io_bgwriter_read_time,
             io_bgwriter_writes, io_bgwriter_write_time,
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
@@ -2542,9 +2578,13 @@ BEGIN
             b.buffers_clean, b.maxwritten_clean, b.buffers_alloc,
             NULL, NULL,
             v_autovacuum_workers, v_slots_count, v_slots_max_retained,
+            v_io_ckpt_reads, v_io_ckpt_read_time,
             v_io_ckpt_writes, v_io_ckpt_write_time, v_io_ckpt_fsyncs, v_io_ckpt_fsync_time,
+            v_io_av_reads, v_io_av_read_time,
             v_io_av_writes, v_io_av_write_time,
+            v_io_client_reads, v_io_client_read_time,
             v_io_client_writes, v_io_client_write_time,
+            v_io_bgw_reads, v_io_bgw_read_time,
             v_io_bgw_writes, v_io_bgw_write_time,
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
@@ -2563,9 +2603,13 @@ BEGIN
             bgw_buffers_clean, bgw_maxwritten_clean, bgw_buffers_alloc,
             bgw_buffers_backend, bgw_buffers_backend_fsync,
             autovacuum_workers, slots_count, slots_max_retained_wal,
+            io_checkpointer_reads, io_checkpointer_read_time,
             io_checkpointer_writes, io_checkpointer_write_time, io_checkpointer_fsyncs, io_checkpointer_fsync_time,
+            io_autovacuum_reads, io_autovacuum_read_time,
             io_autovacuum_writes, io_autovacuum_write_time,
+            io_client_reads, io_client_read_time,
             io_client_writes, io_client_write_time,
+            io_bgwriter_reads, io_bgwriter_read_time,
             io_bgwriter_writes, io_bgwriter_write_time,
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
@@ -2581,9 +2625,13 @@ BEGIN
             b.buffers_clean, b.maxwritten_clean, b.buffers_alloc,
             b.buffers_backend, b.buffers_backend_fsync,
             v_autovacuum_workers, v_slots_count, v_slots_max_retained,
+            v_io_ckpt_reads, v_io_ckpt_read_time,
             v_io_ckpt_writes, v_io_ckpt_write_time, v_io_ckpt_fsyncs, v_io_ckpt_fsync_time,
+            v_io_av_reads, v_io_av_read_time,
             v_io_av_writes, v_io_av_write_time,
+            v_io_client_reads, v_io_client_read_time,
             v_io_client_writes, v_io_client_write_time,
+            v_io_bgw_reads, v_io_bgw_read_time,
             v_io_bgw_writes, v_io_bgw_write_time,
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
@@ -2819,14 +2867,22 @@ SELECT
     s.slots_count,
     s.slots_max_retained_wal,
     flight_recorder._pretty_bytes(s.slots_max_retained_wal) AS slots_max_retained_pretty,
+    s.io_checkpointer_reads - prev.io_checkpointer_reads AS io_ckpt_reads_delta,
+    (s.io_checkpointer_read_time - prev.io_checkpointer_read_time)::numeric AS io_ckpt_read_time_ms,
     s.io_checkpointer_writes - prev.io_checkpointer_writes AS io_ckpt_writes_delta,
     (s.io_checkpointer_write_time - prev.io_checkpointer_write_time)::numeric AS io_ckpt_write_time_ms,
     s.io_checkpointer_fsyncs - prev.io_checkpointer_fsyncs AS io_ckpt_fsyncs_delta,
     (s.io_checkpointer_fsync_time - prev.io_checkpointer_fsync_time)::numeric AS io_ckpt_fsync_time_ms,
+    s.io_autovacuum_reads - prev.io_autovacuum_reads AS io_autovacuum_reads_delta,
+    (s.io_autovacuum_read_time - prev.io_autovacuum_read_time)::numeric AS io_autovacuum_read_time_ms,
     s.io_autovacuum_writes - prev.io_autovacuum_writes AS io_autovacuum_writes_delta,
     (s.io_autovacuum_write_time - prev.io_autovacuum_write_time)::numeric AS io_autovacuum_write_time_ms,
+    s.io_client_reads - prev.io_client_reads AS io_client_reads_delta,
+    (s.io_client_read_time - prev.io_client_read_time)::numeric AS io_client_read_time_ms,
     s.io_client_writes - prev.io_client_writes AS io_client_writes_delta,
     (s.io_client_write_time - prev.io_client_write_time)::numeric AS io_client_write_time_ms,
+    s.io_bgwriter_reads - prev.io_bgwriter_reads AS io_bgwriter_reads_delta,
+    (s.io_bgwriter_read_time - prev.io_bgwriter_read_time)::numeric AS io_bgwriter_read_time_ms,
     s.io_bgwriter_writes - prev.io_bgwriter_writes AS io_bgwriter_writes_delta,
     (s.io_bgwriter_write_time - prev.io_bgwriter_write_time)::numeric AS io_bgwriter_write_time_ms,
     s.temp_files - prev.temp_files AS temp_files_delta,
@@ -2863,14 +2919,22 @@ RETURNS TABLE(
     slots_count             INTEGER,
     slots_max_retained_wal  BIGINT,
     slots_max_retained_pretty TEXT,
+    io_ckpt_reads_delta           BIGINT,
+    io_ckpt_read_time_ms          NUMERIC,
     io_ckpt_writes_delta          BIGINT,
     io_ckpt_write_time_ms         NUMERIC,
     io_ckpt_fsyncs_delta          BIGINT,
     io_ckpt_fsync_time_ms         NUMERIC,
+    io_autovacuum_reads_delta     BIGINT,
+    io_autovacuum_read_time_ms    NUMERIC,
     io_autovacuum_writes_delta    BIGINT,
     io_autovacuum_write_time_ms   NUMERIC,
+    io_client_reads_delta         BIGINT,
+    io_client_read_time_ms        NUMERIC,
     io_client_writes_delta        BIGINT,
     io_client_write_time_ms       NUMERIC,
+    io_bgwriter_reads_delta       BIGINT,
+    io_bgwriter_read_time_ms      NUMERIC,
     io_bgwriter_writes_delta      BIGINT,
     io_bgwriter_write_time_ms     NUMERIC,
     temp_files_delta              BIGINT,
@@ -2912,14 +2976,22 @@ LANGUAGE sql STABLE AS $$
         e.slots_count,
         e.slots_max_retained_wal,
         flight_recorder._pretty_bytes(e.slots_max_retained_wal),
+        e.io_checkpointer_reads - s.io_checkpointer_reads,
+        (e.io_checkpointer_read_time - s.io_checkpointer_read_time)::numeric,
         e.io_checkpointer_writes - s.io_checkpointer_writes,
         (e.io_checkpointer_write_time - s.io_checkpointer_write_time)::numeric,
         e.io_checkpointer_fsyncs - s.io_checkpointer_fsyncs,
         (e.io_checkpointer_fsync_time - s.io_checkpointer_fsync_time)::numeric,
+        e.io_autovacuum_reads - s.io_autovacuum_reads,
+        (e.io_autovacuum_read_time - s.io_autovacuum_read_time)::numeric,
         e.io_autovacuum_writes - s.io_autovacuum_writes,
         (e.io_autovacuum_write_time - s.io_autovacuum_write_time)::numeric,
+        e.io_client_reads - s.io_client_reads,
+        (e.io_client_read_time - s.io_client_read_time)::numeric,
         e.io_client_writes - s.io_client_writes,
         (e.io_client_write_time - s.io_client_write_time)::numeric,
+        e.io_bgwriter_reads - s.io_bgwriter_reads,
+        (e.io_bgwriter_read_time - s.io_bgwriter_read_time)::numeric,
         e.io_bgwriter_writes - s.io_bgwriter_writes,
         (e.io_bgwriter_write_time - s.io_bgwriter_write_time)::numeric,
         e.temp_files - s.temp_files,
