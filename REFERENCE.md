@@ -605,6 +605,31 @@ SELECT flight_recorder.report('1 hour');
 | `deltas` | Snapshot-over-snapshot changes |
 | `capacity_dashboard` | Resource utilization and headroom |
 
+### I/O Timing Metrics
+
+The `deltas` view and `compare()` function include I/O timing columns from `pg_stat_io` (PostgreSQL 16+). These track storage latency by backend type:
+
+| Column | Source | Purpose |
+|--------|--------|---------|
+| `io_ckpt_reads_delta` | checkpointer | Block reads by checkpointer |
+| `io_ckpt_read_time_ms` | checkpointer | Read latency (ms) |
+| `io_ckpt_writes_delta` | checkpointer | Block writes by checkpointer |
+| `io_ckpt_write_time_ms` | checkpointer | Write latency (ms) |
+| `io_autovacuum_reads_delta` | autovacuum | Block reads by autovacuum |
+| `io_autovacuum_read_time_ms` | autovacuum | Read latency (ms) |
+| `io_autovacuum_writes_delta` | autovacuum | Block writes by autovacuum |
+| `io_autovacuum_write_time_ms` | autovacuum | Write latency (ms) |
+| `io_client_reads_delta` | client backends | Block reads by queries |
+| `io_client_read_time_ms` | client backends | Read latency (ms) |
+| `io_client_writes_delta` | client backends | Block writes by queries |
+| `io_client_write_time_ms` | client backends | Write latency (ms) |
+| `io_bgwriter_reads_delta` | background writer | Block reads by bgwriter |
+| `io_bgwriter_read_time_ms` | background writer | Read latency (ms) |
+| `io_bgwriter_writes_delta` | background writer | Block writes by bgwriter |
+| `io_bgwriter_write_time_ms` | background writer | Write latency (ms) |
+
+**Note:** Timing columns require `track_io_timing = on` in PostgreSQL. Without it, `*_time_ms` values are zero.
+
 **Dynamic retention functions** return data matching current mode's retention:
 
 - `recent_waits_current()`
