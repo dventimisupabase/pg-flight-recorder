@@ -13,6 +13,7 @@ This PRD analyzes the relationship between sampling rates, archiving rates, and 
 pg-flight-recorder uses a sophisticated three-tier storage architecture:
 
 **Tier 1: Hot Storage (Ring Buffers) - UNLOGGED**
+
 - Fixed 120 slots with modular arithmetic rotation
 - `samples_ring`, `wait_samples_ring`, `activity_samples_ring`, `lock_samples_ring`
 - Non-durable by design (zero WAL overhead)
@@ -20,6 +21,7 @@ pg-flight-recorder uses a sophisticated three-tier storage architecture:
 - Fillfactor 70-90 to enable efficient page-level updates
 
 **Tier 2 & 3: Cold Storage - DURABLE**
+
 - Archive tables: Full-resolution raw samples (every 15 min default)
 - Aggregate tables: Summarized statistics (every 5 min, hardcoded)
 - Standard logged tables for durability
@@ -166,6 +168,7 @@ Memory cost: ~60 MB additional ✓ (trivial on modern systems)
 ### Memory Cost Analysis
 
 **Current ring buffer sizes (120 slots):**
+
 - `samples_ring`: 120 rows
 - `wait_samples_ring`: 12,000 rows (120 × 100)
 - `activity_samples_ring`: 3,000 rows (120 × 25)
@@ -173,6 +176,7 @@ Memory cost: ~60 MB additional ✓ (trivial on modern systems)
 - **Total: ~27,000 rows (~10-15 MB)**
 
 **At 360 slots (3× larger):**
+
 - `samples_ring`: 360 rows
 - `wait_samples_ring`: 36,000 rows (360 × 100)
 - `activity_samples_ring`: 9,000 rows (360 × 25)
@@ -180,9 +184,11 @@ Memory cost: ~60 MB additional ✓ (trivial on modern systems)
 - **Total: ~81,000 rows (~30-45 MB)**
 
 **At 720 slots (6× larger):**
+
 - **Total: ~162,000 rows (~60-90 MB)**
 
 **At 1440 slots (12× larger):**
+
 - **Total: ~324,000 rows (~120-180 MB)**
 
 **Conclusion:** Memory cost is negligible on modern systems. Even a 1440-slot ring buffer (12× current size) only requires ~150 MB.
@@ -595,6 +601,7 @@ START: Determine your requirements
 ### Appendix B: Common Configurations
 
 #### Standard Production (Current Default)
+
 ```sql
 ring_buffer_slots: 120
 sample_interval_seconds: 180
@@ -604,6 +611,7 @@ Result: 6h retention, 3min granularity, 5:1 batching, 0.014% CPU, 15 MB memory
 ```
 
 #### Fine-Grained Monitoring
+
 ```sql
 ring_buffer_slots: 360
 sample_interval_seconds: 60
@@ -613,6 +621,7 @@ Result: 6h retention, 1min granularity, 10:1 batching, 0.042% CPU, 45 MB memory
 ```
 
 #### Low-Overhead Production
+
 ```sql
 ring_buffer_slots: 120
 sample_interval_seconds: 300
@@ -622,6 +631,7 @@ Result: 10h retention, 5min granularity, 6:1 batching, 0.008% CPU, 15 MB memory
 ```
 
 #### Forensic Investigation (Temporary)
+
 ```sql
 ring_buffer_slots: 720
 sample_interval_seconds: 30
@@ -632,6 +642,7 @@ WARNING: Switch back to standard profile after incident investigation
 ```
 
 #### Extended Retention
+
 ```sql
 ring_buffer_slots: 240
 sample_interval_seconds: 180
