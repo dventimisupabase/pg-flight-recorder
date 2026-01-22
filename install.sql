@@ -137,7 +137,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.samples_ring (
     captured_at         TIMESTAMPTZ NOT NULL,
     epoch_seconds       BIGINT NOT NULL
 ) WITH (fillfactor = 70);
-COMMENT ON TABLE flight_recorder.samples_ring IS 'Ring buffer: Master slot tracker (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. Conservative 120s with proactive throttling. Fill factor 70 enables HOT updates.';
+COMMENT ON TABLE flight_recorder.samples_ring IS 'Ring buffer: Master slot tracker (120 slots, adaptive frequency). Normal=120s/4h, light=120s/4h, emergency=300s/10h retention. Fillfactor 70 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -149,7 +149,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.wait_samples_ring (
     count               INTEGER,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'Ring buffer: Wait events (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.wait_samples_ring IS 'Ring buffer: Wait events (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     slot_id             INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -166,7 +166,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     query_preview       TEXT,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'Ring buffer: Active sessions (UPDATE-only pattern). Pre-populated with 3,000 rows (120 slots × 25 rows). Top 25 active sessions per sample. UPSERTs enable HOT updates, zero dead tuples. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.activity_samples_ring IS 'Ring buffer: Active sessions (UPDATE-only pattern). Pre-populated with 3,000 rows (120 slots × 25 rows). Top 25 active sessions per sample. Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
 
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     slot_id                 INTEGER REFERENCES flight_recorder.samples_ring(slot_id) ON DELETE CASCADE,
@@ -184,7 +184,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.lock_samples_ring (
     locked_relation_oid     OID,
     PRIMARY KEY (slot_id, row_num)
 ) WITH (fillfactor = 90);
-COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'Ring buffer: Lock contention (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. UPSERTs enable HOT updates, zero dead tuples, zero autovacuum pressure. NULLs indicate unused slots.';
+COMMENT ON TABLE flight_recorder.lock_samples_ring IS 'Ring buffer: Lock contention (UPDATE-only pattern). Pre-populated with 12,000 rows (120 slots × 100 rows). Max 100 blocked/blocking pairs per sample. Fillfactor 90 enables HOT updates. Use configure_ring_autovacuum(false) to disable autovacuum if desired. NULLs indicate unused slots.';
 
 INSERT INTO flight_recorder.samples_ring (slot_id, captured_at, epoch_seconds)
 SELECT
@@ -4325,6 +4325,36 @@ BEGIN
     END;
 END;
 $$;
+
+-- Configure autovacuum on ring buffer tables
+-- Ring buffers use pre-allocated rows with UPDATE-only pattern, achieving high HOT update ratios.
+-- With fillfactor 70-90, most updates are HOT (no dead tuples in indexes), but tuple chains still
+-- form within pages. Autovacuum collapses these chains. Since ring buffers are fixed-size UNLOGGED
+-- tables with bounded bloat, autovacuum is optional - page pruning during UPSERTs provides cleanup.
+-- Autovacuum enabled by default; disable for minimal observer effect if desired.
+CREATE OR REPLACE FUNCTION flight_recorder.configure_ring_autovacuum(p_enabled BOOLEAN DEFAULT true)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_status TEXT;
+BEGIN
+    EXECUTE format('ALTER TABLE flight_recorder.samples_ring SET (autovacuum_enabled = %L)', p_enabled);
+    EXECUTE format('ALTER TABLE flight_recorder.wait_samples_ring SET (autovacuum_enabled = %L)', p_enabled);
+    EXECUTE format('ALTER TABLE flight_recorder.activity_samples_ring SET (autovacuum_enabled = %L)', p_enabled);
+    EXECUTE format('ALTER TABLE flight_recorder.lock_samples_ring SET (autovacuum_enabled = %L)', p_enabled);
+
+    IF p_enabled THEN
+        v_status := 'Autovacuum ENABLED on ring buffer tables. Autovacuum will periodically collapse HOT chains.';
+    ELSE
+        v_status := 'Autovacuum DISABLED on ring buffer tables. Page pruning during UPSERTs handles cleanup.';
+    END IF;
+
+    RETURN v_status;
+END;
+$$;
+
+COMMENT ON FUNCTION flight_recorder.configure_ring_autovacuum(BOOLEAN) IS
+'Toggle autovacuum on ring buffer tables. Enabled by default (PostgreSQL standard behavior). Ring buffers are fixed-size UNLOGGED tables with bounded bloat, so autovacuum can be disabled to minimize observer effect if desired.';
 
 -- Enables flight recorder by scheduling periodic cron jobs for collection, archival, and cleanup
 -- Requires pg_cron extension; returns status message on success

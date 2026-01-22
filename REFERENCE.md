@@ -131,7 +131,8 @@ Low-overhead, high-frequency sampling using a fixed 120-slot circular buffer.
 Characteristics:
 
 - **UNLOGGED tables** eliminate WAL overhead (data lost on crash—acceptable for telemetry)
-- **Pre-populated rows** with UPDATE-only pattern achieve 100% HOT updates (zero dead tuples)
+- **Pre-populated rows** with UPDATE-only pattern achieve high HOT update ratios (no index bloat)
+- **Autovacuum configurable** via `configure_ring_autovacuum()`; can be disabled since fixed-size tables have bounded bloat
 - **Modular arithmetic** (`epoch / interval % 120`) auto-overwrites old slots
 - Query via: `recent_waits`, `recent_activity`, `recent_locks` views
 
@@ -217,12 +218,21 @@ With 120 slots:
 
 **Why UNLOGGED tables?** Eliminates WAL overhead. Telemetry data lost on crash is acceptable—the system recovers and resumes collection.
 
-**Why UPDATE-only pattern?** Child tables use `UPDATE ... SET col = NULL` to clear slots, then `INSERT ... ON CONFLICT DO UPDATE`. This achieves 100% HOT (Heap-Only Tuple) updates, eliminating dead tuples and autovacuum pressure.
+**Why UPDATE-only pattern?** Child tables use `UPDATE ... SET col = NULL` to clear slots, then `INSERT ... ON CONFLICT DO UPDATE`. With proper fillfactor, most updates are HOT (Heap-Only Tuple) - they create new tuple versions on the same page without updating indexes. HOT updates still create tuple chains within pages, but these are collapsed by page pruning during subsequent UPSERTs or by autovacuum.
 
 **Storage optimization:**
 
 - Master table: `fillfactor=70` (30% free space for HOT)
 - Child tables: `fillfactor=90` (10% free space for HOT)
+
+**Autovacuum configuration:**
+
+Ring buffer tables use PostgreSQL's default autovacuum behavior. Since they're fixed-size, pre-allocated, and UNLOGGED, bloat is bounded regardless of autovacuum settings. You can disable autovacuum to minimize observer effect if desired:
+
+```sql
+SELECT flight_recorder.configure_ring_autovacuum(false); -- Disable autovacuum
+SELECT flight_recorder.configure_ring_autovacuum(true);  -- Re-enable (default)
+```
 
 ### Collection Modes
 
@@ -521,6 +531,7 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `get_mode()` | Show current mode and settings |
 | `cleanup(interval)` | Delete old data (default: 7 days) |
 | `validate_config()` | Validate configuration settings |
+| `configure_ring_autovacuum(enabled)` | Toggle autovacuum on ring buffer tables (default: true) |
 
 ### Health & Monitoring Functions
 
