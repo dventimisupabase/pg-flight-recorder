@@ -17,7 +17,7 @@ When writing or editing markdown files, follow these rules to pass linting:
 
 Wrong:
 
-```markdown
+````markdown
 **Some header text:**
 - Item 1
 - Item 2
@@ -25,11 +25,11 @@ Wrong:
 ```code
 example
 ```
-```
+````
 
 Right:
 
-```markdown
+````markdown
 **Some header text:**
 
 - Item 1
@@ -40,7 +40,7 @@ Right:
 ```code
 example
 ```
-```
+````
 
 ## Testing
 
