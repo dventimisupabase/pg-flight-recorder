@@ -239,8 +239,8 @@ If sample_interval = 30s:
   → Sweet spot: 3 minutes
 ```
 
-**Below 3:1:** Ring buffer adds overhead without batching benefit
-**Above 10:1:** Data loss window becomes uncomfortable (>15 minutes)
+- **Below 3:1:** Ring buffer adds overhead without batching benefit
+- **Above 10:1:** Data loss window becomes uncomfortable (>15 minutes)
 
 **Recommendation:** Target 5:1 to 10:1 ratio for balanced efficiency.
 
@@ -668,7 +668,9 @@ Add overhead for indexes, PostgreSQL metadata, and alignment: multiply by 1.5× 
 
 ---
 
-**Document Version:** 1.0
-**Author:** System Architecture Analysis
-**Date:** 2026-01-22
-**Status:** Proposed
+| Field | Value |
+|-------|-------|
+| Document Version | 1.0 |
+| Author | System Architecture Analysis |
+| Date | 2026-01-22 |
+| Status | Proposed |
