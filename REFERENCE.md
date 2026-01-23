@@ -1493,4 +1493,3 @@ FROM flight_recorder.collection_stats
 WHERE started_at > now() - interval '1 day'
 GROUP BY collection_type;
 ```
-
