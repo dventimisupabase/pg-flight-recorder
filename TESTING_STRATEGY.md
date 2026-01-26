@@ -39,7 +39,30 @@ cd benchmark
 
 # Measure DDL blocking impact
 ./measure_ddl_impact.sh
+
+# Observer effect benchmark (TPS/latency impact)
+./measure_observer_effect.sh
+
+# Storage growth tracking
+./measure_storage.sh
+
+# Bloat/HOT update monitoring
+./measure_bloat.sh
 ```
+
+### 4. Benchmark Results (Latest Execution)
+
+From `benchmark/EXECUTED_1.md` (2026-01-24):
+
+| Metric | Result | Target | Status |
+|--------|--------|--------|--------|
+| TPS impact | +1.18% | < 1% degradation | **PASS** |
+| p99 latency | -1.05% (-0.14ms) | < 5% OR < 2ms | **PASS** |
+| WAL per sample | 7.56 KB | < 10 KB | **PASS** |
+| HOT update % | 96-100% | > 85% | **PASS** |
+| Dead tuple % | 0-18.92% | < 10% | **WARNING** |
+
+See `benchmark/BENCHMARK_PLAN.md` for methodology details.
 
 ---
 
@@ -135,21 +158,29 @@ Run the new measurement script:
 
 ## Gaps & Areas Not Yet Tested
 
-### Currently Not Covered
+### Now Covered (via benchmark suite)
 
-1. **Long-running storage growth** - No test runs for hours to measure actual growth
+- [x] **Observer effect** - TPS/latency impact measured via `measure_observer_effect.sh`
+- [x] **Storage growth** - Tracked via `measure_storage.sh` (needs longer runs for accurate projections)
+- [x] **Bloat/HOT updates** - Monitored via `measure_bloat.sh`
+- [x] **WAL overhead** - Measured at 7.56 KB per sample
+
+### Still Not Covered
+
+1. **Long-running benchmarks (4h+)** - Short validation runs done, need extended tests
 2. **Concurrent access** - Tests run single-threaded
 3. **Recovery scenarios** - Crash recovery of UNLOGGED tables
 4. **Large catalog impact** - Tests use small schemas (need 1000+ tables test)
 5. **Replica lag detection** - Requires replica setup
-6. **pg_stat_statements integration** - Partially tested
+6. **All workload types** - Only `oltp_balanced` fully tested; read-heavy/write-heavy pending
 
 ### Recommended Additional Tests
 
-1. **Storage growth test** - Run for 1 hour, measure growth rate
-2. **Stress test** - High concurrency with samples
-3. **Version upgrade test** - Install v1, upgrade to v2
-4. **Large schema test** - 1000+ tables performance
+1. **Extended storage test** - Run for 4+ hours to validate projections
+2. **Multi-workload observer test** - Test read-heavy and write-heavy scenarios
+3. **Stress test** - High concurrency (100+ clients) with samples
+4. **Version upgrade test** - Install v1, upgrade to v2
+5. **Large schema test** - 1000+ tables performance
 
 ---
 
@@ -159,12 +190,16 @@ Run the new measurement script:
 
 - [ ] `./test.sh` passes on PG 15, 16, 17
 - [ ] `./benchmark/measure_absolute.sh` shows <200ms mean
+- [ ] `./benchmark/measure_observer_effect.sh` shows <1% TPS degradation
+- [ ] `./benchmark/measure_bloat.sh` shows >85% HOT update ratio
 - [ ] `./tests/measure_storage_footprint.sh` runs without error
 - [ ] Manual: `SELECT flight_recorder.report('1 hour')` returns data
 
 ### For Production Deployment
 
 - [ ] Run `measure_absolute.sh` on target hardware
+- [ ] Run `measure_observer_effect.sh` with 3+ iterations
 - [ ] Verify `measure_ddl_impact.sh` shows <3% collision rate
+- [ ] Verify `measure_bloat.sh` shows <10% dead tuples
 - [ ] Check `SELECT flight_recorder.validate_config()` returns no errors
 - [ ] Monitor `SELECT * FROM flight_recorder.collection_stats ORDER BY started_at DESC LIMIT 10`

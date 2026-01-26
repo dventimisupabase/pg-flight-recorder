@@ -60,7 +60,98 @@ Headroom Assessment:
 
 **That's it.** No complex workload simulation needed.
 
-## DDL Blocking Impact Measurement (NEW)
+## Observer Effect Benchmark (A-B Comparison)
+
+Measures TPS and latency impact by comparing baseline (disabled) vs enabled modes.
+
+### Quick Start
+
+```bash
+cd benchmark
+
+# Setup test data (required first time)
+./setup.sh
+
+# Run observer effect benchmark (~8.5 hours for full matrix)
+./measure_observer_effect.sh
+
+# Quick test with reduced iterations
+ITERATIONS=2 WARMUP_DURATION=60 TEST_DURATION=300 ./measure_observer_effect.sh
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLIENTS` | 50 | Number of pgbench clients |
+| `WARMUP_DURATION` | 120 | Warmup seconds (discarded) |
+| `TEST_DURATION` | 900 | Test duration seconds |
+| `ITERATIONS` | 5 | A-B iteration count |
+| `WORKLOADS` | all 3 | Space-separated workload names |
+
+### Workloads
+
+- `oltp_balanced` - 50% read, 50% write
+- `oltp_read_heavy` - 90% read, 10% write
+- `oltp_write_heavy` - 20% read, 80% write
+
+### Success Criteria
+
+| Metric | Target |
+|--------|--------|
+| TPS degradation | < 1% |
+| p99 latency increase | < 5% OR < 2ms |
+
+## Storage Benchmark
+
+Tracks storage growth over time and computes projections.
+
+### Quick Start
+
+```bash
+# Run storage benchmark (4 hours default)
+./measure_storage.sh
+
+# Quick test (1 hour)
+DURATION_HOURS=1 ./measure_storage.sh
+```
+
+### Output
+
+- `storage_timeline.csv` - Size measurements over time
+- `row_sizes.csv` - Actual row sizes per table
+- `projections.csv` - Daily growth projections
+- `storage_report.md` - Summary report
+
+## Bloat Benchmark
+
+Tracks HOT update ratios and dead tuple accumulation.
+
+### Quick Start
+
+```bash
+# Run bloat benchmark (4 hours default)
+./measure_bloat.sh
+
+# Quick test (1 hour)
+DURATION_HOURS=1 ./measure_bloat.sh
+```
+
+### Success Criteria
+
+| Metric | Target |
+|--------|--------|
+| HOT update % (ring) | > 85% |
+| Dead tuple % (ring) | < 10% |
+
+### Output
+
+- `bloat_timeline.csv` - Bloat measurements over time
+- `deltas.csv` - Delta-based HOT statistics
+- `precise_bloat.csv` - pgstattuple_approx results
+- `bloat_report.md` - Summary report
+
+## DDL Blocking Impact Measurement
 
 ### Purpose
 
