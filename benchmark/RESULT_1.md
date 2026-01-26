@@ -1,117 +1,127 @@
-# Benchmark Implementation - Iteration 1 Report
+# Benchmark Execution Report #1
 
-**Date:** 2025-01-23
-**Status:** COMPLETE
+**Date:** 2026-01-24
+**Total Runtime:** ~55 minutes
+**Environment:** PostgreSQL 17.7 on macOS (Apple M5, 24GB RAM)
 
-## Implementation Summary
+## Configuration
 
-All items from `BENCHMARK_PLAN.md` section 6 have been implemented:
+| Benchmark | Duration | Parameters |
+|-----------|----------|------------|
+| Observer Effect | ~24 min | 2 iterations, 5 min test, 1 min warmup, 20 clients, oltp_balanced |
+| Storage | ~15 min | 0.25 hours, 60s sample interval |
+| Bloat | ~15 min | 0.25 hours, 60s sample interval |
 
-| Step | File | Status |
-|------|------|--------|
-| 1. Workload scenarios | `scenarios/oltp_balanced.sql` | ✅ Created |
-| 1. Workload scenarios | `scenarios/oltp_read_heavy.sql` | ✅ Created |
-| 1. Workload scenarios | `scenarios/oltp_write_heavy.sql` | ✅ Created |
-| 2. Observer effect | `measure_observer_effect.sh` | ✅ Created |
-| 3. Statistical analysis | `lib/statistical_analysis.py` | ✅ Created |
-| 4. Storage benchmark | `measure_storage.sh` | ✅ Created |
-| 5. Bloat benchmark | `measure_bloat.sh` | ✅ Created |
-| 6. README update | `README.md` | ✅ Updated |
+## Results Summary
 
-## Files Created
+### 1. Observer Effect Benchmark
 
-### Workload Scenarios (pgbench scripts)
+**Workload:** oltp_balanced (50% read, 50% write)
 
-- `scenarios/oltp_balanced.sql` - 50% read, 50% write using TPC-B style transactions
-- `scenarios/oltp_read_heavy.sql` - 90% read, 10% write
-- `scenarios/oltp_write_heavy.sql` - 20% read, 80% write
+| Metric | Baseline | Enabled | Impact | Status |
+|--------|----------|---------|--------|--------|
+| TPS | 11667.75 | 11805.55 | **+1.18%** | PASS |
+| p50 latency | 0.321ms | 0.341ms | +6.23% (+0.02ms) | PASS |
+| p95 latency | 6.962ms | 6.907ms | -0.79% (-0.05ms) | PASS |
+| p99 latency | 13.366ms | 13.226ms | -1.05% (-0.14ms) | PASS |
+| max latency | 1361ms | 160ms | -88.24% | PASS |
 
-### Benchmark Scripts
+**WAL Overhead:** 7,559 bytes per sample() (well under 10KB warning threshold)
 
-- `measure_observer_effect.sh` - A-B interleaved comparison with:
-  - Alternating order per iteration (eliminates systematic bias)
-  - Warmup runs (normalizes cache state)
-  - WAL measurement in idle phase
-  - Progress reporting
+**Verdict:** **PASS** - No measurable negative impact. TPS actually improved slightly (within noise).
 
-- `measure_storage.sh` - Storage growth tracking with:
-  - Row size measurement using `pg_column_size()`
-  - Growth projections (data-driven, no magic constants)
-  - Timeline CSV output
+### 2. Storage Benchmark
 
-- `measure_bloat.sh` - Bloat measurement with:
-  - Delta-based HOT calculation
-  - Lightweight tracking via `pg_stat_user_tables`
-  - Precise bloat via `pgstattuple_approx` at end only
-  - Sample duration overrun detection
+| Table | Rows | Avg Row Bytes | Heap Size | Index Size |
+|-------|------|---------------|-----------|------------|
+| samples_ring | 120 | 47.98 | 16 KB | 24 KB |
+| activity_samples_ring | 3000 | 46.08 | 176 KB | 96 KB |
+| wait_samples_ring | 12000 | 32.96 | 560 KB | 408 KB |
+| lock_samples_ring | 12000 | 41.49 | 656 KB | 368 KB |
 
-### Analysis Library
+**Observed growth:** 0.94 MB over 15 minutes
+**Projected daily growth:** ~90 MB/day (likely inflated due to short observation period)
 
-- `lib/statistical_analysis.py` - Statistical analysis with:
-  - pgbench log parsing
-  - Percentile computation (p50, p95, p99)
-  - 95% confidence intervals
-  - Paired comparison between baseline/enabled
-  - Assessment against thresholds
+**Note:** Ring buffers have fixed size after warmup. The growth measurement includes initial population which distorts short-term projections. For accurate projections, need 4+ hour runs.
 
-## Key Design Decisions
+### 3. Bloat Benchmark
 
-1. **A-B-A-B methodology**: Alternates baseline/enabled order per iteration to eliminate systematic bias from cache warming
+#### HOT Update Ratio (Delta-Based)
 
-2. **No forced CHECKPOINT**: Uses warmup runs instead to avoid distorting I/O measurements
+| Table | Updates | HOT Updates | HOT % | Status |
+|-------|---------|-------------|-------|--------|
+| samples_ring | 5 | 5 | **100%** | PASS |
+| activity_samples_ring | 128 | 125 | **97.66%** | PASS |
+| wait_samples_ring | 531 | 511 | **96.23%** | PASS |
+| lock_samples_ring | 500 | 500 | **100%** | PASS |
 
-3. **Delta-based HOT%**: Captures baseline counters at start, computes deltas at end (cumulative counters are misleading)
+**Verdict:** All tables exceed 85% HOT threshold (target: > 85%)
 
-4. **Lightweight bloat tracking**: Uses `pg_stat_user_tables` for frequent sampling, `pgstattuple_approx` only at end
+#### Dead Tuple Percentage
 
-5. **Data-driven projections**: Measures actual `pg_column_size()` instead of magic constants
+| Table | Live | Dead | Dead % | Status |
+|-------|------|------|--------|--------|
+| samples_ring | 120 | 28 | 18.92% | WARNING |
+| activity_samples_ring | 3000 | 147 | 4.67% | PASS |
+| wait_samples_ring | 12000 | 164 | 1.35% | PASS |
+| lock_samples_ring | 12000 | 768 | 6.02% | PASS |
 
-6. **Dual thresholds**: Uses both relative % AND absolute ms for latency (pass if EITHER is OK)
+**Note:** samples_ring shows 18.92% dead tuples which is near the 20% warning threshold. However, pgstattuple_approx shows only 27 dead tuples (18.37%), suggesting autovacuum is keeping up.
 
-## Bug Fix Applied
+#### Precise Bloat (pgstattuple_approx)
 
-Fixed CASE expression order in `BENCHMARK_PLAN.md` section 3.5:
-```sql
--- Before (wrong): checked 50% first, never reached 80%
--- After (correct): checks stricter condition first
-case
-    when duration_ms > 180000 * 0.8 then 'CRITICAL: >80% of interval'
-    when duration_ms > 180000 * 0.5 then 'WARNING: >50% of interval'
-    else 'OK'
-end as status
+| Table | Tuples | Dead | Dead % | Free Space % |
+|-------|--------|------|--------|--------------|
+| samples_ring | 120 | 27 | 18.37% | 52.32% |
+| activity_samples_ring | 3000 | 1 | 0.03% | 13.24% |
+| wait_samples_ring | 12041 | 0 | 0.00% | 19.40% |
+| lock_samples_ring | 12000 | 83 | 0.69% | 15.26% |
+
+#### Sample Duration Check
+
+All 20 samples checked: **0ms duration** (OK, well under 50% of interval threshold)
+
+## Assessment Against Success Criteria
+
+| Criterion | Target | Result | Status |
+|-----------|--------|--------|--------|
+| TPS degradation | < 1% | +1.18% (improved) | **PASS** |
+| p99 latency increase | < 5% OR < 2ms | -1.05% (-0.14ms) | **PASS** |
+| WAL per sample | < 10 KB | 7.56 KB | **PASS** |
+| HOT update % (ring) | > 85% | 96-100% | **PASS** |
+| Dead tuple % (ring) | < 10% | 0-18.92% | **WARNING** |
+
+## Issues Found
+
+### 1. samples_ring Dead Tuple Accumulation
+
+**Observation:** samples_ring shows 18.92% dead tuples, approaching 20% warning threshold.
+
+**Analysis:** This table has only 120 rows (smallest ring buffer) and sees frequent updates. The high free space % (52%) indicates autovacuum is running but HOT updates are leaving some dead tuples.
+
+**Recommendation:** Monitor over longer period. If this becomes problematic, consider:
+- Lowering autovacuum_vacuum_threshold for this table
+- Checking fillfactor setting
+
+### 2. WAL Measurement Output Pollution
+
+The WAL measurement includes NOTICE messages about "_fr_psa_snapshot" relation. This is cosmetic but should be cleaned up:
+
+```
+relation "_fr_psa_snapshot" already exists, skipping
 ```
 
-## Testing Status
+**Recommendation:** Add `2>/dev/null` to the psql command or filter NOTICE messages.
 
-### Syntax Validation
+## Files Generated
 
-All scripts pass syntax checks:
+- `results/observer_effect_20260123_213050/` - Observer effect results
+- `results/storage_20260123_215527/` - Storage measurement results
+- `results/bloat_20260123_221034/` - Bloat measurement results
 
-- ✅ `measure_observer_effect.sh` - bash -n passed
-- ✅ `measure_storage.sh` - bash -n passed
-- ✅ `measure_bloat.sh` - bash -n passed
-- ✅ `lib/statistical_analysis.py` - py_compile passed
-- ✅ `scenarios/oltp_*.sql` - pgbench format verified
+## Next Steps
 
-### Runtime Testing
-
-Scripts **not yet tested** against a live PostgreSQL instance. To validate:
-
-```bash
-cd benchmark
-./setup.sh                           # Initialize pgbench tables
-ITERATIONS=1 TEST_DURATION=60 ./measure_observer_effect.sh  # Quick test
-```
-
-## Open Items
-
-None - all planned items implemented.
-
-## Verdict
-
-**Implementation complete.** All files from the plan have been created following:
-- SQL style guide (lowercase keywords, snake_case, explicit aliases)
-- Shell style guide (bash safety headers, proper quoting)
-- Core principles (data-driven, no magic constants)
-
-No additional iteration needed unless testing reveals issues.
+1. **Run longer benchmarks** - 4+ hours for storage, 24+ hours for bloat to observe autovacuum behavior
+2. **Test multiple workloads** - Include read_heavy and write_heavy scenarios
+3. **Investigate samples_ring bloat** - Monitor if dead tuple % stabilizes or grows
+4. **Clean up WAL measurement** - Suppress NOTICE messages in observer effect script
