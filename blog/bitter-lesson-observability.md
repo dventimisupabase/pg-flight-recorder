@@ -102,6 +102,3 @@ We're early in this transition. Most monitoring tools are still optimized for hu
 
 The lesson is bitter, but the future is interesting.
 
----
-
-*This post emerged from a conversation about [pg-flight-recorder](https://github.com/dventimisupabase/pg-flight-recorder), a PostgreSQL monitoring extension designed around comprehensive telemetry capture. The `report()` function mentioned above is a real feature—because sometimes the best interface for a monitoring tool is structured data in a format readable by both humans and AI.*
