@@ -11,7 +11,7 @@
 DO $$
 DECLARE
     v_current_version TEXT;
-    v_target_version TEXT := '2.1';  -- Update this when adding migrations
+    v_target_version TEXT := '2.3';  -- Update this when adding migrations
 BEGIN
     -- Check if flight_recorder schema exists
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recorder') THEN
@@ -68,6 +68,12 @@ END $$;
 
 -- Migration from 2.0 to 2.1: Add I/O read timing columns
 \i migrations/2.0_to_2.1.sql
+
+-- Migration from 2.1 to 2.2: Add configurable ring buffer slots
+\i migrations/2.1_to_2.2.sql
+
+-- Migration from 2.2 to 2.3: Add XID wraparound metrics
+\i migrations/2.2_to_2.3.sql
 
 -- =============================================================================
 -- Post-upgrade verification

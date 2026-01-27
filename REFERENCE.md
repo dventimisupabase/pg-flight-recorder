@@ -365,6 +365,43 @@ Or use the uninstall script:
 psql -f uninstall.sql
 ```
 
+### Upgrading
+
+To upgrade an existing installation while preserving telemetry data:
+
+**Step 1: Check current version**
+
+```sql
+SELECT value FROM flight_recorder.config WHERE key = 'schema_version';
+```
+
+**Step 2: Run migrations**
+
+```bash
+psql -f migrations/upgrade.sql
+```
+
+This automatically detects your version and applies needed migrations.
+
+**Step 3: Reinstall functions**
+
+```bash
+psql -f install.sql
+```
+
+This is safe — it preserves all data and updates functions/views to the latest version.
+
+### Version History
+
+| Version | Changes |
+|---------|---------|
+| 2.3 | XID wraparound metrics (`datfrozenxid_age`, `relfrozenxid_age`) |
+| 2.2 | Configurable ring buffer slots (72-2880 range) |
+| 2.1 | I/O read timing columns from pg_stat_io |
+| 2.0 | Initial versioned release |
+
+See `migrations/README.md` for detailed migration documentation.
+
 ## Configuration Profiles
 
 Profiles provide pre-configured settings for common use cases. Start here instead of tuning individual parameters.

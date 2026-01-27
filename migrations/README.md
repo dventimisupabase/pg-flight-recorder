@@ -42,7 +42,9 @@ This is safe - it preserves all data and just updates functions/views.
 |------|---------|
 | `upgrade.sql` | Main upgrade runner - detects version and runs migrations |
 | `TEMPLATE.sql` | Template for creating new migration scripts |
-| `2.0_to_2.1.sql.example` | Example migration showing common patterns |
+| `X.Y_to_X.Z.sql` | Individual migration scripts |
+
+See REFERENCE.md for version history.
 
 ## Creating New Migrations
 
