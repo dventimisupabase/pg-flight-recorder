@@ -55,3 +55,19 @@ Run tests with:
 - Follow existing patterns in `install.sql`
 - Use `flight_recorder.` schema prefix for all objects
 - Include COMMENT ON statements for new functions and tables
+
+## Schema Evolution
+
+pg-flight-recorder uses **additive-only schema changes**:
+
+- Add new nullable columns (never remove or rename existing ones)
+- Create migration files (e.g., `migrations/2.2_to_2.3.sql`) for upgrades
+- Historical data with NULL in new columns is correct ("not collected then")
+
+**Why not JSONB + versioning?**
+
+- Query performance matters during incident analysis
+- Strong typing catches errors early
+- Schema-as-documentation (`\d flight_recorder.snapshots` shows what's collected)
+- Underlying pg_stat_* views evolve slowly and additively
+- Migration burden is manageable with semantic versioning
