@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
     connections_active          INTEGER,
     connections_total           INTEGER,
     connections_max             INTEGER,
-    db_size_bytes               BIGINT
+    db_size_bytes               BIGINT,
+    datfrozenxid_age            INTEGER
 );
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
 
@@ -383,6 +384,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.table_snapshots (
     last_autovacuum     TIMESTAMPTZ,
     last_analyze        TIMESTAMPTZ,
     last_autoanalyze    TIMESTAMPTZ,
+    relfrozenxid_age    INTEGER,
     PRIMARY KEY (snapshot_id, relid)
 );
 CREATE INDEX IF NOT EXISTS table_snapshots_relid_idx
@@ -476,7 +478,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.2'),
+    ('schema_version', '2.3'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -2137,34 +2139,37 @@ BEGIN
         n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
         n_live_tup, n_dead_tup,
         vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
-        last_vacuum, last_autovacuum, last_analyze, last_autoanalyze
+        last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
+        relfrozenxid_age
     )
     SELECT
         p_snapshot_id,
-        schemaname,
-        relname,
-        relid,
-        seq_scan,
-        seq_tup_read,
-        idx_scan,
-        idx_tup_fetch,
-        n_tup_ins,
-        n_tup_upd,
-        n_tup_del,
-        n_tup_hot_upd,
-        n_live_tup,
-        n_dead_tup,
-        vacuum_count,
-        autovacuum_count,
-        analyze_count,
-        autoanalyze_count,
-        last_vacuum,
-        last_autovacuum,
-        last_analyze,
-        last_autoanalyze
-    FROM pg_stat_user_tables
-    ORDER BY (COALESCE(seq_tup_read, 0) + COALESCE(idx_tup_fetch, 0) +
-              COALESCE(n_tup_ins, 0) + COALESCE(n_tup_upd, 0) + COALESCE(n_tup_del, 0)) DESC
+        st.schemaname,
+        st.relname,
+        st.relid,
+        st.seq_scan,
+        st.seq_tup_read,
+        st.idx_scan,
+        st.idx_tup_fetch,
+        st.n_tup_ins,
+        st.n_tup_upd,
+        st.n_tup_del,
+        st.n_tup_hot_upd,
+        st.n_live_tup,
+        st.n_dead_tup,
+        st.vacuum_count,
+        st.autovacuum_count,
+        st.analyze_count,
+        st.autoanalyze_count,
+        st.last_vacuum,
+        st.last_autovacuum,
+        st.last_analyze,
+        st.last_autoanalyze,
+        age(c.relfrozenxid)::integer AS relfrozenxid_age
+    FROM pg_stat_user_tables st
+    LEFT JOIN pg_class c ON c.oid = st.relid
+    ORDER BY (COALESCE(st.seq_tup_read, 0) + COALESCE(st.idx_tup_fetch, 0) +
+              COALESCE(st.n_tup_ins, 0) + COALESCE(st.n_tup_upd, 0) + COALESCE(st.n_tup_del, 0)) DESC
     LIMIT v_top_n;
 END;
 $$;
@@ -2473,6 +2478,7 @@ DECLARE
     v_connections_max INTEGER;
     v_db_size_bytes BIGINT;
     v_capacity_enabled BOOLEAN;
+    v_datfrozenxid_age INTEGER;
 BEGIN
     v_should_skip := flight_recorder._check_circuit_breaker('snapshot');
     IF v_should_skip THEN
@@ -2650,6 +2656,10 @@ BEGIN
             WHERE relkind IN ('r', 't', 'i', 'm')
               AND relpages > 0;
         END IF;
+        SELECT age(datfrozenxid)::integer
+        INTO v_datfrozenxid_age
+        FROM pg_database
+        WHERE datname = current_database();
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Capacity planning metrics collection failed: %', SQLERRM;
@@ -2661,6 +2671,7 @@ BEGIN
         v_connections_total := NULL;
         v_connections_max := NULL;
         v_db_size_bytes := NULL;
+        v_datfrozenxid_age := NULL;
     END;
     END IF;
     IF v_pg_version = 17 THEN
@@ -2683,7 +2694,7 @@ BEGIN
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
             connections_active, connections_total, connections_max,
-            db_size_bytes
+            db_size_bytes, datfrozenxid_age
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2705,7 +2716,7 @@ BEGIN
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
             v_connections_active, v_connections_total, v_connections_max,
-            v_db_size_bytes
+            v_db_size_bytes, v_datfrozenxid_age
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_checkpointer c
         CROSS JOIN pg_stat_bgwriter b
@@ -2730,7 +2741,7 @@ BEGIN
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
             connections_active, connections_total, connections_max,
-            db_size_bytes
+            db_size_bytes, datfrozenxid_age
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2752,7 +2763,7 @@ BEGIN
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
             v_connections_active, v_connections_total, v_connections_max,
-            v_db_size_bytes
+            v_db_size_bytes, v_datfrozenxid_age
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -2768,7 +2779,7 @@ BEGIN
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
             connections_active, connections_total, connections_max,
-            db_size_bytes
+            db_size_bytes, datfrozenxid_age
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2782,7 +2793,7 @@ BEGIN
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
             v_connections_active, v_connections_total, v_connections_max,
-            v_db_size_bytes
+            v_db_size_bytes, v_datfrozenxid_age
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
