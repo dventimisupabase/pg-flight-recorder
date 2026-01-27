@@ -101,4 +101,3 @@ The DBA's knowledge of what causes buffer pressure is still valuable. But it mig
 We're early in this transition. Most monitoring tools are still optimized for human eyeballs, and that's fine—humans still need to make decisions. But the tools that will age well are probably the ones that also work as "flight recorders": comprehensive, structured, queryable. Record now, analyze later, with whatever intelligence is available at analysis time.
 
 The lesson is bitter, but the future is interesting.
-
