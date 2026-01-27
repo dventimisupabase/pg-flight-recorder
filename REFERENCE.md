@@ -180,8 +180,8 @@ Captures periodic snapshots of system state every 5 minutes. Unlike sampled acti
 
 | Table | Purpose |
 |-------|---------|
-| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O |
-| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat) |
+| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O, XID age |
+| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat, XID age) |
 | `index_snapshots` | Per-index usage and size |
 
 Query via: `compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`.
@@ -1103,6 +1103,8 @@ Capacity planning uses data already collected (every 5 minutes) with no addition
 | `connections_total` | pg_stat_activity | All connections |
 | `connections_max` | max_connections | Configured limit |
 | `db_size_bytes` | pg_class.relpages | Database size (statistical estimate) |
+| `datfrozenxid_age` | pg_database | Database XID age (wraparound risk) |
+| `relfrozenxid_age` | pg_class | Per-table XID age (in table_snapshots) |
 
 Storage overhead: ~40 bytes per snapshot = 11.5 KB/day.
 
@@ -1389,6 +1391,45 @@ SELECT * FROM flight_recorder.compare('...', '...');
 | `BACKEND_FSYNC` | Backends doing fsync (bgwriter overwhelmed) | Tune bgwriter settings |
 | `TEMP_FILE_SPILLS` | Queries spilling to disk | Increase work_mem or optimize queries |
 | `LOCK_CONTENTION` | Sessions blocked on locks | Review blocking queries, add indexes |
+| `XID_WRAPAROUND_RISK` | Database XID age approaching limit | Run VACUUM FREEZE, tune autovacuum |
+| `TABLE_XID_WRAPAROUND_RISK` | Table XID age approaching limit | Run VACUUM FREEZE on specific table |
+
+### XID Wraparound Detection
+
+Transaction ID (XID) wraparound is a critical PostgreSQL failure mode. Flight Recorder tracks XID ages and alerts when approaching dangerous thresholds.
+
+**Thresholds** (based on `autovacuum_freeze_max_age` setting, default 200M):
+
+| Severity | Threshold | Meaning |
+|----------|-----------|---------|
+| `high` | > 50% of freeze_max_age | Proactive warning |
+| `critical` | > 80% of freeze_max_age | Urgent action needed |
+
+**Per-table awareness:** Each table can have its own `autovacuum_freeze_max_age` storage parameter. The detection respects per-table settings when configured via `ALTER TABLE ... SET (autovacuum_freeze_max_age = ...)`.
+
+**Metrics collected:**
+
+- `datfrozenxid_age` — Database-level XID age (in `snapshots` table)
+- `relfrozenxid_age` — Per-table XID age (in `table_snapshots` table)
+
+**Example output:**
+
+```sql
+SELECT * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
+```
+
+| anomaly_type | severity | description | metric_value | threshold |
+|--------------|----------|-------------|--------------|-----------|
+| XID_WRAPAROUND_RISK | high | Database approaching transaction ID wraparound | XID age: 120,000,000 (60% of autovacuum_freeze_max_age) | datfrozenxid_age > 100,000,000 (50% of 200,000,000) |
+| TABLE_XID_WRAPAROUND_RISK | critical | Table public.large_table approaching XID wraparound | XID age: 170,000,000 (85% of autovacuum_freeze_max_age=200,000,000) | relfrozenxid_age > 100,000,000 (50% of 200,000,000) |
+
+**Related PostgreSQL parameters:**
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `autovacuum_freeze_max_age` | 200M | Forces anti-wraparound autovacuum |
+| `vacuum_freeze_table_age` | 150M | Triggers aggressive freeze during normal vacuum |
+| `vacuum_freeze_min_age` | 50M | Minimum age before tuples can be frozen |
 
 ```sql
 SELECT * FROM flight_recorder.anomaly_report(
