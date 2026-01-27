@@ -3607,7 +3607,19 @@ DECLARE
     v_wait_pct NUMERIC;
     v_lock_count INTEGER;
     v_max_block_duration INTERVAL;
+    v_datfrozenxid_age INTEGER;
+    v_table_xid_rec RECORD;
+    v_freeze_max_age BIGINT;
+    v_warning_threshold BIGINT;
+    v_critical_threshold BIGINT;
 BEGIN
+    -- Get autovacuum_freeze_max_age for XID wraparound thresholds
+    SELECT setting::bigint INTO v_freeze_max_age
+    FROM pg_settings WHERE name = 'autovacuum_freeze_max_age';
+    v_freeze_max_age := COALESCE(v_freeze_max_age, 200000000);
+    v_warning_threshold := (v_freeze_max_age * 0.5)::bigint;   -- 50% of freeze_max_age
+    v_critical_threshold := (v_freeze_max_age * 0.8)::bigint;  -- 80% of freeze_max_age
+
     SELECT * INTO v_cmp FROM flight_recorder.compare(p_start_time, p_end_time);
     IF v_cmp.checkpoint_occurred THEN
         anomaly_type := 'CHECKPOINT_DURING_WINDOW';
@@ -3688,6 +3700,81 @@ BEGIN
         recommendation := 'Check recent_locks for blocking queries; consider shorter transactions';
         RETURN NEXT;
     END IF;
+    -- Database-level XID wraparound check
+    SELECT datfrozenxid_age INTO v_datfrozenxid_age
+    FROM flight_recorder.snapshots
+    WHERE captured_at BETWEEN p_start_time AND p_end_time
+      AND datfrozenxid_age IS NOT NULL
+    ORDER BY captured_at DESC
+    LIMIT 1;
+    IF v_datfrozenxid_age IS NOT NULL AND v_datfrozenxid_age > v_warning_threshold THEN
+        anomaly_type := 'XID_WRAPAROUND_RISK';
+        severity := CASE
+            WHEN v_datfrozenxid_age > v_critical_threshold THEN 'critical'
+            ELSE 'high'
+        END;
+        description := 'Database approaching transaction ID wraparound';
+        metric_value := format('XID age: %s (%s%% of autovacuum_freeze_max_age)',
+                              to_char(v_datfrozenxid_age, 'FM999,999,999'),
+                              round(v_datfrozenxid_age::numeric / v_freeze_max_age * 100, 1));
+        threshold := format('datfrozenxid_age > %s (50%% of %s)',
+                           to_char(v_warning_threshold, 'FM999,999,999'),
+                           to_char(v_freeze_max_age, 'FM999,999,999'));
+        recommendation := 'Run VACUUM FREEZE on large tables or enable more aggressive autovacuum';
+        RETURN NEXT;
+    END IF;
+    -- Table-level XID wraparound check (find tables approaching their threshold)
+    -- Each table may have its own autovacuum_freeze_max_age setting
+    FOR v_table_xid_rec IN
+        SELECT
+            ts.schemaname,
+            ts.relname,
+            ts.relfrozenxid_age,
+            COALESCE(
+                (SELECT (regexp_match(opt, 'autovacuum_freeze_max_age=(\d+)'))[1]::bigint
+                 FROM unnest(c.reloptions) opt
+                 WHERE opt LIKE 'autovacuum_freeze_max_age=%'
+                 LIMIT 1),
+                v_freeze_max_age
+            ) AS table_freeze_max_age
+        FROM flight_recorder.table_snapshots ts
+        LEFT JOIN pg_class c ON c.oid = ts.relid
+        WHERE ts.snapshot_id = (
+            SELECT id FROM flight_recorder.snapshots
+            WHERE captured_at BETWEEN p_start_time AND p_end_time
+            ORDER BY captured_at DESC
+            LIMIT 1
+        )
+          AND ts.relfrozenxid_age IS NOT NULL
+        ORDER BY ts.relfrozenxid_age::numeric / COALESCE(
+            (SELECT (regexp_match(opt, 'autovacuum_freeze_max_age=(\d+)'))[1]::bigint
+             FROM unnest(c.reloptions) opt
+             WHERE opt LIKE 'autovacuum_freeze_max_age=%'
+             LIMIT 1),
+            v_freeze_max_age
+        ) DESC
+        LIMIT 5  -- Check top 5 tables by relative XID age
+    LOOP
+        IF v_table_xid_rec.relfrozenxid_age > (v_table_xid_rec.table_freeze_max_age * 0.5)::bigint THEN
+            anomaly_type := 'TABLE_XID_WRAPAROUND_RISK';
+            severity := CASE
+                WHEN v_table_xid_rec.relfrozenxid_age > (v_table_xid_rec.table_freeze_max_age * 0.8)::bigint THEN 'critical'
+                ELSE 'high'
+            END;
+            description := format('Table %s.%s approaching XID wraparound',
+                                 v_table_xid_rec.schemaname, v_table_xid_rec.relname);
+            metric_value := format('XID age: %s (%s%% of table autovacuum_freeze_max_age=%s)',
+                                  to_char(v_table_xid_rec.relfrozenxid_age, 'FM999,999,999'),
+                                  round(v_table_xid_rec.relfrozenxid_age::numeric / v_table_xid_rec.table_freeze_max_age * 100, 1),
+                                  to_char(v_table_xid_rec.table_freeze_max_age, 'FM999,999,999'));
+            threshold := format('relfrozenxid_age > %s (50%% of %s)',
+                               to_char((v_table_xid_rec.table_freeze_max_age * 0.5)::bigint, 'FM999,999,999'),
+                               to_char(v_table_xid_rec.table_freeze_max_age, 'FM999,999,999'));
+            recommendation := format('Run VACUUM FREEZE on %s.%s',
+                                    v_table_xid_rec.schemaname, v_table_xid_rec.relname);
+            RETURN NEXT;
+        END IF;
+    END LOOP;
     RETURN;
 END;
 $$;

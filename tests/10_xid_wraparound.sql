@@ -2,11 +2,11 @@
 -- pg-flight-recorder pgTAP Tests - XID Wraparound Metrics
 -- =============================================================================
 -- Tests: XID age columns exist and are populated with reasonable values
--- Test count: 8
+-- Test count: 10
 -- =============================================================================
 
 BEGIN;
-SELECT plan(8);
+SELECT plan(10);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -85,6 +85,26 @@ SELECT ok(
           AND ts.relfrozenxid_age >= 2000000000
     ),
     'relfrozenxid_age values should be less than 2 billion'
+);
+
+-- =============================================================================
+-- 4. ANOMALY REPORT INTEGRATION (2 tests)
+-- =============================================================================
+
+-- Verify anomaly_report() runs without error when checking XID ages
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now())$$,
+    'anomaly_report() should run without error with XID age checks'
+);
+
+-- In a fresh test database, XID ages should be low, so no XID wraparound anomalies expected
+-- This verifies the check runs but doesn't false-positive on healthy systems
+SELECT ok(
+    NOT EXISTS (
+        SELECT 1 FROM flight_recorder.anomaly_report(now() - interval '1 hour', now())
+        WHERE anomaly_type IN ('XID_WRAPAROUND_RISK', 'TABLE_XID_WRAPAROUND_RISK')
+    ),
+    'Fresh database should not trigger XID wraparound anomalies'
 );
 
 SELECT * FROM finish();
