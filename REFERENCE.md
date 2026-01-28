@@ -395,6 +395,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.4 | Client IP address tracking (`client_addr` in activity sampling) |
 | 2.3 | XID wraparound metrics (`datfrozenxid_age`, `relfrozenxid_age`) |
 | 2.2 | Configurable ring buffer slots (72-2880 range) |
 | 2.1 | I/O read timing columns from pg_stat_io |
