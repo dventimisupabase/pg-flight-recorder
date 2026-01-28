@@ -166,6 +166,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     pid                 INTEGER,
     usename             TEXT,
     application_name    TEXT,
+    client_addr         INET,
     backend_type        TEXT,
     state               TEXT,
     wait_event_type     TEXT,
@@ -289,6 +290,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.activity_samples_archive (
     pid                 INTEGER,
     usename             TEXT,
     application_name    TEXT,
+    client_addr         INET,
     backend_type        TEXT,
     state               TEXT,
     wait_event_type     TEXT,
@@ -478,7 +480,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.3'),
+    ('schema_version', '2.4'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -1658,7 +1660,7 @@ BEGIN
         PERFORM flight_recorder._set_section_timeout();
         IF v_snapshot_based THEN
             INSERT INTO flight_recorder.activity_samples_ring (
-                slot_id, row_num, pid, usename, application_name, backend_type,
+                slot_id, row_num, pid, usename, application_name, client_addr, backend_type,
                 state, wait_event_type, wait_event, query_start, state_change, query_preview
             )
             SELECT
@@ -1667,6 +1669,7 @@ BEGIN
                 pid,
                 usename,
                 application_name,
+                client_addr,
                 backend_type,
                 state,
                 wait_event_type,
@@ -1681,6 +1684,7 @@ BEGIN
                 pid = EXCLUDED.pid,
                 usename = EXCLUDED.usename,
                 application_name = EXCLUDED.application_name,
+                client_addr = EXCLUDED.client_addr,
                 backend_type = EXCLUDED.backend_type,
                 state = EXCLUDED.state,
                 wait_event_type = EXCLUDED.wait_event_type,
@@ -1690,7 +1694,7 @@ BEGIN
                 query_preview = EXCLUDED.query_preview;
         ELSE
             INSERT INTO flight_recorder.activity_samples_ring (
-                slot_id, row_num, pid, usename, application_name, backend_type,
+                slot_id, row_num, pid, usename, application_name, client_addr, backend_type,
                 state, wait_event_type, wait_event, query_start, state_change, query_preview
             )
             SELECT
@@ -1699,6 +1703,7 @@ BEGIN
                 pid,
                 usename,
                 application_name,
+                client_addr,
                 backend_type,
                 state,
                 wait_event_type,
@@ -1713,6 +1718,7 @@ BEGIN
                 pid = EXCLUDED.pid,
                 usename = EXCLUDED.usename,
                 application_name = EXCLUDED.application_name,
+                client_addr = EXCLUDED.client_addr,
                 backend_type = EXCLUDED.backend_type,
                 state = EXCLUDED.state,
                 wait_event_type = EXCLUDED.wait_event_type,
@@ -1986,7 +1992,7 @@ BEGIN
     END IF;
     IF v_archive_activity THEN
         INSERT INTO flight_recorder.activity_samples_archive (
-            sample_id, captured_at, pid, usename, application_name, backend_type,
+            sample_id, captured_at, pid, usename, application_name, client_addr, backend_type,
             state, wait_event_type, wait_event, query_start, state_change, query_preview
         )
         SELECT
@@ -1995,6 +2001,7 @@ BEGIN
             a.pid,
             a.usename,
             a.application_name,
+            a.client_addr,
             a.backend_type,
             a.state,
             a.wait_event_type,
@@ -3145,6 +3152,7 @@ SELECT
     a.pid,
     a.usename,
     a.application_name,
+    a.client_addr,
     a.backend_type,
     a.state,
     a.wait_event_type,

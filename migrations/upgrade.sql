@@ -11,7 +11,7 @@
 DO $$
 DECLARE
     v_current_version TEXT;
-    v_target_version TEXT := '2.3';  -- Update this when adding migrations
+    v_target_version TEXT := '2.4';  -- Update this when adding migrations
 BEGIN
     -- Check if flight_recorder schema exists
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recorder') THEN
@@ -74,6 +74,9 @@ END $$;
 
 -- Migration from 2.2 to 2.3: Add XID wraparound metrics
 \i migrations/2.2_to_2.3.sql
+
+-- Migration from 2.3 to 2.4: Add client_addr to activity sampling
+\i migrations/2.3_to_2.4.sql
 
 -- =============================================================================
 -- Post-upgrade verification
