@@ -395,6 +395,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
 | 2.4 | Client IP address tracking (`client_addr` in activity sampling) |
 | 2.3 | XID wraparound metrics (`datfrozenxid_age`, `relfrozenxid_age`) |
 | 2.2 | Configurable ring buffer slots (72-2880 range) |

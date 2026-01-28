@@ -88,7 +88,14 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
     connections_total           INTEGER,
     connections_max             INTEGER,
     db_size_bytes               BIGINT,
-    datfrozenxid_age            INTEGER
+    datfrozenxid_age            INTEGER,
+    archived_count              BIGINT,
+    last_archived_wal           TEXT,
+    last_archived_time          TIMESTAMPTZ,
+    failed_count                BIGINT,
+    last_failed_wal             TEXT,
+    last_failed_time            TIMESTAMPTZ,
+    archiver_stats_reset        TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
 
@@ -111,6 +118,27 @@ CREATE TABLE IF NOT EXISTS flight_recorder.replication_snapshots (
     replay_lag              INTERVAL,
     PRIMARY KEY (snapshot_id, pid)
 );
+
+-- Captures vacuum progress from pg_stat_progress_vacuum for each snapshot
+-- Tracks vacuum phase, blocks scanned/vacuumed, dead tuple counts
+-- Each record represents a single vacuum operation at a point in time
+CREATE TABLE IF NOT EXISTS flight_recorder.vacuum_progress_snapshots (
+    snapshot_id         INTEGER REFERENCES flight_recorder.snapshots(id) ON DELETE CASCADE,
+    pid                 INTEGER NOT NULL,
+    datid               OID,
+    datname             TEXT,
+    relid               OID,
+    relname             TEXT,
+    phase               TEXT,
+    heap_blks_total     BIGINT,
+    heap_blks_scanned   BIGINT,
+    heap_blks_vacuumed  BIGINT,
+    index_vacuum_count  BIGINT,
+    max_dead_tuples     BIGINT,
+    num_dead_tuples     BIGINT,
+    PRIMARY KEY (snapshot_id, pid)
+);
+COMMENT ON TABLE flight_recorder.vacuum_progress_snapshots IS 'Vacuum progress snapshots from pg_stat_progress_vacuum for monitoring long-running vacuums';
 
 -- Stores execution statistics for SQL statements at specific snapshot points
 -- Captures query performance metrics (timing, I/O, WAL activity) per query/user/database
@@ -171,6 +199,8 @@ CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.activity_samples_ring (
     state               TEXT,
     wait_event_type     TEXT,
     wait_event          TEXT,
+    backend_start       TIMESTAMPTZ,
+    xact_start          TIMESTAMPTZ,
     query_start         TIMESTAMPTZ,
     state_change        TIMESTAMPTZ,
     query_preview       TEXT,
@@ -295,6 +325,8 @@ CREATE TABLE IF NOT EXISTS flight_recorder.activity_samples_archive (
     state               TEXT,
     wait_event_type     TEXT,
     wait_event          TEXT,
+    backend_start       TIMESTAMPTZ,
+    xact_start          TIMESTAMPTZ,
     query_start         TIMESTAMPTZ,
     state_change        TIMESTAMPTZ,
     query_preview       TEXT
@@ -480,7 +512,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.4'),
+    ('schema_version', '2.5'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -1594,6 +1626,7 @@ BEGIN
     UPDATE flight_recorder.activity_samples_ring SET
         pid = NULL, usename = NULL, application_name = NULL, backend_type = NULL,
         state = NULL, wait_event_type = NULL, wait_event = NULL,
+        backend_start = NULL, xact_start = NULL,
         query_start = NULL, state_change = NULL, query_preview = NULL
     WHERE slot_id = v_slot_id;
     UPDATE flight_recorder.lock_samples_ring SET
@@ -1661,7 +1694,8 @@ BEGIN
         IF v_snapshot_based THEN
             INSERT INTO flight_recorder.activity_samples_ring (
                 slot_id, row_num, pid, usename, application_name, client_addr, backend_type,
-                state, wait_event_type, wait_event, query_start, state_change, query_preview
+                state, wait_event_type, wait_event, backend_start, xact_start,
+                query_start, state_change, query_preview
             )
             SELECT
                 v_slot_id,
@@ -1674,6 +1708,8 @@ BEGIN
                 state,
                 wait_event_type,
                 wait_event,
+                backend_start,
+                xact_start,
                 query_start,
                 state_change,
                 left(query, 200)
@@ -1689,13 +1725,16 @@ BEGIN
                 state = EXCLUDED.state,
                 wait_event_type = EXCLUDED.wait_event_type,
                 wait_event = EXCLUDED.wait_event,
+                backend_start = EXCLUDED.backend_start,
+                xact_start = EXCLUDED.xact_start,
                 query_start = EXCLUDED.query_start,
                 state_change = EXCLUDED.state_change,
                 query_preview = EXCLUDED.query_preview;
         ELSE
             INSERT INTO flight_recorder.activity_samples_ring (
                 slot_id, row_num, pid, usename, application_name, client_addr, backend_type,
-                state, wait_event_type, wait_event, query_start, state_change, query_preview
+                state, wait_event_type, wait_event, backend_start, xact_start,
+                query_start, state_change, query_preview
             )
             SELECT
                 v_slot_id,
@@ -1708,6 +1747,8 @@ BEGIN
                 state,
                 wait_event_type,
                 wait_event,
+                backend_start,
+                xact_start,
                 query_start,
                 state_change,
                 left(query, 200)
@@ -1723,6 +1764,8 @@ BEGIN
                 state = EXCLUDED.state,
                 wait_event_type = EXCLUDED.wait_event_type,
                 wait_event = EXCLUDED.wait_event,
+                backend_start = EXCLUDED.backend_start,
+                xact_start = EXCLUDED.xact_start,
                 query_start = EXCLUDED.query_start,
                 state_change = EXCLUDED.state_change,
                 query_preview = EXCLUDED.query_preview;
@@ -1993,7 +2036,8 @@ BEGIN
     IF v_archive_activity THEN
         INSERT INTO flight_recorder.activity_samples_archive (
             sample_id, captured_at, pid, usename, application_name, client_addr, backend_type,
-            state, wait_event_type, wait_event, query_start, state_change, query_preview
+            state, wait_event_type, wait_event, backend_start, xact_start,
+            query_start, state_change, query_preview
         )
         SELECT
             s.epoch_seconds AS sample_id,
@@ -2006,6 +2050,8 @@ BEGIN
             a.state,
             a.wait_event_type,
             a.wait_event,
+            a.backend_start,
+            a.xact_start,
             a.query_start,
             a.state_change,
             a.query_preview
@@ -2486,6 +2532,14 @@ DECLARE
     v_db_size_bytes BIGINT;
     v_capacity_enabled BOOLEAN;
     v_datfrozenxid_age INTEGER;
+    v_archived_count BIGINT;
+    v_last_archived_wal TEXT;
+    v_last_archived_time TIMESTAMPTZ;
+    v_failed_count BIGINT;
+    v_last_failed_wal TEXT;
+    v_last_failed_time TIMESTAMPTZ;
+    v_archiver_stats_reset TIMESTAMPTZ;
+    v_archive_mode TEXT;
 BEGIN
     v_should_skip := flight_recorder._check_circuit_breaker('snapshot');
     IF v_should_skip THEN
@@ -2681,6 +2735,33 @@ BEGIN
         v_datfrozenxid_age := NULL;
     END;
     END IF;
+    -- Collect archiver stats (conditional on archive_mode != 'off')
+    BEGIN
+        PERFORM flight_recorder._set_section_timeout();
+        v_archive_mode := current_setting('archive_mode', true);
+        IF v_archive_mode IS NOT NULL AND v_archive_mode != 'off' THEN
+            SELECT
+                archived_count,
+                last_archived_wal,
+                last_archived_time,
+                failed_count,
+                last_failed_wal,
+                last_failed_time,
+                stats_reset
+            INTO
+                v_archived_count,
+                v_last_archived_wal,
+                v_last_archived_time,
+                v_failed_count,
+                v_last_failed_wal,
+                v_last_failed_time,
+                v_archiver_stats_reset
+            FROM pg_stat_archiver;
+        END IF;
+        PERFORM flight_recorder._record_section_success(v_stat_id);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg-flight-recorder: Archiver stats collection failed: %', SQLERRM;
+    END;
     IF v_pg_version = 17 THEN
         INSERT INTO flight_recorder.snapshots (
             captured_at, pg_version,
@@ -2701,7 +2782,9 @@ BEGIN
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
             connections_active, connections_total, connections_max,
-            db_size_bytes, datfrozenxid_age
+            db_size_bytes, datfrozenxid_age,
+            archived_count, last_archived_wal, last_archived_time,
+            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2723,7 +2806,9 @@ BEGIN
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
             v_connections_active, v_connections_total, v_connections_max,
-            v_db_size_bytes, v_datfrozenxid_age
+            v_db_size_bytes, v_datfrozenxid_age,
+            v_archived_count, v_last_archived_wal, v_last_archived_time,
+            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_checkpointer c
         CROSS JOIN pg_stat_bgwriter b
@@ -2748,7 +2833,9 @@ BEGIN
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
             connections_active, connections_total, connections_max,
-            db_size_bytes, datfrozenxid_age
+            db_size_bytes, datfrozenxid_age,
+            archived_count, last_archived_wal, last_archived_time,
+            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2770,7 +2857,9 @@ BEGIN
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
             v_connections_active, v_connections_total, v_connections_max,
-            v_db_size_bytes, v_datfrozenxid_age
+            v_db_size_bytes, v_datfrozenxid_age,
+            v_archived_count, v_last_archived_wal, v_last_archived_time,
+            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -2786,7 +2875,9 @@ BEGIN
             temp_files, temp_bytes,
             xact_commit, xact_rollback, blks_read, blks_hit,
             connections_active, connections_total, connections_max,
-            db_size_bytes, datfrozenxid_age
+            db_size_bytes, datfrozenxid_age,
+            archived_count, last_archived_wal, last_archived_time,
+            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2800,7 +2891,9 @@ BEGIN
             v_temp_files, v_temp_bytes,
             v_xact_commit, v_xact_rollback, v_blks_read, v_blks_hit,
             v_connections_active, v_connections_total, v_connections_max,
-            v_db_size_bytes, v_datfrozenxid_age
+            v_db_size_bytes, v_datfrozenxid_age,
+            v_archived_count, v_last_archived_wal, v_last_archived_time,
+            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -2966,6 +3059,62 @@ BEGIN
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Database/role config collection failed: %', SQLERRM;
+    END;
+    -- Collect vacuum progress
+    -- Note: In PG17, max_dead_tuples was renamed to max_dead_tuple_bytes
+    --       and num_dead_tuples was renamed to num_dead_item_ids
+    BEGIN
+        PERFORM flight_recorder._set_section_timeout();
+        IF v_pg_version >= 17 THEN
+            INSERT INTO flight_recorder.vacuum_progress_snapshots (
+                snapshot_id, pid, datid, datname, relid, relname, phase,
+                heap_blks_total, heap_blks_scanned, heap_blks_vacuumed,
+                index_vacuum_count, max_dead_tuples, num_dead_tuples
+            )
+            SELECT
+                v_snapshot_id,
+                p.pid,
+                p.datid,
+                d.datname,
+                p.relid,
+                c.relname,
+                p.phase,
+                p.heap_blks_total,
+                p.heap_blks_scanned,
+                p.heap_blks_vacuumed,
+                p.index_vacuum_count,
+                p.max_dead_tuple_bytes,  -- Renamed in PG17
+                p.num_dead_item_ids      -- Renamed in PG17
+            FROM pg_stat_progress_vacuum p
+            LEFT JOIN pg_database d ON d.oid = p.datid
+            LEFT JOIN pg_class c ON c.oid = p.relid;
+        ELSE
+            INSERT INTO flight_recorder.vacuum_progress_snapshots (
+                snapshot_id, pid, datid, datname, relid, relname, phase,
+                heap_blks_total, heap_blks_scanned, heap_blks_vacuumed,
+                index_vacuum_count, max_dead_tuples, num_dead_tuples
+            )
+            SELECT
+                v_snapshot_id,
+                p.pid,
+                p.datid,
+                d.datname,
+                p.relid,
+                c.relname,
+                p.phase,
+                p.heap_blks_total,
+                p.heap_blks_scanned,
+                p.heap_blks_vacuumed,
+                p.index_vacuum_count,
+                p.max_dead_tuples,
+                p.num_dead_tuples
+            FROM pg_stat_progress_vacuum p
+            LEFT JOIN pg_database d ON d.oid = p.datid
+            LEFT JOIN pg_class c ON c.oid = p.relid;
+        END IF;
+        PERFORM flight_recorder._record_section_success(v_stat_id);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg-flight-recorder: Vacuum progress collection failed: %', SQLERRM;
     END;
     PERFORM flight_recorder._record_collection_end(v_stat_id, true, NULL);
     PERFORM set_config('statement_timeout', '0', true);
@@ -3157,7 +3306,11 @@ SELECT
     a.state,
     a.wait_event_type,
     a.wait_event,
+    a.backend_start,
+    a.xact_start,
     a.query_start,
+    sr.captured_at - a.backend_start AS session_age,
+    sr.captured_at - a.xact_start AS xact_age,
     sr.captured_at - a.query_start AS running_for,
     a.query_preview
 FROM flight_recorder.samples_ring sr
@@ -3326,6 +3479,58 @@ FROM flight_recorder.snapshots sn
 JOIN flight_recorder.replication_snapshots r ON r.snapshot_id = sn.id
 WHERE sn.captured_at > now() - interval '2 hours'
 ORDER BY sn.captured_at DESC, r.application_name;
+
+-- Shows vacuum progress from recent snapshots with percentage calculations
+CREATE OR REPLACE VIEW flight_recorder.recent_vacuum_progress AS
+SELECT
+    sn.captured_at,
+    v.pid,
+    v.datname,
+    v.relname,
+    v.phase,
+    v.heap_blks_total,
+    v.heap_blks_scanned,
+    v.heap_blks_vacuumed,
+    CASE WHEN v.heap_blks_total > 0
+        THEN round(100.0 * v.heap_blks_scanned / v.heap_blks_total, 1)
+        ELSE NULL
+    END AS pct_scanned,
+    CASE WHEN v.heap_blks_total > 0
+        THEN round(100.0 * v.heap_blks_vacuumed / v.heap_blks_total, 1)
+        ELSE NULL
+    END AS pct_vacuumed,
+    v.index_vacuum_count,
+    v.max_dead_tuples,
+    v.num_dead_tuples
+FROM flight_recorder.snapshots sn
+JOIN flight_recorder.vacuum_progress_snapshots v ON v.snapshot_id = sn.id
+WHERE sn.captured_at > now() - interval '2 hours'
+ORDER BY sn.captured_at DESC, v.pid;
+COMMENT ON VIEW flight_recorder.recent_vacuum_progress IS 'Recent vacuum progress with percentage scanned/vacuumed calculations';
+
+-- Shows archiver status with delta calculations between snapshots
+CREATE OR REPLACE VIEW flight_recorder.archiver_status AS
+SELECT
+    s.id AS snapshot_id,
+    s.captured_at,
+    s.archived_count,
+    s.last_archived_wal,
+    s.last_archived_time,
+    s.failed_count,
+    s.last_failed_wal,
+    s.last_failed_time,
+    s.archiver_stats_reset,
+    s.archived_count - prev.archived_count AS archived_delta,
+    s.failed_count - prev.failed_count AS failed_delta
+FROM flight_recorder.snapshots s
+JOIN flight_recorder.snapshots prev ON prev.id = (
+    SELECT MAX(id) FROM flight_recorder.snapshots WHERE id < s.id
+)
+WHERE s.captured_at > now() - interval '24 hours'
+  AND s.archived_count IS NOT NULL
+ORDER BY s.captured_at DESC;
+COMMENT ON VIEW flight_recorder.archiver_status IS 'WAL archiver status with delta calculations between snapshots';
+
 -- Summarizes wait events within a time range, grouped by backend type and wait event
 -- Returns statistics including sample count, total/avg/max waiters, and percentage of samples
 CREATE OR REPLACE FUNCTION flight_recorder.wait_summary(
