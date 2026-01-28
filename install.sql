@@ -5862,6 +5862,142 @@ BEGIN
     END IF;
 
     -- ==========================================================================
+    -- Long-Running Transactions Section
+    -- ==========================================================================
+    v_result := v_result || '## Long-Running Transactions' || E'\n\n';
+
+    SELECT count(*) INTO v_count
+    FROM flight_recorder.activity_samples_archive
+    WHERE captured_at BETWEEN p_start_time AND p_end_time
+      AND xact_start IS NOT NULL
+      AND captured_at - xact_start > interval '5 minutes';
+
+    IF v_count = 0 THEN
+        v_result := v_result || '(no long-running transactions detected)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Time | PID | User | App | Transaction Age | State | Query Preview |' || E'\n';
+        v_result := v_result || '|------|-----|------|-----|-----------------|-------|---------------|' || E'\n';
+        FOR v_row IN
+            SELECT DISTINCT ON (pid, xact_start)
+                captured_at,
+                pid,
+                usename,
+                application_name,
+                captured_at - xact_start AS xact_age,
+                state,
+                query_preview
+            FROM flight_recorder.activity_samples_archive
+            WHERE captured_at BETWEEN p_start_time AND p_end_time
+              AND xact_start IS NOT NULL
+              AND captured_at - xact_start > interval '5 minutes'
+            ORDER BY pid, xact_start, captured_at DESC
+            LIMIT 25
+        LOOP
+            v_result := v_result || '| ' ||
+                to_char(v_row.captured_at, 'HH24:MI:SS') || ' | ' ||
+                COALESCE(v_row.pid::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.usename, '-') || ' | ' ||
+                COALESCE(left(v_row.application_name, 15), '-') || ' | ' ||
+                COALESCE(v_row.xact_age::TEXT, '-') || ' | ' ||
+                COALESCE(v_row.state, '-') || ' | ' ||
+                COALESCE(left(v_row.query_preview, 30), '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Vacuum Progress Section
+    -- ==========================================================================
+    v_result := v_result || '## Vacuum Progress' || E'\n\n';
+
+    SELECT count(*) INTO v_count
+    FROM flight_recorder.vacuum_progress_snapshots v
+    JOIN flight_recorder.snapshots s ON s.id = v.snapshot_id
+    WHERE s.captured_at BETWEEN p_start_time AND p_end_time;
+
+    IF v_count = 0 THEN
+        v_result := v_result || '(no vacuums captured during this period)' || E'\n\n';
+    ELSE
+        v_result := v_result || '| Time | Database | Table | Phase | % Scanned | % Vacuumed | Dead Tuples |' || E'\n';
+        v_result := v_result || '|------|----------|-------|-------|-----------|------------|-------------|' || E'\n';
+        FOR v_row IN
+            SELECT
+                s.captured_at,
+                v.datname,
+                v.relname,
+                v.phase,
+                CASE WHEN v.heap_blks_total > 0
+                    THEN round(100.0 * v.heap_blks_scanned / v.heap_blks_total, 1)
+                    ELSE NULL
+                END AS pct_scanned,
+                CASE WHEN v.heap_blks_total > 0
+                    THEN round(100.0 * v.heap_blks_vacuumed / v.heap_blks_total, 1)
+                    ELSE NULL
+                END AS pct_vacuumed,
+                v.num_dead_tuples
+            FROM flight_recorder.vacuum_progress_snapshots v
+            JOIN flight_recorder.snapshots s ON s.id = v.snapshot_id
+            WHERE s.captured_at BETWEEN p_start_time AND p_end_time
+            ORDER BY s.captured_at DESC
+            LIMIT 25
+        LOOP
+            v_result := v_result || '| ' ||
+                to_char(v_row.captured_at, 'HH24:MI:SS') || ' | ' ||
+                COALESCE(v_row.datname, '-') || ' | ' ||
+                COALESCE(v_row.relname, '-') || ' | ' ||
+                COALESCE(v_row.phase, '-') || ' | ' ||
+                COALESCE(v_row.pct_scanned::TEXT || '%', '-') || ' | ' ||
+                COALESCE(v_row.pct_vacuumed::TEXT || '%', '-') || ' | ' ||
+                COALESCE(v_row.num_dead_tuples::TEXT, '-') || ' |' || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Archiver Status Section
+    -- ==========================================================================
+    v_result := v_result || '## WAL Archiver Status' || E'\n\n';
+
+    SELECT count(*) INTO v_count
+    FROM flight_recorder.snapshots
+    WHERE captured_at BETWEEN p_start_time AND p_end_time
+      AND archived_count IS NOT NULL;
+
+    IF v_count = 0 THEN
+        v_result := v_result || '(archiving not enabled or no data in range)' || E'\n\n';
+    ELSE
+        -- Show summary: total archived, total failed, any failures
+        FOR v_row IN
+            SELECT
+                min(archived_count) AS start_archived,
+                max(archived_count) AS end_archived,
+                max(archived_count) - min(archived_count) AS archived_delta,
+                min(failed_count) AS start_failed,
+                max(failed_count) AS end_failed,
+                max(failed_count) - min(failed_count) AS failed_delta,
+                max(last_failed_wal) AS last_failed_wal,
+                max(last_failed_time) AS last_failed_time
+            FROM flight_recorder.snapshots
+            WHERE captured_at BETWEEN p_start_time AND p_end_time
+              AND archived_count IS NOT NULL
+        LOOP
+            v_result := v_result || '| Metric | Value |' || E'\n';
+            v_result := v_result || '|--------|-------|' || E'\n';
+            v_result := v_result || '| WAL Files Archived | ' ||
+                COALESCE(v_row.archived_delta::TEXT, '0') || ' |' || E'\n';
+            v_result := v_result || '| Archive Failures | ' ||
+                COALESCE(v_row.failed_delta::TEXT, '0') || ' |' || E'\n';
+            IF v_row.failed_delta > 0 AND v_row.last_failed_wal IS NOT NULL THEN
+                v_result := v_result || '| Last Failed WAL | ' ||
+                    v_row.last_failed_wal || ' |' || E'\n';
+                v_result := v_result || '| Last Failure Time | ' ||
+                    to_char(v_row.last_failed_time, 'YYYY-MM-DD HH24:MI:SS') || ' |' || E'\n';
+            END IF;
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
     -- Configuration Changes Section
     -- ==========================================================================
     v_result := v_result || '## Configuration Changes' || E'\n\n';
