@@ -236,6 +236,21 @@ When `archive_mode` is enabled, snapshots capture archiver metrics from `pg_stat
 
 Query via: `archiver_status` view for delta calculations between snapshots. Null when `archive_mode = off`.
 
+**Database Conflicts (Standby Servers)**
+
+On standby servers, snapshots capture query cancellation metrics from `pg_stat_database_conflicts`:
+
+| Column | Purpose |
+|--------|---------|
+| `confl_tablespace` | Queries cancelled due to dropped tablespaces |
+| `confl_lock` | Queries cancelled due to lock timeouts |
+| `confl_snapshot` | Queries cancelled due to old snapshots |
+| `confl_bufferpin` | Queries cancelled due to pinned buffers |
+| `confl_deadlock` | Queries cancelled due to deadlocks |
+| `confl_active_logicalslot` | Queries cancelled due to logical replication slots (PG16+) |
+
+These columns are NULL on primary servers (conflicts only occur on standbys during recovery). Use to diagnose replica query cancellations.
+
 **Top-N Rankings** — Periodic capture of top queries by various metrics.
 
 | Table | Purpose |
@@ -436,6 +451,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
 | 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
 | 2.4 | Client IP address tracking (`client_addr` in activity sampling) |
 | 2.3 | XID wraparound metrics (`datfrozenxid_age`, `relfrozenxid_age`) |
@@ -744,6 +760,7 @@ SELECT flight_recorder.report('1 hour');
 | `recent_waits` | Wait events (10-hour window, covers all modes) |
 | `recent_activity` | Active sessions with session/transaction age (10-hour window) |
 | `recent_locks` | Lock contention (10-hour window) |
+| `recent_idle_in_transaction` | Sessions idle in transaction, ordered by duration (10-hour window) |
 | `recent_replication` | Replication lag (2 hours, from snapshots) |
 | `recent_vacuum_progress` | Vacuum progress with % scanned/vacuumed (2 hours) |
 | `archiver_status` | WAL archiver metrics with delta calculations (24 hours) |
@@ -1478,6 +1495,11 @@ SELECT * FROM flight_recorder.compare('...', '...');
 | `LOCK_CONTENTION` | Sessions blocked on locks | Review blocking queries, add indexes |
 | `XID_WRAPAROUND_RISK` | Database XID age approaching limit | Run VACUUM FREEZE, tune autovacuum |
 | `TABLE_XID_WRAPAROUND_RISK` | Table XID age approaching limit | Run VACUUM FREEZE on specific table |
+| `IDLE_IN_TRANSACTION` | Session idle in transaction >5 min | Terminate stale sessions, blocks vacuum |
+| `DEAD_TUPLE_ACCUMULATION` | Table has >10% dead tuples | Run VACUUM, check autovacuum settings |
+| `VACUUM_STARVATION` | Dead tuples growing, no vacuum in 24h | Tune autovacuum thresholds |
+| `CONNECTION_LEAK` | Session open >7 days | Investigate leak, use connection pooling |
+| `REPLICATION_LAG_GROWING` | Replica lag trending upward | Check replica capacity, network, queries |
 
 ### XID Wraparound Detection
 
@@ -1522,6 +1544,75 @@ SELECT * FROM flight_recorder.anomaly_report(
     '2024-01-15 11:00'
 );
 ```
+
+### Idle-in-Transaction Detection
+
+Detects sessions that have been idle in a transaction for too long. These sessions block autovacuum, hold locks, and can cause replication lag on replicas.
+
+**Thresholds:**
+
+| Severity | Threshold |
+|----------|-----------|
+| `medium` | 5-15 minutes idle in transaction |
+| `high` | 15-60 minutes idle in transaction |
+| `critical` | >60 minutes idle in transaction |
+
+**Quick visibility:**
+
+```sql
+SELECT * FROM flight_recorder.recent_idle_in_transaction;
+```
+
+### Dead Tuple Accumulation Detection
+
+Detects tables with high dead tuple ratios that indicate bloat risk.
+
+**Thresholds:**
+
+| Condition | Severity |
+|-----------|----------|
+| >10% dead tuples AND >10,000 dead rows | `medium` |
+| >30% dead tuples | `high` |
+
+### Vacuum Starvation Detection
+
+Detects tables where dead tuples are accumulating but autovacuum hasn't run recently.
+
+**Conditions for alert:**
+
+- Dead tuples grew by >1,000 since last snapshot
+- No autovacuum in past 24 hours
+
+**Severity:** Always `high`
+
+### Connection Leak Detection
+
+Detects sessions that have been open for an unusually long time, which may indicate connection leaks.
+
+**Thresholds:**
+
+| Severity | Threshold |
+|----------|-----------|
+| `medium` | Session open 7-30 days |
+| `high` | Session open >30 days |
+
+### Replication Lag Velocity Detection
+
+Detects when replica lag is trending upward (lag is growing over time).
+
+**Conditions for alert:**
+
+- Lag grew by >60 seconds during the time window
+- Current lag is >30 seconds
+- At least 3 samples in the window
+
+**Thresholds:**
+
+| Severity | Current Lag |
+|----------|-------------|
+| `medium` | 30-60 seconds |
+| `high` | 60-300 seconds |
+| `critical` | >300 seconds |
 
 ## Testing and Benchmarking
 

@@ -95,7 +95,13 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
     failed_count                BIGINT,
     last_failed_wal             TEXT,
     last_failed_time            TIMESTAMPTZ,
-    archiver_stats_reset        TIMESTAMPTZ
+    archiver_stats_reset        TIMESTAMPTZ,
+    confl_tablespace            BIGINT,
+    confl_lock                  BIGINT,
+    confl_snapshot              BIGINT,
+    confl_bufferpin             BIGINT,
+    confl_deadlock              BIGINT,
+    confl_active_logicalslot    BIGINT
 );
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
 
@@ -2540,6 +2546,13 @@ DECLARE
     v_last_failed_time TIMESTAMPTZ;
     v_archiver_stats_reset TIMESTAMPTZ;
     v_archive_mode TEXT;
+    v_confl_tablespace BIGINT;
+    v_confl_lock BIGINT;
+    v_confl_snapshot BIGINT;
+    v_confl_bufferpin BIGINT;
+    v_confl_deadlock BIGINT;
+    v_confl_active_logicalslot BIGINT;
+    v_is_standby BOOLEAN;
 BEGIN
     v_should_skip := flight_recorder._check_circuit_breaker('snapshot');
     IF v_should_skip THEN
@@ -2762,6 +2775,49 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Archiver stats collection failed: %', SQLERRM;
     END;
+    -- Collect database conflict stats (only populated on standby servers)
+    BEGIN
+        PERFORM flight_recorder._set_section_timeout();
+        v_is_standby := pg_is_in_recovery();
+        IF v_is_standby THEN
+            IF v_pg_version >= 16 THEN
+                SELECT
+                    confl_tablespace,
+                    confl_lock,
+                    confl_snapshot,
+                    confl_bufferpin,
+                    confl_deadlock,
+                    confl_active_logicalslot
+                INTO
+                    v_confl_tablespace,
+                    v_confl_lock,
+                    v_confl_snapshot,
+                    v_confl_bufferpin,
+                    v_confl_deadlock,
+                    v_confl_active_logicalslot
+                FROM pg_stat_database_conflicts
+                WHERE datname = current_database();
+            ELSE
+                SELECT
+                    confl_tablespace,
+                    confl_lock,
+                    confl_snapshot,
+                    confl_bufferpin,
+                    confl_deadlock
+                INTO
+                    v_confl_tablespace,
+                    v_confl_lock,
+                    v_confl_snapshot,
+                    v_confl_bufferpin,
+                    v_confl_deadlock
+                FROM pg_stat_database_conflicts
+                WHERE datname = current_database();
+            END IF;
+        END IF;
+        PERFORM flight_recorder._record_section_success(v_stat_id);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg-flight-recorder: Database conflict stats collection failed: %', SQLERRM;
+    END;
     IF v_pg_version = 17 THEN
         INSERT INTO flight_recorder.snapshots (
             captured_at, pg_version,
@@ -2784,7 +2840,8 @@ BEGIN
             connections_active, connections_total, connections_max,
             db_size_bytes, datfrozenxid_age,
             archived_count, last_archived_wal, last_archived_time,
-            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset
+            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset,
+            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2808,7 +2865,8 @@ BEGIN
             v_connections_active, v_connections_total, v_connections_max,
             v_db_size_bytes, v_datfrozenxid_age,
             v_archived_count, v_last_archived_wal, v_last_archived_time,
-            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset
+            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset,
+            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock, v_confl_active_logicalslot
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_checkpointer c
         CROSS JOIN pg_stat_bgwriter b
@@ -2835,7 +2893,8 @@ BEGIN
             connections_active, connections_total, connections_max,
             db_size_bytes, datfrozenxid_age,
             archived_count, last_archived_wal, last_archived_time,
-            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset
+            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset,
+            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2859,7 +2918,8 @@ BEGIN
             v_connections_active, v_connections_total, v_connections_max,
             v_db_size_bytes, v_datfrozenxid_age,
             v_archived_count, v_last_archived_wal, v_last_archived_time,
-            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset
+            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset,
+            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock, v_confl_active_logicalslot
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -2877,7 +2937,8 @@ BEGIN
             connections_active, connections_total, connections_max,
             db_size_bytes, datfrozenxid_age,
             archived_count, last_archived_wal, last_archived_time,
-            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset
+            failed_count, last_failed_wal, last_failed_time, archiver_stats_reset,
+            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2893,7 +2954,8 @@ BEGIN
             v_connections_active, v_connections_total, v_connections_max,
             v_db_size_bytes, v_datfrozenxid_age,
             v_archived_count, v_last_archived_wal, v_last_archived_time,
-            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset
+            v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset,
+            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -3337,6 +3399,29 @@ JOIN flight_recorder.lock_samples_ring l ON l.slot_id = sr.slot_id
 WHERE sr.captured_at > now() - interval '10 hours'
   AND l.blocked_pid IS NOT NULL
 ORDER BY sr.captured_at DESC, l.blocked_duration DESC;
+
+-- Shows sessions currently idle in transaction, ordered by how long they have been idle
+-- Used for quick visibility into problem sessions that may be blocking vacuum or holding locks
+CREATE OR REPLACE VIEW flight_recorder.recent_idle_in_transaction AS
+SELECT
+    sr.captured_at,
+    a.pid,
+    a.usename,
+    a.application_name,
+    a.client_addr,
+    a.xact_start,
+    sr.captured_at - a.xact_start AS idle_duration,
+    a.query_preview
+FROM flight_recorder.samples_ring sr
+JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
+WHERE sr.captured_at > now() - interval '10 hours'
+  AND a.pid IS NOT NULL
+  AND a.state = 'idle in transaction'
+ORDER BY a.xact_start ASC NULLS LAST;
+
+COMMENT ON VIEW flight_recorder.recent_idle_in_transaction IS
+'Sessions currently idle in transaction, ordered by how long they have been idle';
+
 -- Retrieves recent wait event samples from the flight recorder ring buffer
 -- Filters by configured retention interval and orders by capture time and occurrence count
 CREATE OR REPLACE FUNCTION flight_recorder.recent_waits_current()
@@ -3825,6 +3910,7 @@ DECLARE
     v_freeze_max_age BIGINT;
     v_warning_threshold BIGINT;
     v_critical_threshold BIGINT;
+    v_row RECORD;
 BEGIN
     -- Get autovacuum_freeze_max_age for XID wraparound thresholds
     SELECT setting::bigint INTO v_freeze_max_age
@@ -3988,6 +4074,144 @@ BEGIN
             RETURN NEXT;
         END IF;
     END LOOP;
+
+    -- Idle-in-transaction detection
+    FOR v_row IN
+        SELECT pid, usename, application_name,
+               EXTRACT(EPOCH FROM (now() - xact_start))/60 AS idle_minutes
+        FROM flight_recorder.activity_samples_archive
+        WHERE captured_at BETWEEN p_start_time AND p_end_time
+          AND state = 'idle in transaction'
+          AND xact_start IS NOT NULL
+          AND now() - xact_start > interval '5 minutes'
+        ORDER BY xact_start ASC
+        LIMIT 5
+    LOOP
+        anomaly_type := 'IDLE_IN_TRANSACTION';
+        severity := CASE WHEN v_row.idle_minutes > 60 THEN 'critical'
+             WHEN v_row.idle_minutes > 15 THEN 'high'
+             ELSE 'medium' END;
+        description := format('Session %s (%s) idle in transaction for %s minutes',
+               v_row.pid, v_row.usename, round(v_row.idle_minutes::numeric));
+        metric_value := format('PID %s, %s minutes', v_row.pid, round(v_row.idle_minutes::numeric));
+        threshold := '>5 minutes idle in transaction';
+        recommendation := 'Investigate and terminate if stale. Blocks vacuum and holds locks.';
+        RETURN NEXT;
+    END LOOP;
+
+    -- Dead tuple accumulation (bloat risk)
+    FOR v_row IN
+        SELECT ts.schemaname, ts.relname, ts.n_dead_tup, ts.n_live_tup,
+               round(100.0 * ts.n_dead_tup / NULLIF(ts.n_dead_tup + ts.n_live_tup, 0), 1) AS dead_pct
+        FROM flight_recorder.table_snapshots ts
+        JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+        WHERE s.captured_at = (SELECT MAX(s2.captured_at) FROM flight_recorder.snapshots s2
+                               JOIN flight_recorder.table_snapshots ts2 ON ts2.snapshot_id = s2.id
+                               WHERE s2.captured_at <= p_end_time)
+          AND ts.n_dead_tup > 10000
+          AND ts.n_dead_tup::float / NULLIF(ts.n_dead_tup + ts.n_live_tup, 0) > 0.1
+        ORDER BY ts.n_dead_tup DESC
+        LIMIT 5
+    LOOP
+        anomaly_type := 'DEAD_TUPLE_ACCUMULATION';
+        severity := CASE WHEN v_row.dead_pct > 30 THEN 'high'
+             ELSE 'medium' END;
+        description := format('Table %s.%s has %s%% dead tuples (%s dead)',
+               v_row.schemaname, v_row.relname, v_row.dead_pct, v_row.n_dead_tup);
+        metric_value := format('%s%% dead tuples', v_row.dead_pct);
+        threshold := '>10% dead tuples and >10000 dead rows';
+        recommendation := 'Run VACUUM on this table. Check autovacuum settings.';
+        RETURN NEXT;
+    END LOOP;
+
+    -- Vacuum starvation (dead tuples growing, vacuum not running)
+    FOR v_row IN
+        WITH recent AS (
+            SELECT ts.schemaname, ts.relname, ts.n_dead_tup, ts.last_autovacuum,
+                   s.captured_at,
+                   LAG(ts.n_dead_tup) OVER (PARTITION BY ts.schemaname, ts.relname ORDER BY s.captured_at) AS prev_dead
+            FROM flight_recorder.table_snapshots ts
+            JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+            WHERE s.captured_at BETWEEN p_start_time AND p_end_time
+        )
+        SELECT schemaname, relname, n_dead_tup, last_autovacuum,
+               n_dead_tup - COALESCE(prev_dead, 0) AS dead_growth
+        FROM recent
+        WHERE captured_at = (SELECT MAX(captured_at) FROM recent)
+          AND n_dead_tup > prev_dead + 1000
+          AND (last_autovacuum IS NULL OR last_autovacuum < now() - interval '24 hours')
+        ORDER BY n_dead_tup - COALESCE(prev_dead, 0) DESC
+        LIMIT 3
+    LOOP
+        anomaly_type := 'VACUUM_STARVATION';
+        severity := 'high';
+        description := format('Table %s.%s: dead tuples growing (+%s) but no vacuum in 24h',
+               v_row.schemaname, v_row.relname, v_row.dead_growth);
+        metric_value := format('+%s dead tuples, last vacuum: %s', v_row.dead_growth,
+               COALESCE(v_row.last_autovacuum::TEXT, 'never'));
+        threshold := 'Dead tuples growing >1000 with no vacuum in 24h';
+        recommendation := 'Check autovacuum_vacuum_threshold and autovacuum_vacuum_scale_factor.';
+        RETURN NEXT;
+    END LOOP;
+
+    -- Connection leak detection (sessions open > 7 days)
+    FOR v_row IN
+        SELECT DISTINCT ON (pid) pid, usename, application_name, backend_start,
+               EXTRACT(DAY FROM (now() - backend_start)) AS days_open
+        FROM flight_recorder.activity_samples_archive
+        WHERE captured_at BETWEEN p_start_time AND p_end_time
+          AND backend_start IS NOT NULL
+          AND backend_start < now() - interval '7 days'
+        ORDER BY pid, backend_start
+        LIMIT 5
+    LOOP
+        anomaly_type := 'CONNECTION_LEAK';
+        severity := CASE WHEN v_row.days_open > 30 THEN 'high' ELSE 'medium' END;
+        description := format('Session %s (%s/%s) open for %s days',
+               v_row.pid, v_row.usename, v_row.application_name, round(v_row.days_open::numeric));
+        metric_value := format('%s days', round(v_row.days_open::numeric));
+        threshold := '>7 days session age';
+        recommendation := 'Investigate if this is a connection leak. Consider connection pooling.';
+        RETURN NEXT;
+    END LOOP;
+
+    -- Replication lag velocity (lag is growing)
+    FOR v_row IN
+        WITH lag_samples AS (
+            SELECT r.application_name,
+                   EXTRACT(EPOCH FROM r.replay_lag) AS lag_seconds,
+                   s.captured_at,
+                   ROW_NUMBER() OVER (PARTITION BY r.application_name ORDER BY s.captured_at) AS rn
+            FROM flight_recorder.replication_snapshots r
+            JOIN flight_recorder.snapshots s ON s.id = r.snapshot_id
+            WHERE s.captured_at BETWEEN p_start_time AND p_end_time
+              AND r.replay_lag IS NOT NULL
+        ),
+        lag_trend AS (
+            SELECT application_name,
+                   MAX(lag_seconds) - MIN(lag_seconds) AS lag_growth,
+                   MAX(lag_seconds) AS current_lag,
+                   COUNT(*) AS samples
+            FROM lag_samples
+            GROUP BY application_name
+            HAVING COUNT(*) >= 3
+        )
+        SELECT * FROM lag_trend
+        WHERE lag_growth > 60  -- Growing by more than 60 seconds
+          AND current_lag > 30 -- And currently > 30 seconds behind
+    LOOP
+        anomaly_type := 'REPLICATION_LAG_GROWING';
+        severity := CASE WHEN v_row.current_lag > 300 THEN 'critical'
+             WHEN v_row.current_lag > 60 THEN 'high'
+             ELSE 'medium' END;
+        description := format('Replica %s: lag growing (+%ss), now %ss behind',
+               v_row.application_name, round(v_row.lag_growth::numeric), round(v_row.current_lag::numeric));
+        metric_value := format('+%ss growth, %ss current', round(v_row.lag_growth::numeric), round(v_row.current_lag::numeric));
+        threshold := '>60s growth and >30s current lag';
+        recommendation := 'Check replica capacity, network, and long-running queries on primary.';
+        RETURN NEXT;
+    END LOOP;
+
     RETURN;
 END;
 $$;
