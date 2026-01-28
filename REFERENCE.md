@@ -143,10 +143,23 @@ Periodic preservation of ring buffer samples for forensic analysis. Captured eve
 | Table | Purpose |
 |-------|---------|
 | `wait_samples_archive` | Wait patterns with counts |
-| `activity_samples_archive` | PIDs, queries, session details |
+| `activity_samples_archive` | PIDs, queries, session details, session/transaction age |
 | `lock_samples_archive` | Complete blocking chains |
 
 Preserves details that aggregates lose: specific PIDs, exact timestamps, complete blocking chains. Query directly for forensic analysis ("what exactly was happening at 14:32:17?").
+
+**Session and Transaction Age Tracking**
+
+Activity samples include `backend_start` and `xact_start` timestamps from `pg_stat_activity`, enabling:
+
+- **Session age** (`session_age`): How long a connection has been open
+- **Transaction age** (`xact_age`): How long the current transaction has been running
+
+Use cases:
+
+- Identify long-running transactions causing bloat or replication lag
+- Detect connection leaks (very old sessions)
+- Find idle-in-transaction sessions holding locks
 
 **Aggregates (cold storage, summarized)**
 
@@ -180,7 +193,7 @@ Captures periodic snapshots of system state every 5 minutes. Unlike sampled acti
 
 | Table | Purpose |
 |-------|---------|
-| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O, XID age |
+| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O, XID age, archiver status |
 | `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat, XID age) |
 | `index_snapshots` | Per-index usage and size |
 
@@ -192,8 +205,36 @@ Query via: `compare(start, end)`, `deltas` view, `table_compare(start, end)`, `i
 |-------|---------|
 | `config_snapshots` | PostgreSQL configuration parameters |
 | `replication_snapshots` | pg_stat_replication, replication slots, lag |
+| `vacuum_progress_snapshots` | pg_stat_progress_vacuum for long-running vacuums |
 
 Query via: `config_at(timestamp)`, `config_changes(start, end)`.
+
+**Vacuum Progress Monitoring**
+
+Captures vacuum progress from `pg_stat_progress_vacuum` at each snapshot, tracking:
+
+- Vacuum phase (scanning heap, vacuuming indexes, etc.)
+- Blocks scanned and vacuumed (with percentage calculations)
+- Dead tuple counts
+- Index vacuum iterations
+
+Query via: `recent_vacuum_progress` view. Useful for monitoring long-running vacuums during incidents.
+
+**WAL Archiver Status**
+
+When `archive_mode` is enabled, snapshots capture archiver metrics from `pg_stat_archiver`:
+
+| Column | Purpose |
+|--------|---------|
+| `archived_count` | Total WAL files archived |
+| `last_archived_wal` | Name of last archived WAL |
+| `last_archived_time` | When last archive completed |
+| `failed_count` | Total archive failures |
+| `last_failed_wal` | Name of last failed WAL |
+| `last_failed_time` | When last failure occurred |
+| `archiver_stats_reset` | When archiver stats were reset |
+
+Query via: `archiver_status` view for delta calculations between snapshots. Null when `archive_mode = off`.
 
 **Top-N Rankings** — Periodic capture of top queries by various metrics.
 
@@ -672,6 +713,9 @@ The `report(interval)` and `report(start, end)` functions return a diagnostic re
 | Index Efficiency | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
 | Statement Performance | `statement_compare()` | Query performance changes (requires pg_stat_statements) |
 | Lock Contention | `lock_samples_archive` | Lock blocking events |
+| Long-Running Transactions | `activity_samples_archive` | Transactions running >5 minutes with session/xact age |
+| Vacuum Progress | `vacuum_progress_snapshots` | Vacuum phases, completion percentages, dead tuples |
+| WAL Archiver Status | Snapshots table | Archive counts and failures during window |
 | Configuration Changes | `config_changes()` | PostgreSQL parameter changes during window |
 | Role Configuration Changes | `db_role_config_changes()` | Database/role override changes during window |
 
@@ -698,9 +742,11 @@ SELECT flight_recorder.report('1 hour');
 | View | Purpose |
 |------|---------|
 | `recent_waits` | Wait events (10-hour window, covers all modes) |
-| `recent_activity` | Active sessions (10-hour window) |
+| `recent_activity` | Active sessions with session/transaction age (10-hour window) |
 | `recent_locks` | Lock contention (10-hour window) |
 | `recent_replication` | Replication lag (2 hours, from snapshots) |
+| `recent_vacuum_progress` | Vacuum progress with % scanned/vacuumed (2 hours) |
+| `archiver_status` | WAL archiver metrics with delta calculations (24 hours) |
 | `deltas` | Snapshot-over-snapshot changes |
 | `capacity_dashboard` | Resource utilization and headroom |
 
