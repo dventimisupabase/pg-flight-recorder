@@ -100,6 +100,7 @@ All 20 samples checked: **0ms duration** (OK, well under 50% of interval thresho
 **Analysis:** This table has only 120 rows (smallest ring buffer) and sees frequent updates. The high free space % (52%) indicates autovacuum is running but HOT updates are leaving some dead tuples.
 
 **Recommendation:** Monitor over longer period. If this becomes problematic, consider:
+
 - Lowering autovacuum_vacuum_threshold for this table
 - Checking fillfactor setting
 

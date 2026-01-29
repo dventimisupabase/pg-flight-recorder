@@ -22,6 +22,7 @@ NC='\033[0m'
 log() { echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*"; }
 info() { echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*"; }
 warn() { echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*"; }
+error() { echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR:${NC} $*"; }
 
 check_prerequisites() {
     log "Checking prerequisites..."
@@ -199,10 +200,6 @@ generate_report() {
     local duration_file="$4"
 
     log "Generating bloat report..."
-
-    # Calculate summary stats
-    local ring_tables
-    ring_tables=$(grep '_ring' "${bloat_file}" | tail -4 || true)
 
     cat > "${RESULTS_DIR}/bloat_report.md" <<EOF
 # Bloat Benchmark Results

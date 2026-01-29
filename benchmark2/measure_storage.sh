@@ -115,7 +115,7 @@ compute_projections() {
     # Read row sizes and compute projections
     {
         echo "table_name,avg_row_bytes,samples_per_day,heap_mb_per_day,total_mb_per_day"
-        while IFS=',' read -r table_name row_count avg_row_bytes heap_bytes index_bytes; do
+        while IFS=',' read -r table_name _row_count avg_row_bytes _heap_bytes _index_bytes; do
             if [[ -z "${avg_row_bytes}" ]] || [[ "${avg_row_bytes}" == "0" ]]; then
                 continue
             fi
