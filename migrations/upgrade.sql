@@ -11,7 +11,7 @@
 DO $$
 DECLARE
     v_current_version TEXT;
-    v_target_version TEXT := '2.0';  -- Update this when adding migrations
+    v_target_version TEXT := '2.7';  -- Update this when adding migrations
 BEGIN
     -- Check if flight_recorder schema exists
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recorder') THEN
@@ -66,9 +66,26 @@ END $$;
 -- \i migrations/1.1_to_2.0.sql
 -- =============================================================================
 
--- Currently no migrations needed (fresh 2.0 installations)
--- When you need to migrate from 2.0 to 2.1, add:
--- \i migrations/2.0_to_2.1.sql
+-- Migration from 2.0 to 2.1: Add I/O read timing columns
+\i migrations/2.0_to_2.1.sql
+
+-- Migration from 2.1 to 2.2: Add configurable ring buffer slots
+\i migrations/2.1_to_2.2.sql
+
+-- Migration from 2.2 to 2.3: Add XID wraparound metrics
+\i migrations/2.2_to_2.3.sql
+
+-- Migration from 2.3 to 2.4: Add client_addr to activity sampling
+\i migrations/2.3_to_2.4.sql
+
+-- Migration from 2.4 to 2.5: Targeted statistics enhancements
+\i migrations/2.4_to_2.5.sql
+
+-- Migration from 2.5 to 2.6: Low-hanging fruit anomaly detection enhancements
+\i migrations/2.5_to_2.6.sql
+
+-- Migration from 2.6 to 2.7: Autovacuum observer enhancements
+\i migrations/2.6_to_2.7.sql
 
 -- =============================================================================
 -- Post-upgrade verification
