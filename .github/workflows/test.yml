@@ -24,54 +24,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build PostgreSQL ${{ matrix.pg_version }} image with pg_cron
+      - name: Run tests on PostgreSQL ${{ matrix.pg_version }}
         run: |
-          PG_VERSION=${{ matrix.pg_version }} docker compose build
-
-      - name: Start PostgreSQL ${{ matrix.pg_version }} with pg_cron
-        run: |
-          PG_VERSION=${{ matrix.pg_version }} docker compose up -d
-
-      - name: Wait for PostgreSQL to be ready
-        run: |
-          for i in {1..30}; do
-            if docker compose exec -T postgres pg_isready -U postgres > /dev/null 2>&1; then
-              echo "PostgreSQL is ready"
-              break
-            fi
-            echo "Waiting for PostgreSQL... ($i/30)"
-            sleep 1
-          done
-
-      - name: Install pg_cron extension
-        run: |
-          docker compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_cron;"
-
-      - name: Install pg-flight-recorder
-        run: |
-          docker compose exec -T postgres psql -U postgres -d postgres -f /install.sql
-
-      - name: Install pgTAP extension
-        run: |
-          docker compose exec -T postgres psql -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
-
-      - name: Disable scheduled jobs for testing
-        run: |
-          docker compose exec -T postgres psql -U postgres -d postgres -c "SELECT flight_recorder.disable();"
-
-      - name: Run pgTAP tests (462 tests)
-        run: |
-          docker compose exec -T postgres sh -c 'pg_prove --timer -U postgres -d postgres /tests/*.sql'
-
-      - name: Show PostgreSQL logs on failure
-        if: failure()
-        run: |
-          docker compose logs postgres
-
-      - name: Clean up
-        if: always()
-        run: |
-          docker compose down -v
+          ./test.sh ${{ matrix.pg_version }}
 
   test-summary:
     name: Test Summary

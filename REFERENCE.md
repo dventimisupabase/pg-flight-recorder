@@ -35,7 +35,6 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
 - [Testing and Benchmarking](#testing-and-benchmarking)
-- [Project Structure](#project-structure)
 
 ---
 
@@ -45,7 +44,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 ### Purpose and Scope
 
-pg-flight-recorder continuously samples PostgreSQL system state, storing data in a four-tier architecture optimized for minimal overhead and flexible retention. Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
+pg-flight-recorder continuously samples PostgreSQL system state using two independent collection systems: sampled activity (wait events, sessions, locks) and cumulative snapshots (WAL, checkpoints, I/O). Use it to diagnose performance issues, track capacity trends, and understand database behavior over time.
 
 ### Requirements
 
@@ -70,104 +69,279 @@ Analysis functions compare snapshots or aggregate samples to diagnose performanc
 
 ## Core Concepts
 
-### Four-Tier Data Architecture
+### Data Architecture
 
-Flight Recorder organizes data into four tiers optimized for different access patterns:
+Flight Recorder uses two independent collection systems that answer different questions:
+
+- **Sampled Activity**: "What's happening right now?" (wait events, sessions, locks)
+- **Snapshots**: "What is/was the system state?" (counters, config, query stats)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ TIER 1: Ring Buffers (UNLOGGED)                                         │
-│   High-frequency sampling, 6-10 hour retention, auto-overwrites         │
+│ SAMPLED ACTIVITY SYSTEM                                                 │
+│   Collects: wait events, active sessions, locks                         │
+│   Job: sample() every 3 minutes                                         │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │ Ring Buffers (hot storage)                                      │   │
+│   │   UNLOGGED, 6-10 hour retention, auto-overwrites                │   │
+│   └──────────────────────┬──────────────────────────────────────────┘   │
+│                          │                                              │
+│            ┌─────────────┴─────────────┐                                │
+│            ▼                           ▼                                │
+│   ┌─────────────────────┐     ┌─────────────────────┐                   │
+│   │ Raw Archives        │     │ Aggregates          │                   │
+│   │   Detail preserved  │     │   Summarized        │                   │
+│   │   7-day retention   │     │   7-day retention   │                   │
+│   │   Forensic analysis │     │   Pattern analysis  │                   │
+│   └─────────────────────┘     └─────────────────────┘                   │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ TIER 1.5: Raw Archives (LOGGED)                                         │
-│   Periodic raw sample snapshots, 7-day retention, forensic detail       │
-├─────────────────────────────────────────────────────────────────────────┤
-│ TIER 2: Aggregates (LOGGED)                                             │
-│   Summarized data, 7-day retention, pattern analysis                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│ TIER 3: Snapshots (LOGGED)                                              │
-│   Cumulative stats, 30-day retention, trend analysis                    │
+│ SNAPSHOT SYSTEM                                                         │
+│   Job: snapshot() every 5 minutes, 30-day retention                     │
+│                                                                         │
+│   ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐     │
+│   │ Cumulative        │ │ Point-in-time     │ │ Top-N Rankings    │     │
+│   │ Counters          │ │ State             │ │                   │     │
+│   │                   │ │                   │ │                   │     │
+│   │ WAL, checkpoints, │ │ Config params,    │ │ Top queries by    │     │
+│   │ I/O, table/index  │ │ replication lag   │ │ time, calls       │     │
+│   │ stats             │ │                   │ │                   │     │
+│   └───────────────────┘ └───────────────────┘ └───────────────────┘     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**TIER 1: Ring Buffers**
+---
 
-Low-overhead, high-frequency sampling using a fixed 120-slot circular buffer.
+### Sampled Activity System
 
-| Table | Rows | Purpose |
-|-------|------|---------|
-| `samples_ring` | 120 | Master slot tracker |
-| `wait_samples_ring` | 12,000 | Wait events (120 slots × 100 rows) |
-| `activity_samples_ring` | 3,000 | Active sessions (120 slots × 25 rows) |
-| `lock_samples_ring` | 12,000 | Lock contention (120 slots × 100 rows) |
+Samples current database state every 3 minutes, capturing three categories of observational data: wait events, active sessions, and locks. Data lands in ring buffers (hot storage), then flows to two parallel outputs for longer-term retention.
+
+**Ring Buffers (hot storage)**
+
+Low-overhead, high-frequency sampling using a configurable circular buffer (default 120 slots, range 72-2880).
+
+| Table | Default Rows | Purpose |
+|-------|--------------|---------|
+| `samples_ring` | slots | Master slot tracker |
+| `wait_samples_ring` | slots × 100 | Wait events |
+| `activity_samples_ring` | slots × 25 | Active sessions |
+| `lock_samples_ring` | slots × 100 | Lock contention |
 
 Characteristics:
 
 - **UNLOGGED tables** eliminate WAL overhead (data lost on crash—acceptable for telemetry)
-- **Pre-populated rows** with UPDATE-only pattern achieve 100% HOT updates (zero dead tuples)
-- **Modular arithmetic** (`epoch / interval % 120`) auto-overwrites old slots
+- **Pre-populated rows** with UPDATE-only pattern achieve high HOT update ratios (no index bloat)
+- **Autovacuum configurable** via `configure_ring_autovacuum()`; can be disabled since fixed-size tables have bounded bloat
+- **Modular arithmetic** (`epoch / interval % ring_buffer_slots`) auto-overwrites old slots
+- **Configurable size** via `ring_buffer_slots` config and `rebuild_ring_buffers()` function
 - Query via: `recent_waits`, `recent_activity`, `recent_locks` views
 
-**TIER 1.5: Raw Archives**
+**Raw Archives (cold storage, detail preserved)**
 
-Periodic preservation of raw samples for forensic analysis beyond ring buffer retention.
+Periodic preservation of ring buffer samples for forensic analysis. Captured every 15 minutes.
 
 | Table | Purpose |
 |-------|---------|
-| `activity_samples_archive` | PIDs, queries, session details |
-| `lock_samples_archive` | Complete blocking chains |
 | `wait_samples_archive` | Wait patterns with counts |
+| `activity_samples_archive` | PIDs, queries, session details, session/transaction age |
+| `lock_samples_archive` | Complete blocking chains |
 
-Preserves details that aggregates lose: specific PIDs, exact timestamps, complete blocking chains. Query directly for forensic analysis.
+Preserves details that aggregates lose: specific PIDs, exact timestamps, complete blocking chains. Query directly for forensic analysis ("what exactly was happening at 14:32:17?").
 
-**TIER 2: Aggregates**
+**Session and Transaction Age Tracking**
 
-Durable summaries of ring buffer data for medium-term analysis.
+Activity samples include `backend_start` and `xact_start` timestamps from `pg_stat_activity`, enabling:
+
+- **Session age** (`session_age`): How long a connection has been open
+- **Transaction age** (`xact_age`): How long the current transaction has been running
+
+Use cases:
+
+- Identify long-running transactions causing bloat or replication lag
+- Detect connection leaks (very old sessions)
+- Find idle-in-transaction sessions holding locks
+
+**Aggregates (cold storage, summarized)**
+
+Durable summaries of ring buffer data. Flushed every 5 minutes.
 
 | Table | Purpose |
 |-------|---------|
 | `wait_event_aggregates` | Wait patterns over 5-minute windows |
+| `activity_aggregates` | Activity/query execution patterns |
 | `lock_aggregates` | Lock contention patterns |
-| `query_aggregates` | Query execution patterns |
 
-Query via: `wait_summary(start, end)` function.
+Compresses data for pattern analysis ("Lock:transactionid wait occurred 47 times this hour"). Query via `wait_summary(start, end)` function.
 
-**TIER 3: Snapshots**
+**Data flow:**
 
-Point-in-time cumulative statistics for long-term trends.
+| Category | Ring Buffer | → Archive | → Aggregate |
+|----------|-------------|-----------|-------------|
+| Wait events | `wait_samples_ring` | `wait_samples_archive` | `wait_event_aggregates` |
+| Activity | `activity_samples_ring` | `activity_samples_archive` | `activity_aggregates` |
+| Locks | `lock_samples_ring` | `lock_samples_archive` | `lock_aggregates` |
+
+Note: Archives and aggregates both derive directly from ring buffers—they are parallel outputs, not sequential stages.
+
+---
+
+### Snapshot System
+
+Captures periodic snapshots of system state every 5 minutes. Unlike sampled activity (which captures "what's happening now"), snapshots capture "what is/was the system state." The snapshot system collects three types of data:
+
+**Cumulative Counters** — Monotonically increasing values from `pg_stat_*` views. Compare two snapshots to compute deltas (e.g., "500 checkpoints occurred between 10:00 and 11:00").
 
 | Table | Purpose |
 |-------|---------|
-| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O |
-| `replication_snapshots` | pg_stat_replication, replication slots |
-| `statement_snapshots` | pg_stat_statements top queries |
-| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat) |
+| `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O, XID age, archiver status |
+| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat, XID age) |
 | `index_snapshots` | Per-index usage and size |
-| `config_snapshots` | PostgreSQL configuration parameters |
 
-Query via: `compare(start, end)`, `statement_compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`, `config_at(timestamp)`.
+Query via: `compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`.
+
+**Point-in-time State** — Non-cumulative values that represent current state at capture time.
+
+| Table | Purpose |
+|-------|---------|
+| `config_snapshots` | PostgreSQL configuration parameters |
+| `replication_snapshots` | pg_stat_replication, replication slots, lag |
+| `vacuum_progress_snapshots` | pg_stat_progress_vacuum for long-running vacuums |
+
+Query via: `config_at(timestamp)`, `config_changes(start, end)`.
+
+**Vacuum Progress Monitoring**
+
+Captures vacuum progress from `pg_stat_progress_vacuum` at each snapshot, tracking:
+
+- Vacuum phase (scanning heap, vacuuming indexes, etc.)
+- Blocks scanned and vacuumed (with percentage calculations)
+- Dead tuple counts
+- Index vacuum iterations
+
+Query via: `recent_vacuum_progress` view. Useful for monitoring long-running vacuums during incidents.
+
+**WAL Archiver Status**
+
+When `archive_mode` is enabled, snapshots capture archiver metrics from `pg_stat_archiver`:
+
+| Column | Purpose |
+|--------|---------|
+| `archived_count` | Total WAL files archived |
+| `last_archived_wal` | Name of last archived WAL |
+| `last_archived_time` | When last archive completed |
+| `failed_count` | Total archive failures |
+| `last_failed_wal` | Name of last failed WAL |
+| `last_failed_time` | When last failure occurred |
+| `archiver_stats_reset` | When archiver stats were reset |
+
+Query via: `archiver_status` view for delta calculations between snapshots. Null when `archive_mode = off`.
+
+**Database Conflicts (Standby Servers)**
+
+On standby servers, snapshots capture query cancellation metrics from `pg_stat_database_conflicts`:
+
+| Column | Purpose |
+|--------|---------|
+| `confl_tablespace` | Queries cancelled due to dropped tablespaces |
+| `confl_lock` | Queries cancelled due to lock timeouts |
+| `confl_snapshot` | Queries cancelled due to old snapshots |
+| `confl_bufferpin` | Queries cancelled due to pinned buffers |
+| `confl_deadlock` | Queries cancelled due to deadlocks |
+| `confl_active_logicalslot` | Queries cancelled due to logical replication slots (PG16+) |
+
+These columns are NULL on primary servers (conflicts only occur on standbys during recovery). Use to diagnose replica query cancellations.
+
+**Top-N Rankings** — Periodic capture of top queries by various metrics.
+
+| Table | Purpose |
+|-------|---------|
+| `statement_snapshots` | pg_stat_statements top queries by time, calls |
+
+Query via: `statement_compare(start, end)`.
 
 ### Ring Buffer Mechanism
 
 The ring buffer uses modular arithmetic for slot rotation:
 
 ```
-slot_id = (epoch_seconds / sample_interval_seconds) % 120
+slot_id = (epoch_seconds / sample_interval_seconds) % ring_buffer_slots
 ```
 
-With 120 slots:
+The slot count is configurable (default 120, range 72-2880):
 
-- At 180s intervals: 120 × 180s = 6 hours retention
-- At 300s intervals: 120 × 300s = 10 hours retention
+```
+retention_hours = (ring_buffer_slots × sample_interval_seconds) / 3600
+```
+
+Example configurations:
+
+| Slots | Interval | Retention | Memory |
+|-------|----------|-----------|--------|
+| 120 | 180s | 6 hours | ~15 MB |
+| 360 | 60s | 6 hours | ~45 MB |
+| 720 | 30s | 6 hours | ~90 MB |
 
 **Why UNLOGGED tables?** Eliminates WAL overhead. Telemetry data lost on crash is acceptable—the system recovers and resumes collection.
 
-**Why UPDATE-only pattern?** Child tables use `UPDATE ... SET col = NULL` to clear slots, then `INSERT ... ON CONFLICT DO UPDATE`. This achieves 100% HOT (Heap-Only Tuple) updates, eliminating dead tuples and autovacuum pressure.
+**Why UPDATE-only pattern?** Child tables use `UPDATE ... SET col = NULL` to clear slots, then `INSERT ... ON CONFLICT DO UPDATE`. With proper fillfactor, most updates are HOT (Heap-Only Tuple) - they create new tuple versions on the same page without updating indexes. HOT updates still create tuple chains within pages, but these are collapsed by page pruning during subsequent UPSERTs or by autovacuum.
 
 **Storage optimization:**
 
 - Master table: `fillfactor=70` (30% free space for HOT)
 - Child tables: `fillfactor=90` (10% free space for HOT)
+
+**Autovacuum configuration:**
+
+Ring buffer tables use PostgreSQL's default autovacuum behavior. Since they're fixed-size, pre-allocated, and UNLOGGED, bloat is bounded regardless of autovacuum settings. You can disable autovacuum to minimize observer effect if desired:
+
+```sql
+SELECT flight_recorder.configure_ring_autovacuum(false); -- Disable autovacuum
+SELECT flight_recorder.configure_ring_autovacuum(true);  -- Re-enable (default)
+```
+
+### Ring Buffer Optimization
+
+Ring buffer size can be configured for different monitoring scenarios. Use optimization profiles for common configurations:
+
+```sql
+-- View available optimization profiles
+SELECT * FROM flight_recorder.get_optimization_profiles();
+
+-- Apply a profile (updates config, warns if rebuild needed)
+SELECT * FROM flight_recorder.apply_optimization_profile('fine_grained');
+
+-- Rebuild ring buffers to new size (clears ring buffer data)
+SELECT flight_recorder.rebuild_ring_buffers();
+
+-- Validate current ring buffer configuration
+SELECT * FROM flight_recorder.validate_ring_configuration();
+```
+
+**Optimization Profiles:**
+
+| Profile | Slots | Interval | Retention | Use Case |
+|---------|-------|----------|-----------|----------|
+| `standard` | 120 | 180s | 6h | Default, balanced |
+| `fine_grained` | 360 | 60s | 6h | 1-min granularity |
+| `ultra_fine` | 720 | 30s | 6h | 30-sec granularity |
+| `low_overhead` | 72 | 300s | 6h | Minimal footprint |
+| `high_retention` | 240 | 180s | 12h | Extended retention |
+| `forensic` | 1440 | 15s | 6h | Temporary debugging |
+
+**Ring Buffer Configuration:**
+
+| Setting | Default | Range | Purpose |
+|---------|---------|-------|---------|
+| `ring_buffer_slots` | 120 | 72-2880 | Number of ring buffer slots |
+
+**Validation Checks:**
+
+The `validate_ring_configuration()` function checks:
+
+- **ring_buffer_retention**: WARN if <4h, ERROR if <2h
+- **batching_efficiency**: WARN if <3:1 or >15:1 ratio
+- **cpu_overhead**: WARN if >0.1%
+- **memory_usage**: WARN if >200MB
 
 ### Collection Modes
 
@@ -247,6 +421,47 @@ Or use the uninstall script:
 psql -f uninstall.sql
 ```
 
+### Upgrading
+
+To upgrade an existing installation while preserving telemetry data:
+
+**Step 1: Check current version**
+
+```sql
+SELECT value FROM flight_recorder.config WHERE key = 'schema_version';
+```
+
+**Step 2: Run migrations**
+
+```bash
+psql -f migrations/upgrade.sql
+```
+
+This automatically detects your version and applies needed migrations.
+
+**Step 3: Reinstall functions**
+
+```bash
+psql -f install.sql
+```
+
+This is safe — it preserves all data and updates functions/views to the latest version.
+
+### Version History
+
+| Version | Changes |
+|---------|---------|
+| 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
+| 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
+| 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
+| 2.4 | Client IP address tracking (`client_addr` in activity sampling) |
+| 2.3 | XID wraparound metrics (`datfrozenxid_age`, `relfrozenxid_age`) |
+| 2.2 | Configurable ring buffer slots (72-2880 range) |
+| 2.1 | I/O read timing columns from pg_stat_io |
+| 2.0 | Initial versioned release |
+
+See `migrations/README.md` for detailed migration documentation.
+
 ## Configuration Profiles
 
 Profiles provide pre-configured settings for common use cases. Start here instead of tuning individual parameters.
@@ -319,6 +534,7 @@ SELECT * FROM flight_recorder.config;
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `sample_interval_seconds` | 180 | Ring buffer sample frequency |
+| `ring_buffer_slots` | 120 | Number of ring buffer slots (72-2880) |
 | `statements_interval_minutes` | 15 | pg_stat_statements collection interval |
 | `statements_top_n` | 20 | Number of top queries to capture |
 | `snapshot_based_collection` | true | Use temp table snapshot (reduces catalog locks) |
@@ -344,26 +560,28 @@ SELECT * FROM flight_recorder.config;
 
 Single authoritative reference for all retention periods:
 
-| Setting | Default | Tier | Purpose |
-|---------|---------|------|---------|
-| `aggregate_retention_days` | 7 | TIER 2 | Aggregated summaries |
-| `archive_retention_days` | 7 | TIER 1.5 | Raw sample archives |
-| `retention_snapshots_days` | 30 | TIER 3 | System stat snapshots |
-| `retention_statements_days` | 30 | TIER 3 | Query snapshots |
+| Setting | Default | Storage | Purpose |
+|---------|---------|---------|---------|
+| `aggregate_retention_days` | 7 | Aggregates | Aggregated summaries |
+| `archive_retention_days` | 7 | Raw Archives | Raw sample archives |
+| `retention_snapshots_days` | 30 | Snapshots | System stat snapshots |
+| `retention_statements_days` | 30 | Snapshots | Query snapshots |
 | `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
 
-Ring buffer (TIER 1) self-cleans via slot overwrite—no retention setting needed.
+Ring buffers self-clean via slot overwrite—no retention setting needed. Size is configurable via `ring_buffer_slots` (see [Ring Buffer Optimization](#ring-buffer-optimization)).
 
 ### Sample Intervals
 
 Single authoritative reference for sample timing:
 
-| Mode | Interval | Slots | Retention | Collections/Day |
-|------|----------|-------|-----------|-----------------|
+| Mode | Default Interval | Default Slots | Default Retention | Collections/Day |
+|------|------------------|---------------|-------------------|-----------------|
 | `normal` | 180s | 120 | 6 hours | 480 |
 | `emergency` | 300s | 120 | 10 hours | 288 |
 
-Formula: `retention = slots × interval` (120 × 180s = 21,600s = 6 hours)
+Formula: `retention = ring_buffer_slots × sample_interval_seconds`
+
+Both `ring_buffer_slots` and `sample_interval_seconds` are configurable. Use optimization profiles for common configurations (see [Ring Buffer Optimization](#ring-buffer-optimization)).
 
 ### Archive Settings
 
@@ -391,10 +609,12 @@ Formula: `retention = slots × interval` (120 × 180s = 21,600s = 6 hours)
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `table_stats_enabled` | true | Enable per-table statistics collection |
-| `table_stats_top_n` | 50 | Number of hottest tables to track per snapshot |
+| `table_stats_top_n` | 50 | Number of hottest tables to track per snapshot (for `top_n` mode) |
+| `table_stats_mode` | top_n | Collection mode: `top_n` (limit to N), `all` (every table), `threshold` (activity filter) |
+| `table_stats_activity_threshold` | 0 | Minimum activity score for `threshold` mode |
 | `index_stats_enabled` | true | Enable per-index usage tracking |
 
-Table tracking captures seq scans, index scans, tuple activity, bloat indicators, and vacuum/analyze counts for the top N most active tables.
+Table tracking captures seq scans, index scans, tuple activity, bloat indicators, vacuum/analyze counts, and modifications since last analyze for tracked tables.
 
 Index tracking captures scan counts, tuple reads/fetches, and index sizes for detecting unused or inefficient indexes.
 
@@ -456,6 +676,40 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `db_role_config_changes(start, end)` | Detect database/role configuration changes |
 | `db_role_config_summary()` | Overview of database/role configuration overrides |
 
+### Autovacuum Observer Functions
+
+| Function | Purpose |
+|----------|---------|
+| `dead_tuple_growth_rate(relid, window)` | Calculate dead tuple accumulation rate (tuples/second) |
+| `modification_rate(relid, window)` | Calculate row modification rate (modifications/second) |
+| `hot_update_ratio(relid)` | Calculate HOT (Heap-Only Tuple) update percentage |
+| `time_to_budget_exhaustion(relid, budget)` | Estimate time until dead tuple budget exceeded |
+
+These functions support autovacuum monitoring and control systems by providing rate calculations based on historical snapshots. They return NULL when insufficient data exists (< 2 snapshots within window) or for non-existent table OIDs.
+
+**Example usage:**
+
+```sql
+-- Dead tuple growth rate over last hour
+SELECT flight_recorder.dead_tuple_growth_rate(
+    'my_table'::regclass::oid,
+    '1 hour'::interval
+);
+
+-- Time until 10,000 dead tuple budget exhausted
+SELECT flight_recorder.time_to_budget_exhaustion(
+    'my_table'::regclass::oid,
+    10000
+);
+
+-- HOT update efficiency
+SELECT relname,
+       flight_recorder.hot_update_ratio(relid) as hot_pct
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 0
+ORDER BY hot_pct NULLS LAST;
+```
+
 ### Control Functions
 
 | Function | Purpose |
@@ -466,6 +720,11 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `get_mode()` | Show current mode and settings |
 | `cleanup(interval)` | Delete old data (default: 7 days) |
 | `validate_config()` | Validate configuration settings |
+| `configure_ring_autovacuum(enabled)` | Toggle autovacuum on ring buffer tables (default: true) |
+| `validate_ring_configuration()` | Validate ring buffer config (retention, batching, overhead) |
+| `get_optimization_profiles()` | List available ring buffer optimization profiles |
+| `apply_optimization_profile(name)` | Apply a ring buffer optimization profile |
+| `rebuild_ring_buffers(slots)` | Resize ring buffers (clears ring buffer data) |
 
 ### Health & Monitoring Functions
 
@@ -478,7 +737,8 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `performance_report(interval)` | Flight recorder's own performance |
 | `check_alerts(interval)` | Active alerts (if enabled) |
 | `config_recommendations()` | Optimization suggestions |
-| `export_json(start, end)` | AI-friendly data export |
+| `report(start, end)` | Human/AI-readable diagnostic report |
+| `report(interval)` | Same as above, for interval ending now |
 
 ### Internal Functions (pg_cron scheduled)
 
@@ -490,53 +750,84 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `archive_ring_samples()` | Archive raw samples for forensic analysis |
 | `cleanup_aggregates()` | Clean old aggregate and archive data |
 
-### export_json() Output Structure
+### report() Output Structure
 
-The `export_json(start, end)` function returns a JSONB object optimized for AI analysis. It aggregates data from multiple analysis functions into a single payload.
+The `report(interval)` and `report(start, end)` functions return a diagnostic report readable by both humans and AI systems.
 
-**Output sections:**
+**Report sections:**
 
 | Section | Source | Content |
 |---------|--------|---------|
-| `meta` | Generated | Version, timestamp, schema documentation |
-| `range` | Parameters | Start/end timestamps of the export window |
-| `anomalies` | `anomaly_report()` | Auto-detected issues (checkpoints, buffer pressure, etc.) |
-| `wait_summary` | `wait_summary()` | Aggregated wait events by type |
-| `table_hotspots` | `table_hotspots()` | Table issues: seq scan storms, bloat, low HOT ratio |
-| `index_efficiency` | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
-| `config_changes` | `config_changes()` | PostgreSQL parameter changes during window |
-| `db_role_config_changes` | `db_role_config_changes()` | Database/role override changes during window |
-| `samples` | Ring buffers | Raw wait events and lock samples (compact array format) |
-| `snapshots` | Snapshots table | System stats: WAL, checkpoints, bgwriter (compact array format) |
+| Header | Generated | Version, timestamp, time range |
+| Anomalies | `anomaly_report()` | Auto-detected issues (checkpoints, buffer pressure, etc.) |
+| Wait Event Summary | `wait_summary()` | Aggregated wait events by type |
+| Snapshots | Snapshots table | System stats: WAL, checkpoints, bgwriter |
+| Table Hotspots | `table_hotspots()` | Table issues: seq scan storms, bloat, low HOT ratio |
+| Index Efficiency | `index_efficiency()` | Index usage analysis: scans, selectivity, size |
+| Statement Performance | `statement_compare()` | Query performance changes (requires pg_stat_statements) |
+| Lock Contention | `lock_samples_archive` | Lock blocking events |
+| Long-Running Transactions | `activity_samples_archive` | Transactions running >5 minutes with session/xact age |
+| Vacuum Progress | `vacuum_progress_snapshots` | Vacuum phases, completion percentages, dead tuples |
+| WAL Archiver Status | Snapshots table | Archive counts and failures during window |
+| Configuration Changes | `config_changes()` | PostgreSQL parameter changes during window |
+| Role Configuration Changes | `db_role_config_changes()` | Database/role override changes during window |
 
 **Example usage:**
 
 ```sql
--- Export last hour for AI analysis
-SELECT flight_recorder.export_json(
-    now() - interval '1 hour',
-    now()
-);
+-- Report for the last hour
+SELECT flight_recorder.report('1 hour');
 
--- Export incident window
-SELECT flight_recorder.export_json(
+-- Report for specific time window
+SELECT flight_recorder.report(
     '2024-01-15 14:00:00'::timestamptz,
     '2024-01-15 15:00:00'::timestamptz
 );
-```
 
-**Schema documentation** is embedded in the `meta.schemas` field to help AI consumers interpret compact array formats.
+-- Save to file
+\o /tmp/incident_report.md
+SELECT flight_recorder.report('1 hour');
+\o
+```
 
 ## Views Reference
 
 | View | Purpose |
 |------|---------|
 | `recent_waits` | Wait events (10-hour window, covers all modes) |
-| `recent_activity` | Active sessions (10-hour window) |
+| `recent_activity` | Active sessions with session/transaction age (10-hour window) |
 | `recent_locks` | Lock contention (10-hour window) |
+| `recent_idle_in_transaction` | Sessions idle in transaction, ordered by duration (10-hour window) |
 | `recent_replication` | Replication lag (2 hours, from snapshots) |
+| `recent_vacuum_progress` | Vacuum progress with % scanned/vacuumed (2 hours) |
+| `archiver_status` | WAL archiver metrics with delta calculations (24 hours) |
 | `deltas` | Snapshot-over-snapshot changes |
 | `capacity_dashboard` | Resource utilization and headroom |
+
+### I/O Timing Metrics
+
+The `deltas` view and `compare()` function include I/O timing columns from `pg_stat_io` (PostgreSQL 16+). These track storage latency by backend type:
+
+| Column | Source | Purpose |
+|--------|--------|---------|
+| `io_ckpt_reads_delta` | checkpointer | Block reads by checkpointer |
+| `io_ckpt_read_time_ms` | checkpointer | Read latency (ms) |
+| `io_ckpt_writes_delta` | checkpointer | Block writes by checkpointer |
+| `io_ckpt_write_time_ms` | checkpointer | Write latency (ms) |
+| `io_autovacuum_reads_delta` | autovacuum | Block reads by autovacuum |
+| `io_autovacuum_read_time_ms` | autovacuum | Read latency (ms) |
+| `io_autovacuum_writes_delta` | autovacuum | Block writes by autovacuum |
+| `io_autovacuum_write_time_ms` | autovacuum | Write latency (ms) |
+| `io_client_reads_delta` | client backends | Block reads by queries |
+| `io_client_read_time_ms` | client backends | Read latency (ms) |
+| `io_client_writes_delta` | client backends | Block writes by queries |
+| `io_client_write_time_ms` | client backends | Write latency (ms) |
+| `io_bgwriter_reads_delta` | background writer | Block reads by bgwriter |
+| `io_bgwriter_read_time_ms` | background writer | Read latency (ms) |
+| `io_bgwriter_writes_delta` | background writer | Block writes by bgwriter |
+| `io_bgwriter_write_time_ms` | background writer | Write latency (ms) |
+
+**Note:** Timing columns require `track_io_timing = on` in PostgreSQL. Without it, `*_time_ms` values are zero.
 
 **Dynamic retention functions** return data matching current mode's retention:
 
@@ -951,6 +1242,8 @@ Capacity planning uses data already collected (every 5 minutes) with no addition
 | `connections_total` | pg_stat_activity | All connections |
 | `connections_max` | max_connections | Configured limit |
 | `db_size_bytes` | pg_class.relpages | Database size (statistical estimate) |
+| `datfrozenxid_age` | pg_database | Database XID age (wraparound risk) |
+| `relfrozenxid_age` | pg_class | Per-table XID age (in table_snapshots) |
 
 Storage overhead: ~40 bytes per snapshot = 11.5 KB/day.
 
@@ -1237,6 +1530,50 @@ SELECT * FROM flight_recorder.compare('...', '...');
 | `BACKEND_FSYNC` | Backends doing fsync (bgwriter overwhelmed) | Tune bgwriter settings |
 | `TEMP_FILE_SPILLS` | Queries spilling to disk | Increase work_mem or optimize queries |
 | `LOCK_CONTENTION` | Sessions blocked on locks | Review blocking queries, add indexes |
+| `XID_WRAPAROUND_RISK` | Database XID age approaching limit | Run VACUUM FREEZE, tune autovacuum |
+| `TABLE_XID_WRAPAROUND_RISK` | Table XID age approaching limit | Run VACUUM FREEZE on specific table |
+| `IDLE_IN_TRANSACTION` | Session idle in transaction >5 min | Terminate stale sessions, blocks vacuum |
+| `DEAD_TUPLE_ACCUMULATION` | Table has >10% dead tuples | Run VACUUM, check autovacuum settings |
+| `VACUUM_STARVATION` | Dead tuples growing, no vacuum in 24h | Tune autovacuum thresholds |
+| `CONNECTION_LEAK` | Session open >7 days | Investigate leak, use connection pooling |
+| `REPLICATION_LAG_GROWING` | Replica lag trending upward | Check replica capacity, network, queries |
+
+### XID Wraparound Detection
+
+Transaction ID (XID) wraparound is a critical PostgreSQL failure mode. Flight Recorder tracks XID ages and alerts when approaching dangerous thresholds.
+
+**Thresholds** (based on `autovacuum_freeze_max_age` setting, default 200M):
+
+| Severity | Threshold | Meaning |
+|----------|-----------|---------|
+| `high` | > 50% of freeze_max_age | Proactive warning |
+| `critical` | > 80% of freeze_max_age | Urgent action needed |
+
+**Per-table awareness:** Each table can have its own `autovacuum_freeze_max_age` storage parameter. The detection respects per-table settings when configured via `ALTER TABLE ... SET (autovacuum_freeze_max_age = ...)`.
+
+**Metrics collected:**
+
+- `datfrozenxid_age` — Database-level XID age (in `snapshots` table)
+- `relfrozenxid_age` — Per-table XID age (in `table_snapshots` table)
+
+**Example output:**
+
+```sql
+SELECT * FROM flight_recorder.anomaly_report(now() - interval '1 hour', now());
+```
+
+| anomaly_type | severity | description | metric_value | threshold |
+|--------------|----------|-------------|--------------|-----------|
+| XID_WRAPAROUND_RISK | high | Database approaching transaction ID wraparound | XID age: 120,000,000 (60% of autovacuum_freeze_max_age) | datfrozenxid_age > 100,000,000 (50% of 200,000,000) |
+| TABLE_XID_WRAPAROUND_RISK | critical | Table public.large_table approaching XID wraparound | XID age: 170,000,000 (85% of autovacuum_freeze_max_age=200,000,000) | relfrozenxid_age > 100,000,000 (50% of 200,000,000) |
+
+**Related PostgreSQL parameters:**
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `autovacuum_freeze_max_age` | 200M | Forces anti-wraparound autovacuum |
+| `vacuum_freeze_table_age` | 150M | Triggers aggressive freeze during normal vacuum |
+| `vacuum_freeze_min_age` | 50M | Minimum age before tuples can be frozen |
 
 ```sql
 SELECT * FROM flight_recorder.anomaly_report(
@@ -1244,6 +1581,75 @@ SELECT * FROM flight_recorder.anomaly_report(
     '2024-01-15 11:00'
 );
 ```
+
+### Idle-in-Transaction Detection
+
+Detects sessions that have been idle in a transaction for too long. These sessions block autovacuum, hold locks, and can cause replication lag on replicas.
+
+**Thresholds:**
+
+| Severity | Threshold |
+|----------|-----------|
+| `medium` | 5-15 minutes idle in transaction |
+| `high` | 15-60 minutes idle in transaction |
+| `critical` | >60 minutes idle in transaction |
+
+**Quick visibility:**
+
+```sql
+SELECT * FROM flight_recorder.recent_idle_in_transaction;
+```
+
+### Dead Tuple Accumulation Detection
+
+Detects tables with high dead tuple ratios that indicate bloat risk.
+
+**Thresholds:**
+
+| Condition | Severity |
+|-----------|----------|
+| >10% dead tuples AND >10,000 dead rows | `medium` |
+| >30% dead tuples | `high` |
+
+### Vacuum Starvation Detection
+
+Detects tables where dead tuples are accumulating but autovacuum hasn't run recently.
+
+**Conditions for alert:**
+
+- Dead tuples grew by >1,000 since last snapshot
+- No autovacuum in past 24 hours
+
+**Severity:** Always `high`
+
+### Connection Leak Detection
+
+Detects sessions that have been open for an unusually long time, which may indicate connection leaks.
+
+**Thresholds:**
+
+| Severity | Threshold |
+|----------|-----------|
+| `medium` | Session open 7-30 days |
+| `high` | Session open >30 days |
+
+### Replication Lag Velocity Detection
+
+Detects when replica lag is trending upward (lag is growing over time).
+
+**Conditions for alert:**
+
+- Lag grew by >60 seconds during the time window
+- Current lag is >30 seconds
+- At least 3 samples in the window
+
+**Thresholds:**
+
+| Severity | Current Lag |
+|----------|-------------|
+| `medium` | 30-60 seconds |
+| `high` | 60-300 seconds |
+| `critical` | >300 seconds |
 
 ## Testing and Benchmarking
 
@@ -1340,29 +1746,4 @@ SELECT collection_type,
 FROM flight_recorder.collection_stats
 WHERE started_at > now() - interval '1 day'
 GROUP BY collection_type;
-```
-
-## Project Structure
-
-```
-pg-flight-recorder/
-├── install.sql                  # Installation script
-├── uninstall.sql                # Uninstall script
-├── flight_recorder_test.sql     # Original monolithic test file (kept as backup)
-├── tests/                       # Split test files for per-file timing
-│   ├── 01_foundation.sql
-│   ├── 02_ring_buffer_analysis.sql
-│   ├── 03_safety_features.sql
-│   ├── 04_boundary_critical.sql
-│   ├── 05_error_version.sql
-│   └── 06_load_archive_capacity.sql
-├── docker-compose.yml           # PostgreSQL + pg_cron for testing
-├── docker-compose.parallel.yml  # Parallel testing across PG 15, 16, 17
-├── test.sh                      # Test runner (supports parallel mode)
-├── README.md                    # Quick start guide
-├── REFERENCE.md                 # This file
-├── FEATURE_DESIGNS.md           # Technical designs for new features
-└── benchmark/
-    ├── measure_absolute.sh      # Overhead measurement
-    └── measure_ddl_impact.sh    # DDL interaction testing
 ```

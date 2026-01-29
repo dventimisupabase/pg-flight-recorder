@@ -7,7 +7,7 @@
 
 Server-side flight recorder for PostgreSQL. Runs automatically via pg_cron. Zero config.
 
-**Records:** Query activity, wait events, lock conflicts, connection stats, and performance metrics every 3 minutes.
+**Records:** Query activity, wait events, lock conflicts, connection stats, and performance metrics.
 
 ## Install
 
@@ -19,69 +19,23 @@ psql -f install.sql
 
 ## Use
 
-It runs automatically. Query when you need answers:
+It runs automatically. When you need answers:
 
 ```sql
--- What's happening now?
-SELECT * FROM flight_recorder.recent_activity;
-
--- What happened during this slow period?
-SELECT * FROM flight_recorder.compare('2024-01-15 10:00', '2024-01-15 11:00');
-
--- What were queries waiting on?
-SELECT * FROM flight_recorder.wait_summary('2024-01-15 10:00', '2024-01-15 11:00');
-
--- Auto-detect problems
-SELECT * FROM flight_recorder.anomaly_report('2024-01-15 10:00', '2024-01-15 11:00');
-
--- Do I have the right amount of resources?
-SELECT * FROM flight_recorder.capacity_dashboard;
-SELECT * FROM flight_recorder.capacity_summary(interval '7 days');
+SELECT flight_recorder.report('1 hour');
 ```
 
-## Optional: Configuration
-
-**Most users:** Just install. The defaults work.
-
-**Production tuning:**
-
-```sql
-SELECT flight_recorder.apply_profile('production_safe');
-```
-
-**Troubleshooting an incident:**
-
-```sql
-SELECT flight_recorder.apply_profile('troubleshooting');
-```
-
-**Need to stop it:**
-
-```sql
-SELECT flight_recorder.disable();
-```
-
-See [REFERENCE.md](REFERENCE.md) for all profiles and settings.
+Paste the output into your AI assistant of choice, or read it yourself. The report includes anomalies, wait events, query performance, lock contention, configuration changes, and more.
 
 ## Is It Safe?
 
-**Yes.** ~0.02% CPU overhead. 23-32ms per collection every 3 minutes.
+**Yes.** ~0.02% CPU overhead. 23-32ms per collection.
 
-**Validated on resource-constrained hardware:**
-
-- Supabase Micro (2 core, 1GB): 0% DDL blocking across 202 operations
+- Validated on resource-constrained hardware (Supabase Micro: 2 core, 1GB)
 - Built-in protection: load shedding, circuit breakers, fast timeouts
+- 0% DDL blocking across 202 operations in testing
 
 Safe for staging (always-on), production troubleshooting, and production always-on (test in staging first).
-
-## Health Checks
-
-Optional but recommended:
-
-```sql
-SELECT * FROM flight_recorder.preflight_check();  -- Before you start
-SELECT * FROM flight_recorder.quarterly_review(); -- Every 3 months
-```
 
 ## Uninstall
 
@@ -89,13 +43,6 @@ SELECT * FROM flight_recorder.quarterly_review(); -- Every 3 months
 psql -f uninstall.sql
 ```
 
-## For Developers
+## More Info
 
-Run the test suite:
-
-```bash
-./test.sh     # PostgreSQL 16
-./test.sh all # All versions (15, 16, 17)
-```
-
-See [REFERENCE.md](REFERENCE.md) for full documentation.
+See [REFERENCE.md](REFERENCE.md) for all functions, views, profiles, and configuration options.

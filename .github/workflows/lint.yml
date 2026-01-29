@@ -61,17 +61,6 @@ jobs:
 
           echo "✓ uninstall.sql syntax validation passed"
 
-      - name: Validate SQL syntax (test file)
-        run: |
-          echo "Checking flight_recorder_test.sql for syntax errors..."
-
-          if grep -n "SYNTAX ERROR" flight_recorder_test.sql; then
-            echo "Found syntax errors in flight_recorder_test.sql"
-            exit 1
-          fi
-
-          echo "✓ flight_recorder_test.sql syntax validation passed"
-
   markdown-lint:
     name: Markdown Lint
     runs-on: ubuntu-latest

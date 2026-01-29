@@ -3,11 +3,11 @@
 -- =============================================================================
 -- Tests: Adversarial boundary tests, untested critical functions
 -- Sections: 11 (Adversarial Boundary), 12 (Untested Critical Functions)
--- Test count: 104
+-- Test count: 101
 -- =============================================================================
 
 BEGIN;
-SELECT plan(104);
+SELECT plan(101);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -847,24 +847,6 @@ END $$;
 SELECT ok(
     (SELECT count(*) FROM flight_recorder.config_recommendations()) >= 0,
     'Alerts: config_recommendations() should handle optimal config'
-);
-
--- Test export_json() with empty time range
-SELECT lives_ok(
-    $$SELECT flight_recorder.export_json(now() + interval '1 day', now() + interval '2 days')$$,
-    'Alerts: export_json() should handle empty time range'
-);
-
--- Test export_json() with recent data
-SELECT ok(
-    (SELECT flight_recorder.export_json(now() - interval '1 hour', now())::text LIKE '%meta%'),
-    'Alerts: export_json() should include ''meta'' key in JSON structure'
-);
-
--- Test export_json() structure
-SELECT ok(
-    (SELECT jsonb_typeof(flight_recorder.export_json(now() - interval '1 hour', now())::jsonb) = 'object'),
-    'Alerts: export_json() should return valid JSON object'
 );
 
 -- Test get_current_profile()

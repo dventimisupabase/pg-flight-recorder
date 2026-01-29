@@ -33,7 +33,7 @@ jobs:
 
       - name: Run full test suite
         run: |
-          ./test.sh all
+          ./test.sh
 
   create-release:
     name: Create GitHub Release
