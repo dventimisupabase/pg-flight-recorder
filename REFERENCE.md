@@ -194,10 +194,11 @@ Captures periodic snapshots of system state every 5 minutes. Unlike sampled acti
 | Table | Purpose |
 |-------|---------|
 | `snapshots` | pg_stat_bgwriter, pg_stat_database, WAL, temp files, I/O, XID age, archiver status |
-| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat, XID age) |
+| `table_snapshots` | Per-table activity (seq scans, index scans, writes, bloat, XID age, reltuples, vacuum_running) |
 | `index_snapshots` | Per-index usage and size |
+| `vacuum_control_state` | Per-table vacuum mode tracking and recommendation state (v2.8) |
 
-Query via: `compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`.
+Query via: `compare(start, end)`, `deltas` view, `table_compare(start, end)`, `index_efficiency(start, end)`, `vacuum_control_report(start, end)`.
 
 **Point-in-time State** — Non-cumulative values that represent current state at capture time.
 
@@ -451,6 +452,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.8 | Vacuum control enhancements: `vacuum_control_state` table, `vacuum_control_mode()`, `compute_recommended_scale_factor()`, `vacuum_diagnostic()`, `vacuum_control_report()` functions, new `table_snapshots` columns (`reltuples`, `vacuum_running`, `last_vacuum_duration_ms`), new anomaly types (`VACUUM_CONTROL_SAFETY_MODE`, `VACUUM_CONTROL_CATCHUP_MODE`), vacuum recommendations in `report()` |
 | 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
 | 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
@@ -602,6 +604,20 @@ Both `ring_buffer_slots` and `sample_interval_seconds` are configurable. Use opt
 | `capacity_thresholds_critical_pct` | 80 | Critical threshold |
 | `capacity_forecast_window_days` | 90 | Forecast window for projections |
 | `collect_database_size` | true | Collect db_size_bytes |
+
+### Vacuum Control Settings (v2.8)
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `vacuum_control_enabled` | true | Enable vacuum control features |
+| `vacuum_control_dead_tuple_budget_pct` | 5 | Target dead tuple budget as % of table rows |
+| `vacuum_control_min_scale_factor` | 0.001 | Minimum allowed scale_factor recommendation |
+| `vacuum_control_max_scale_factor` | 0.2 | Maximum allowed scale_factor recommendation |
+| `vacuum_control_hysteresis_pct` | 25 | Minimum % change before recommending new scale_factor |
+| `vacuum_control_rate_limit_minutes` | 60 | Minimum time between recommendations per table |
+| `vacuum_control_catchup_budget_hours` | 4 | Budget hours threshold for catch-up mode |
+
+The vacuum control system observes and recommends but never auto-applies changes. All recommendations are surfaced as ready-to-run SQL for operator review.
 | `collect_connection_metrics` | true | Collect connection metrics |
 
 ### Table & Index Tracking Settings
@@ -687,7 +703,52 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 
 These functions support autovacuum monitoring and control systems by providing rate calculations based on historical snapshots. They return NULL when insufficient data exists (< 2 snapshots within window) or for non-existent table OIDs.
 
+### Vacuum Control Functions (v2.8)
+
+| Function | Purpose |
+|----------|---------|
+| `vacuum_control_mode(relid)` | Determine operating mode (normal/catch_up/safety) for a table |
+| `compute_recommended_scale_factor(relid)` | Calculate optimal autovacuum_vacuum_scale_factor |
+| `vacuum_diagnostic(relid)` | Classify vacuum failure mode with actionable guidance |
+| `vacuum_control_report(start, end)` | Generate comprehensive vacuum tuning recommendations |
+| `dead_tuple_trend(relid, window)` | Calculate dead tuple trend using linear regression |
+| `_get_table_autovacuum_settings(relid)` | Get table-specific autovacuum settings with fallback to globals |
+
+The vacuum control system provides closed-loop tuning recommendations without automatically applying changes. It observes vacuum behavior, computes optimal settings, and surfaces actionable SQL that operators can review and execute.
+
+**Operating Modes:**
+
+- **normal**: Vacuum keeping up with workload (default steady-state)
+- **catch_up**: Dead tuples growing, budget exhaustion within configured hours
+- **safety**: XID age approaching wraparound or blocking transactions detected
+
+**Diagnostic Classifications:**
+
+- **HEALTHY**: Vacuum keeping up, no action needed
+- **NOT_SCHEDULED**: Workers saturated or threshold not reached
+- **RUNNING_BUT_LOSING**: Vacuum running but not keeping pace with workload
+- **BLOCKED**: Long-running transactions preventing vacuum progress
+
 **Example usage:**
+
+```sql
+-- Check vacuum control mode for a table
+SELECT * FROM flight_recorder.vacuum_control_mode('my_table'::regclass::oid);
+
+-- Get scale factor recommendation
+SELECT * FROM flight_recorder.compute_recommended_scale_factor('my_table'::regclass::oid);
+
+-- Run diagnostic on a problematic table
+SELECT * FROM flight_recorder.vacuum_diagnostic('my_table'::regclass::oid);
+
+-- Get full vacuum control report with recommended ALTER TABLE statements
+SELECT schemaname, relname, operating_mode, diagnostic_classification,
+       current_scale_factor, recommended_scale_factor, alter_table_sql
+FROM flight_recorder.vacuum_control_report(now() - interval '1 hour', now())
+WHERE should_recommend = true;
+```
+
+**Autovacuum Observer Example usage:**
 
 ```sql
 -- Dead tuple growth rate over last hour
