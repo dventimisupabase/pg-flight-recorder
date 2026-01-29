@@ -30,7 +30,13 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 - [Capacity Planning](#capacity-planning)
 
-**Part VI: Reference Material**
+**Part VI: Vacuum Control**
+
+- [From Observation to Control](#from-observation-to-control)
+- [Vacuum Control Concepts](#vacuum-control-concepts)
+- [Using Vacuum Control](#using-vacuum-control)
+
+**Part VII: Reference Material**
 
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
@@ -75,6 +81,8 @@ Flight Recorder uses two independent collection systems that answer different qu
 
 - **Sampled Activity**: "What's happening right now?" (wait events, sessions, locks)
 - **Snapshots**: "What is/was the system state?" (counters, config, query stats)
+
+A third system, **Vacuum Control** (v2.8+), builds on snapshot data to provide closed-loop tuning recommendations. See [Part VI: Vacuum Control](#from-observation-to-control).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -452,7 +460,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
-| 2.8 | Vacuum control enhancements: `vacuum_control_state` table, `vacuum_control_mode()`, `compute_recommended_scale_factor()`, `vacuum_diagnostic()`, `vacuum_control_report()` functions, new `table_snapshots` columns (`reltuples`, `vacuum_running`, `last_vacuum_duration_ms`), new anomaly types (`VACUUM_CONTROL_SAFETY_MODE`, `VACUUM_CONTROL_CATCHUP_MODE`), vacuum recommendations in `report()` |
+| 2.8 | **First control loop**: Crosses from observation into closed-loop control. Vacuum control system observes vacuum health, computes optimal settings, recommends (but never auto-applies) changes. New: `vacuum_control_state` table, `vacuum_control_mode()`, `compute_recommended_scale_factor()`, `vacuum_diagnostic()`, `vacuum_control_report()` functions, `table_snapshots` columns (`reltuples`, `vacuum_running`, `last_vacuum_duration_ms`), anomaly types (`VACUUM_CONTROL_SAFETY_MODE`, `VACUUM_CONTROL_CATCHUP_MODE`), vacuum recommendations in `report()`. See [Part VI: Vacuum Control](#from-observation-to-control). |
 | 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
 | 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
@@ -1440,7 +1448,241 @@ ORDER BY utilization_pct;
 
 ---
 
-## Part VI: Reference Material
+## Part VI: Vacuum Control
+
+Version 2.8 marks a fundamental expansion of pg-flight-recorder's scope: the first step from pure observation into closed-loop control.
+
+## From Observation to Control
+
+### A Paradigm Shift
+
+Until v2.8, pg-flight-recorder was a passive observer—collecting telemetry, surfacing anomalies, helping operators understand what happened. With vacuum control, Flight Recorder crosses into a new domain: computing optimal settings and recommending changes.
+
+This is not just another feature. It represents a philosophical shift from "here's what happened" to "here's what you should do about it."
+
+### Why Autovacuum Is the Right First Target
+
+Autovacuum is uniquely suited for closed-loop control:
+
+**It affects query latency.** Dead tuple accumulation causes table bloat, which means more pages to scan for the same logical data. A table with 30% dead tuples requires 43% more I/O for sequential scans.
+
+**It affects storage costs.** Dead tuples consume disk space. In cloud environments where storage is metered, bloat directly increases costs.
+
+**It has a catastrophic failure mode.** If autovacuum falls too far behind, PostgreSQL approaches transaction ID (XID) wraparound—a hard limit that forces the database into single-user mode for emergency recovery. This isn't a performance degradation; it's a complete outage.
+
+**It is fundamentally a control problem.** The goal isn't "run vacuum as much as possible" or "run vacuum as little as possible." It's "maintain dead tuple ratio within an acceptable budget." This is a classic control system: measure the error, compute a correction, apply it.
+
+### The Design Philosophy: Observe, Compute, Recommend—Never Auto-Apply
+
+Vacuum control follows a strict principle: **recommendations are data-driven, but application requires human judgment.**
+
+The system will never execute `ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = ...)` on your behalf. Instead, it:
+
+1. **Observes** vacuum behavior through snapshots and state tracking
+2. **Computes** optimal settings using control theory
+3. **Recommends** changes as ready-to-run SQL for operator review
+
+Why this constraint?
+
+- **Aggressive scale factors impact performance.** A scale_factor of 0.001 means vacuum triggers after 0.1% dead tuples—potentially running constantly on high-write tables. This is sometimes correct, but the operator must understand the trade-off.
+
+- **Workloads vary.** A batch-import table that grows by millions of rows overnight has different vacuum needs than an OLTP table with steady updates. The system doesn't know your SLOs.
+
+- **Trust but verify.** The recommendations are data-driven, but they're based on observed behavior during the analysis window. Operators know whether that window was representative.
+
+## Vacuum Control Concepts
+
+### The Dead Tuple Budget
+
+At its core, vacuum control is about maintaining a **dead tuple budget**—an SLO that says "I will tolerate up to X% dead tuples in my tables."
+
+The default budget is 5% (`vacuum_control_dead_tuple_budget_pct`). This means:
+
+- A 1 million row table can have up to 50,000 dead tuples before the system considers intervention
+- If dead tuples approach this budget, the system computes what scale_factor would trigger vacuum earlier
+
+The budget translates to a recommended scale_factor via the control law:
+
+```
+recommended_scale_factor = (dead_budget - threshold) / reltuples
+```
+
+Where:
+
+- `dead_budget` = table rows × budget percentage
+- `threshold` = current autovacuum_vacuum_threshold (default 50)
+- `reltuples` = estimated live row count from pg_class
+
+### The Three-Tier Architecture
+
+Vacuum control operates as a pipeline:
+
+```
+OBSERVATION          →    COMPUTATION         →    RECOMMENDATION
+      ↓                         ↓                         ↓
+  table_snapshots         vacuum_control_mode()      vacuum_control_report()
+  vacuum_control_state    compute_recommended_       Filter by hysteresis,
+  Detect: dead tuples,      scale_factor()           rate limits, urgency
+  vacuum_running,         vacuum_diagnostic()        Present as ALTER TABLE
+  reltuples, rates        Derive optimal settings    SQL for review
+```
+
+Each stage is independently queryable—you can observe without computing, or compute without generating recommendations.
+
+### Operating Modes
+
+The system classifies each table into one of three operating modes:
+
+| Mode | Meaning | Urgency |
+|------|---------|---------|
+| `normal` | Vacuum keeping up with workload | Low—steady-state operations |
+| `catch_up` | Dead tuples growing, budget exhaustion within configured hours | Medium—proactive intervention recommended |
+| `safety` | XID age approaching wraparound OR blocking transactions detected | High—immediate action required |
+
+Mode transitions are based on:
+
+- **normal → catch_up**: `time_to_budget_exhaustion()` returns less than `vacuum_control_catchup_budget_hours` (default 4 hours)
+- **any → safety**: XID age exceeds 50% of `autovacuum_freeze_max_age`, or long-running transactions are blocking vacuum
+
+### Diagnostic Classifications
+
+When a table isn't in `normal` mode, `vacuum_diagnostic()` classifies the failure mode:
+
+| Classification | Meaning | Typical Cause |
+|----------------|---------|---------------|
+| `HEALTHY` | Vacuum keeping up | No action needed |
+| `NOT_SCHEDULED` | Vacuum hasn't triggered | Workers saturated, threshold not reached, or table below activity threshold |
+| `RUNNING_BUT_LOSING` | Vacuum is running but dead tuples still growing | Workload exceeds vacuum throughput |
+| `BLOCKED` | Long-running transactions preventing progress | Idle-in-transaction sessions, long queries |
+
+Each classification comes with targeted guidance for resolution.
+
+### Why Human-in-the-Loop
+
+The vacuum control system explicitly avoids auto-applying changes for several reasons:
+
+**Performance impact is context-dependent.** A recommended scale_factor of 0.002 is mathematically optimal for the observed dead tuple growth rate. But if that means vacuum runs every 5 minutes on a write-heavy table, the operator needs to decide if that I/O overhead is acceptable during business hours.
+
+**The observation window may not be representative.** If you analyze a 1-hour window during a maintenance batch job, the recommendations will be tuned for batch-job workloads—not your typical OLTP traffic.
+
+**Operators have institutional knowledge.** "That table always has high dead tuples right after the nightly import, but it clears up by 6 AM" is knowledge the system can't infer from metrics.
+
+**Reversibility matters.** If an auto-applied change causes problems, debugging what changed and why is harder than reviewing a recommendation before applying it.
+
+## Using Vacuum Control
+
+### Quick Start
+
+```sql
+-- Get vacuum recommendations for the last hour
+SELECT schemaname, relname, operating_mode, diagnostic_classification,
+       current_scale_factor, recommended_scale_factor, alter_table_sql
+FROM flight_recorder.vacuum_control_report(now() - interval '1 hour', now())
+WHERE should_recommend = true;
+```
+
+If recommendations exist, review them and apply selectively:
+
+```sql
+-- Review recommendation for a specific table
+SELECT * FROM flight_recorder.vacuum_diagnostic('my_schema.my_table'::regclass::oid);
+
+-- If appropriate, apply the recommendation
+ALTER TABLE my_schema.my_table SET (autovacuum_vacuum_scale_factor = 0.02);
+```
+
+### Configuration Reference
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `vacuum_control_enabled` | true | Master switch for vacuum control features |
+| `vacuum_control_dead_tuple_budget_pct` | 5 | Target dead tuple budget as % of table rows |
+| `vacuum_control_min_scale_factor` | 0.001 | Minimum allowed scale_factor recommendation |
+| `vacuum_control_max_scale_factor` | 0.2 | Maximum allowed scale_factor recommendation |
+| `vacuum_control_hysteresis_pct` | 25 | Minimum % change before recommending new scale_factor |
+| `vacuum_control_rate_limit_minutes` | 60 | Minimum time between recommendations per table |
+| `vacuum_control_catchup_budget_hours` | 4 | Budget hours threshold for catch-up mode |
+
+### Function Reference
+
+| Function | Purpose |
+|----------|---------|
+| `vacuum_control_mode(relid)` | Determine operating mode (normal/catch_up/safety) for a table |
+| `compute_recommended_scale_factor(relid)` | Calculate optimal autovacuum_vacuum_scale_factor |
+| `vacuum_diagnostic(relid)` | Classify vacuum failure mode with actionable guidance |
+| `vacuum_control_report(start, end)` | Generate comprehensive vacuum tuning recommendations |
+| `dead_tuple_trend(relid, window)` | Calculate dead tuple trend using linear regression |
+| `_get_table_autovacuum_settings(relid)` | Get table-specific autovacuum settings with fallback to globals |
+
+### Workflow: Investigating a Problematic Table
+
+**Step 1: Check the operating mode**
+
+```sql
+SELECT * FROM flight_recorder.vacuum_control_mode('problem_table'::regclass::oid);
+```
+
+If `safety` or `catch_up`, proceed to diagnosis.
+
+**Step 2: Run diagnostic**
+
+```sql
+SELECT * FROM flight_recorder.vacuum_diagnostic('problem_table'::regclass::oid);
+```
+
+This returns:
+
+- `classification`: What type of vacuum problem (BLOCKED, NOT_SCHEDULED, etc.)
+- `explanation`: Human-readable description
+- `recommended_action`: Specific guidance
+
+**Step 3: Get recommended scale_factor**
+
+```sql
+SELECT * FROM flight_recorder.compute_recommended_scale_factor('problem_table'::regclass::oid);
+```
+
+Review whether the recommendation makes sense for your workload.
+
+**Step 4: Apply if appropriate**
+
+```sql
+ALTER TABLE problem_table SET (autovacuum_vacuum_scale_factor = <recommended_value>);
+```
+
+### Workflow: Proactive Monitoring
+
+Add vacuum control to your monitoring dashboard:
+
+```sql
+-- Tables requiring attention
+SELECT relname, operating_mode, diagnostic_classification
+FROM flight_recorder.vacuum_control_report(now() - interval '1 hour', now())
+WHERE operating_mode != 'normal'
+ORDER BY
+  CASE operating_mode
+    WHEN 'safety' THEN 1
+    WHEN 'catch_up' THEN 2
+    ELSE 3
+  END;
+```
+
+The `report()` function also includes vacuum recommendations when issues are detected.
+
+### Integration with Anomaly Detection
+
+Two new anomaly types surface vacuum control issues:
+
+| Anomaly Type | Meaning |
+|--------------|---------|
+| `VACUUM_CONTROL_SAFETY_MODE` | A table is in safety mode—XID risk or blocking detected |
+| `VACUUM_CONTROL_CATCHUP_MODE` | A table is in catch-up mode—budget exhaustion imminent |
+
+These appear in `anomaly_report()` output alongside existing anomaly types like `DEAD_TUPLE_ACCUMULATION` and `VACUUM_STARVATION`.
+
+---
+
+## Part VII: Reference Material
 
 ## Troubleshooting Guide
 
@@ -1598,6 +1840,8 @@ SELECT * FROM flight_recorder.compare('...', '...');
 | `VACUUM_STARVATION` | Dead tuples growing, no vacuum in 24h | Tune autovacuum thresholds |
 | `CONNECTION_LEAK` | Session open >7 days | Investigate leak, use connection pooling |
 | `REPLICATION_LAG_GROWING` | Replica lag trending upward | Check replica capacity, network, queries |
+| `VACUUM_CONTROL_SAFETY_MODE` | Table in vacuum control safety mode | XID wraparound risk or blocking detected. See [Vacuum Control](#from-observation-to-control) |
+| `VACUUM_CONTROL_CATCHUP_MODE` | Table in vacuum control catch-up mode | Dead tuple budget exhaustion imminent. See [Vacuum Control](#from-observation-to-control) |
 
 ### XID Wraparound Detection
 
