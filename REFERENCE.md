@@ -451,6 +451,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
 | 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
 | 2.4 | Client IP address tracking (`client_addr` in activity sampling) |
@@ -608,10 +609,12 @@ Both `ring_buffer_slots` and `sample_interval_seconds` are configurable. Use opt
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `table_stats_enabled` | true | Enable per-table statistics collection |
-| `table_stats_top_n` | 50 | Number of hottest tables to track per snapshot |
+| `table_stats_top_n` | 50 | Number of hottest tables to track per snapshot (for `top_n` mode) |
+| `table_stats_mode` | top_n | Collection mode: `top_n` (limit to N), `all` (every table), `threshold` (activity filter) |
+| `table_stats_activity_threshold` | 0 | Minimum activity score for `threshold` mode |
 | `index_stats_enabled` | true | Enable per-index usage tracking |
 
-Table tracking captures seq scans, index scans, tuple activity, bloat indicators, and vacuum/analyze counts for the top N most active tables.
+Table tracking captures seq scans, index scans, tuple activity, bloat indicators, vacuum/analyze counts, and modifications since last analyze for tracked tables.
 
 Index tracking captures scan counts, tuple reads/fetches, and index sizes for detecting unused or inefficient indexes.
 
@@ -672,6 +675,40 @@ UPDATE flight_recorder.config SET value = '85' WHERE key = 'load_shedding_active
 | `db_role_config_at(timestamp)` | Show database/role configuration overrides at a point in time |
 | `db_role_config_changes(start, end)` | Detect database/role configuration changes |
 | `db_role_config_summary()` | Overview of database/role configuration overrides |
+
+### Autovacuum Observer Functions
+
+| Function | Purpose |
+|----------|---------|
+| `dead_tuple_growth_rate(relid, window)` | Calculate dead tuple accumulation rate (tuples/second) |
+| `modification_rate(relid, window)` | Calculate row modification rate (modifications/second) |
+| `hot_update_ratio(relid)` | Calculate HOT (Heap-Only Tuple) update percentage |
+| `time_to_budget_exhaustion(relid, budget)` | Estimate time until dead tuple budget exceeded |
+
+These functions support autovacuum monitoring and control systems by providing rate calculations based on historical snapshots. They return NULL when insufficient data exists (< 2 snapshots within window) or for non-existent table OIDs.
+
+**Example usage:**
+
+```sql
+-- Dead tuple growth rate over last hour
+SELECT flight_recorder.dead_tuple_growth_rate(
+    'my_table'::regclass::oid,
+    '1 hour'::interval
+);
+
+-- Time until 10,000 dead tuple budget exhausted
+SELECT flight_recorder.time_to_budget_exhaustion(
+    'my_table'::regclass::oid,
+    10000
+);
+
+-- HOT update efficiency
+SELECT relname,
+       flight_recorder.hot_update_ratio(relid) as hot_pct
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 0
+ORDER BY hot_pct NULLS LAST;
+```
 
 ### Control Functions
 

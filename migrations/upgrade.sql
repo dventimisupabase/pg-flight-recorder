@@ -11,7 +11,7 @@
 DO $$
 DECLARE
     v_current_version TEXT;
-    v_target_version TEXT := '2.6';  -- Update this when adding migrations
+    v_target_version TEXT := '2.7';  -- Update this when adding migrations
 BEGIN
     -- Check if flight_recorder schema exists
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recorder') THEN
@@ -83,6 +83,9 @@ END $$;
 
 -- Migration from 2.5 to 2.6: Low-hanging fruit anomaly detection enhancements
 \i migrations/2.5_to_2.6.sql
+
+-- Migration from 2.6 to 2.7: Autovacuum observer enhancements
+\i migrations/2.6_to_2.7.sql
 
 -- =============================================================================
 -- Post-upgrade verification

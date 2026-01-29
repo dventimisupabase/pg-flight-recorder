@@ -416,6 +416,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.table_snapshots (
     n_tup_hot_upd       BIGINT,
     n_live_tup          BIGINT,
     n_dead_tup          BIGINT,
+    n_mod_since_analyze BIGINT,
     vacuum_count        BIGINT,
     autovacuum_count    BIGINT,
     analyze_count       BIGINT,
@@ -518,7 +519,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.5'),
+    ('schema_version', '2.7'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -587,6 +588,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('collect_connection_metrics', 'true'),
     ('table_stats_enabled', 'true'),
     ('table_stats_top_n', '50'),
+    ('table_stats_mode', 'top_n'),
+    ('table_stats_activity_threshold', '0'),
     ('index_stats_enabled', 'true'),
     ('config_snapshots_enabled', 'true'),
     ('db_role_config_snapshots_enabled', 'true'),
@@ -2170,13 +2173,15 @@ COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old
 
 
 -- Collects table-level statistics from pg_stat_user_tables
--- Captures top N tables by activity score for hotspot tracking
+-- Captures tables based on configurable sampling mode: top_n, all, or threshold
 CREATE OR REPLACE FUNCTION flight_recorder._collect_table_stats(p_snapshot_id INTEGER)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     v_enabled BOOLEAN;
     v_top_n INTEGER;
+    v_mode TEXT;
+    v_threshold BIGINT;
 BEGIN
     v_enabled := COALESCE(
         flight_recorder._get_config('table_stats_enabled', 'true')::boolean,
@@ -2192,44 +2197,139 @@ BEGIN
         50
     );
 
-    INSERT INTO flight_recorder.table_snapshots (
-        snapshot_id, schemaname, relname, relid,
-        seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
-        n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
-        n_live_tup, n_dead_tup,
-        vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
-        last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
-        relfrozenxid_age
-    )
-    SELECT
-        p_snapshot_id,
-        st.schemaname,
-        st.relname,
-        st.relid,
-        st.seq_scan,
-        st.seq_tup_read,
-        st.idx_scan,
-        st.idx_tup_fetch,
-        st.n_tup_ins,
-        st.n_tup_upd,
-        st.n_tup_del,
-        st.n_tup_hot_upd,
-        st.n_live_tup,
-        st.n_dead_tup,
-        st.vacuum_count,
-        st.autovacuum_count,
-        st.analyze_count,
-        st.autoanalyze_count,
-        st.last_vacuum,
-        st.last_autovacuum,
-        st.last_analyze,
-        st.last_autoanalyze,
-        age(c.relfrozenxid)::integer AS relfrozenxid_age
-    FROM pg_stat_user_tables st
-    LEFT JOIN pg_class c ON c.oid = st.relid
-    ORDER BY (COALESCE(st.seq_tup_read, 0) + COALESCE(st.idx_tup_fetch, 0) +
-              COALESCE(st.n_tup_ins, 0) + COALESCE(st.n_tup_upd, 0) + COALESCE(st.n_tup_del, 0)) DESC
-    LIMIT v_top_n;
+    v_mode := COALESCE(
+        flight_recorder._get_config('table_stats_mode', 'top_n'),
+        'top_n'
+    );
+
+    v_threshold := COALESCE(
+        flight_recorder._get_config('table_stats_activity_threshold', '0')::bigint,
+        0
+    );
+
+    -- Handle different collection modes
+    IF v_mode = 'all' THEN
+        -- Collect all user tables
+        INSERT INTO flight_recorder.table_snapshots (
+            snapshot_id, schemaname, relname, relid,
+            seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
+            n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
+            n_live_tup, n_dead_tup, n_mod_since_analyze,
+            vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
+            last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
+            relfrozenxid_age
+        )
+        SELECT
+            p_snapshot_id,
+            st.schemaname,
+            st.relname,
+            st.relid,
+            st.seq_scan,
+            st.seq_tup_read,
+            st.idx_scan,
+            st.idx_tup_fetch,
+            st.n_tup_ins,
+            st.n_tup_upd,
+            st.n_tup_del,
+            st.n_tup_hot_upd,
+            st.n_live_tup,
+            st.n_dead_tup,
+            st.n_mod_since_analyze,
+            st.vacuum_count,
+            st.autovacuum_count,
+            st.analyze_count,
+            st.autoanalyze_count,
+            st.last_vacuum,
+            st.last_autovacuum,
+            st.last_analyze,
+            st.last_autoanalyze,
+            age(c.relfrozenxid)::integer AS relfrozenxid_age
+        FROM pg_stat_user_tables st
+        LEFT JOIN pg_class c ON c.oid = st.relid;
+
+    ELSIF v_mode = 'threshold' THEN
+        -- Collect tables with activity score above threshold
+        INSERT INTO flight_recorder.table_snapshots (
+            snapshot_id, schemaname, relname, relid,
+            seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
+            n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
+            n_live_tup, n_dead_tup, n_mod_since_analyze,
+            vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
+            last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
+            relfrozenxid_age
+        )
+        SELECT
+            p_snapshot_id,
+            st.schemaname,
+            st.relname,
+            st.relid,
+            st.seq_scan,
+            st.seq_tup_read,
+            st.idx_scan,
+            st.idx_tup_fetch,
+            st.n_tup_ins,
+            st.n_tup_upd,
+            st.n_tup_del,
+            st.n_tup_hot_upd,
+            st.n_live_tup,
+            st.n_dead_tup,
+            st.n_mod_since_analyze,
+            st.vacuum_count,
+            st.autovacuum_count,
+            st.analyze_count,
+            st.autoanalyze_count,
+            st.last_vacuum,
+            st.last_autovacuum,
+            st.last_analyze,
+            st.last_autoanalyze,
+            age(c.relfrozenxid)::integer AS relfrozenxid_age
+        FROM pg_stat_user_tables st
+        LEFT JOIN pg_class c ON c.oid = st.relid
+        WHERE (COALESCE(st.seq_tup_read, 0) + COALESCE(st.idx_tup_fetch, 0) +
+               COALESCE(st.n_tup_ins, 0) + COALESCE(st.n_tup_upd, 0) + COALESCE(st.n_tup_del, 0)) >= v_threshold;
+
+    ELSE
+        -- Default: top_n mode (also handles invalid mode values)
+        INSERT INTO flight_recorder.table_snapshots (
+            snapshot_id, schemaname, relname, relid,
+            seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
+            n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
+            n_live_tup, n_dead_tup, n_mod_since_analyze,
+            vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
+            last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
+            relfrozenxid_age
+        )
+        SELECT
+            p_snapshot_id,
+            st.schemaname,
+            st.relname,
+            st.relid,
+            st.seq_scan,
+            st.seq_tup_read,
+            st.idx_scan,
+            st.idx_tup_fetch,
+            st.n_tup_ins,
+            st.n_tup_upd,
+            st.n_tup_del,
+            st.n_tup_hot_upd,
+            st.n_live_tup,
+            st.n_dead_tup,
+            st.n_mod_since_analyze,
+            st.vacuum_count,
+            st.autovacuum_count,
+            st.analyze_count,
+            st.autoanalyze_count,
+            st.last_vacuum,
+            st.last_autovacuum,
+            st.last_analyze,
+            st.last_autoanalyze,
+            age(c.relfrozenxid)::integer AS relfrozenxid_age
+        FROM pg_stat_user_tables st
+        LEFT JOIN pg_class c ON c.oid = st.relid
+        ORDER BY (COALESCE(st.seq_tup_read, 0) + COALESCE(st.idx_tup_fetch, 0) +
+                  COALESCE(st.n_tup_ins, 0) + COALESCE(st.n_tup_upd, 0) + COALESCE(st.n_tup_del, 0)) DESC
+        LIMIT v_top_n;
+    END IF;
 END;
 $$;
 
@@ -3884,6 +3984,198 @@ LANGUAGE sql STABLE AS $$
     CROSS JOIN sample_progress sp
     CROSS JOIN wait_array wa
 $$;
+
+-- =============================================================================
+-- Autovacuum Observer Rate Calculation Functions (v2.7)
+-- =============================================================================
+
+-- Calculates the rate of dead tuple accumulation over a time window
+-- Returns tuples per second, or NULL if insufficient data
+CREATE OR REPLACE FUNCTION flight_recorder.dead_tuple_growth_rate(
+    p_relid OID,
+    p_window INTERVAL
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_first_snapshot RECORD;
+    v_last_snapshot RECORD;
+    v_delta_tuples BIGINT;
+    v_delta_seconds NUMERIC;
+BEGIN
+    -- Get earliest snapshot within window
+    SELECT ts.n_dead_tup, s.captured_at
+    INTO v_first_snapshot
+    FROM flight_recorder.table_snapshots ts
+    JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+    WHERE ts.relid = p_relid
+      AND s.captured_at >= now() - p_window
+    ORDER BY s.captured_at ASC
+    LIMIT 1;
+
+    -- Get latest snapshot
+    SELECT ts.n_dead_tup, s.captured_at
+    INTO v_last_snapshot
+    FROM flight_recorder.table_snapshots ts
+    JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+    WHERE ts.relid = p_relid
+      AND s.captured_at >= now() - p_window
+    ORDER BY s.captured_at DESC
+    LIMIT 1;
+
+    -- Need at least 2 distinct snapshots
+    IF v_first_snapshot.captured_at IS NULL OR v_last_snapshot.captured_at IS NULL
+       OR v_first_snapshot.captured_at = v_last_snapshot.captured_at THEN
+        RETURN NULL;
+    END IF;
+
+    v_delta_tuples := COALESCE(v_last_snapshot.n_dead_tup, 0) - COALESCE(v_first_snapshot.n_dead_tup, 0);
+    v_delta_seconds := EXTRACT(EPOCH FROM (v_last_snapshot.captured_at - v_first_snapshot.captured_at));
+
+    IF v_delta_seconds <= 0 THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN ROUND(v_delta_tuples::numeric / v_delta_seconds, 4);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.dead_tuple_growth_rate(OID, INTERVAL) IS 'Returns dead tuple growth rate (tuples/second) for a table over a time window';
+
+-- Calculates the rate of row modifications (INSERT/UPDATE/DELETE) over a time window
+-- Returns modifications per second, or NULL if insufficient data
+CREATE OR REPLACE FUNCTION flight_recorder.modification_rate(
+    p_relid OID,
+    p_window INTERVAL
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_first_snapshot RECORD;
+    v_last_snapshot RECORD;
+    v_delta_mods BIGINT;
+    v_delta_seconds NUMERIC;
+BEGIN
+    -- Get earliest snapshot within window
+    SELECT ts.n_tup_ins, ts.n_tup_upd, ts.n_tup_del, s.captured_at
+    INTO v_first_snapshot
+    FROM flight_recorder.table_snapshots ts
+    JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+    WHERE ts.relid = p_relid
+      AND s.captured_at >= now() - p_window
+    ORDER BY s.captured_at ASC
+    LIMIT 1;
+
+    -- Get latest snapshot
+    SELECT ts.n_tup_ins, ts.n_tup_upd, ts.n_tup_del, s.captured_at
+    INTO v_last_snapshot
+    FROM flight_recorder.table_snapshots ts
+    JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+    WHERE ts.relid = p_relid
+      AND s.captured_at >= now() - p_window
+    ORDER BY s.captured_at DESC
+    LIMIT 1;
+
+    -- Need at least 2 distinct snapshots
+    IF v_first_snapshot.captured_at IS NULL OR v_last_snapshot.captured_at IS NULL
+       OR v_first_snapshot.captured_at = v_last_snapshot.captured_at THEN
+        RETURN NULL;
+    END IF;
+
+    v_delta_mods := (COALESCE(v_last_snapshot.n_tup_ins, 0) + COALESCE(v_last_snapshot.n_tup_upd, 0) + COALESCE(v_last_snapshot.n_tup_del, 0))
+                  - (COALESCE(v_first_snapshot.n_tup_ins, 0) + COALESCE(v_first_snapshot.n_tup_upd, 0) + COALESCE(v_first_snapshot.n_tup_del, 0));
+    v_delta_seconds := EXTRACT(EPOCH FROM (v_last_snapshot.captured_at - v_first_snapshot.captured_at));
+
+    IF v_delta_seconds <= 0 THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN ROUND(v_delta_mods::numeric / v_delta_seconds, 4);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.modification_rate(OID, INTERVAL) IS 'Returns row modification rate (modifications/second) for a table over a time window';
+
+-- Calculates the HOT (Heap-Only Tuple) update ratio for a table
+-- Higher ratio indicates more efficient updates that don't require index maintenance
+-- Returns percentage (0-100), or NULL if no updates
+CREATE OR REPLACE FUNCTION flight_recorder.hot_update_ratio(
+    p_relid OID
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_n_tup_upd BIGINT;
+    v_n_tup_hot_upd BIGINT;
+BEGIN
+    -- Get latest snapshot for this table
+    SELECT ts.n_tup_upd, ts.n_tup_hot_upd
+    INTO v_n_tup_upd, v_n_tup_hot_upd
+    FROM flight_recorder.table_snapshots ts
+    JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+    WHERE ts.relid = p_relid
+    ORDER BY s.captured_at DESC
+    LIMIT 1;
+
+    IF v_n_tup_upd IS NULL OR v_n_tup_upd = 0 THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN ROUND((COALESCE(v_n_tup_hot_upd, 0)::numeric / v_n_tup_upd) * 100, 2);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.hot_update_ratio(OID) IS 'Returns HOT update percentage (0-100) for a table based on latest snapshot';
+
+-- Estimates time until dead tuple budget is exhausted based on current growth rate
+-- Returns interval until budget exceeded, NULL if insufficient data or no growth
+CREATE OR REPLACE FUNCTION flight_recorder.time_to_budget_exhaustion(
+    p_relid OID,
+    p_budget BIGINT
+)
+RETURNS INTERVAL
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_current_dead_tuples BIGINT;
+    v_growth_rate NUMERIC;
+    v_remaining_budget BIGINT;
+    v_seconds_to_exhaustion NUMERIC;
+BEGIN
+    -- Get current dead tuple count
+    SELECT ts.n_dead_tup
+    INTO v_current_dead_tuples
+    FROM flight_recorder.table_snapshots ts
+    JOIN flight_recorder.snapshots s ON s.id = ts.snapshot_id
+    WHERE ts.relid = p_relid
+    ORDER BY s.captured_at DESC
+    LIMIT 1;
+
+    IF v_current_dead_tuples IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Get growth rate over last hour
+    v_growth_rate := flight_recorder.dead_tuple_growth_rate(p_relid, '1 hour'::interval);
+
+    -- If no growth rate data or rate is zero/negative, can't estimate
+    IF v_growth_rate IS NULL OR v_growth_rate <= 0 THEN
+        RETURN NULL;
+    END IF;
+
+    v_remaining_budget := p_budget - v_current_dead_tuples;
+
+    -- Already over budget
+    IF v_remaining_budget <= 0 THEN
+        RETURN '0 seconds'::interval;
+    END IF;
+
+    v_seconds_to_exhaustion := v_remaining_budget::numeric / v_growth_rate;
+
+    RETURN make_interval(secs => v_seconds_to_exhaustion);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.time_to_budget_exhaustion(OID, BIGINT) IS 'Estimates time until dead tuple budget is exhausted based on growth rate';
+
+-- =============================================================================
+-- End Autovacuum Observer Functions
+-- =============================================================================
 
 -- Analyzes database metrics within a time window and reports detected anomalies (checkpoints, buffer pressure, lock contention, etc.)
 -- Returns anomalies with severity levels and actionable remediation recommendations
