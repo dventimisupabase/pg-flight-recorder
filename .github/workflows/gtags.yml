@@ -19,30 +19,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install GNU Global and Universal CTags
+      - name: Build gtags-builder image
         run: |
-          sudo apt-get update
-          sudo apt-get install -y global universal-ctags
-
-      - name: Verify installation
-        run: |
-          echo "GNU Global version:"
-          global --version
-          echo ""
-          echo "Universal CTags version:"
-          ctags --version | head -3
+          docker build -t gtags-builder -f tools/Dockerfile.gtags .
 
       - name: Generate GTAGS database
         run: |
-          # Use Universal CTags backend for better SQL support
-          GTAGSLABEL=new-ctags gtags --verbose
+          docker run --rm -v "$(pwd):/src" gtags-builder
           echo ""
           echo "Generated files:"
           ls -lh GPATH GRTAGS GTAGS
 
       - name: Generate HTML with htags
         run: |
-          htags --suggest --frame --symbol --line-number --other --title "pg-flight-recorder Code Browser"
+          docker run --rm -v "$(pwd):/src" --entrypoint htags gtags-builder \
+            --suggest --frame --symbol --line-number --other \
+            --title "pg-flight-recorder Code Browser"
           echo ""
           echo "HTML output:"
           ls -lh HTML/
