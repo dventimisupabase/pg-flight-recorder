@@ -6036,6 +6036,7 @@ $$;
 COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
 
 -- Auto-detect storms and log new ones to query_storms table
+-- Also auto-resolves storms when query counts return to normal
 -- Called by pg_cron when storm detection is enabled
 CREATE OR REPLACE FUNCTION flight_recorder.auto_detect_storms()
 RETURNS INTEGER
@@ -6043,7 +6044,10 @@ LANGUAGE plpgsql AS $$
 DECLARE
     v_enabled BOOLEAN;
     v_storm RECORD;
-    v_count INTEGER := 0;
+    v_active_storm RECORD;
+    v_current_storms BIGINT[];
+    v_new_count INTEGER := 0;
+    v_resolved_count INTEGER := 0;
 BEGIN
     -- Check if storm detection is enabled
     v_enabled := COALESCE(
@@ -6055,7 +6059,32 @@ BEGIN
         RETURN 0;
     END IF;
 
-    -- Detect storms and insert new ones (avoid duplicates for same queryid in last hour)
+    -- Get current storm queryids for comparison
+    SELECT array_agg(queryid) INTO v_current_storms
+    FROM flight_recorder.detect_query_storms()
+    WHERE storm_type != 'NORMAL';
+
+    -- Auto-resolve active storms that are no longer spiking
+    FOR v_active_storm IN
+        SELECT id, queryid, storm_type
+        FROM flight_recorder.query_storms
+        WHERE resolved_at IS NULL
+    LOOP
+        -- If this queryid is not in current storms, auto-resolve it
+        IF v_current_storms IS NULL OR NOT (v_active_storm.queryid = ANY(v_current_storms)) THEN
+            UPDATE flight_recorder.query_storms
+            SET resolved_at = now(),
+                resolution_notes = 'Auto-resolved: query counts returned to normal'
+            WHERE id = v_active_storm.id;
+
+            v_resolved_count := v_resolved_count + 1;
+
+            RAISE NOTICE 'pg-flight-recorder: Storm auto-resolved - % for queryid % (counts normalized)',
+                v_active_storm.storm_type, v_active_storm.queryid;
+        END IF;
+    END LOOP;
+
+    -- Detect and insert new storms (avoid duplicates for same queryid in last hour)
     FOR v_storm IN SELECT * FROM flight_recorder.detect_query_storms() WHERE storm_type != 'NORMAL' LOOP
         -- Only insert if no unresolved storm exists for this queryid
         IF NOT EXISTS (
@@ -6070,21 +6099,25 @@ BEGIN
                 v_storm.queryid, v_storm.query_fingerprint, v_storm.storm_type,
                 v_storm.recent_count, v_storm.baseline_count, v_storm.multiplier
             );
-            v_count := v_count + 1;
+            v_new_count := v_new_count + 1;
 
             RAISE NOTICE 'pg-flight-recorder: Storm detected - % for queryid % (% vs baseline %)',
                 v_storm.storm_type, v_storm.queryid, v_storm.recent_count, v_storm.baseline_count;
         END IF;
     END LOOP;
 
-    IF v_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Detected % new query storm(s)', v_count;
+    IF v_new_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Detected % new query storm(s)', v_new_count;
     END IF;
 
-    RETURN v_count;
+    IF v_resolved_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Auto-resolved % storm(s)', v_resolved_count;
+    END IF;
+
+    RETURN v_new_count;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Called by pg_cron.';
+COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Also auto-resolves storms when counts normalize. Called by pg_cron.';
 
 -- Returns current storm status for monitoring
 -- Shows active (unresolved) storms and recent resolved storms

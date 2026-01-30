@@ -2,11 +2,11 @@
 -- pg-flight-recorder pgTAP Tests - Query Storm Detection
 -- =============================================================================
 -- Tests: Query storm detection definitions, execution, status, resolution, dashboard
--- Test count: 38
+-- Test count: 40
 -- =============================================================================
 
 BEGIN;
-SELECT plan(38);
+SELECT plan(40);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -243,7 +243,35 @@ SELECT matches(
 DELETE FROM flight_recorder.query_storms WHERE queryid = 12345;
 
 -- =============================================================================
--- 8. STORM DASHBOARD VIEW (3 tests)
+-- 8. AUTO-RESOLUTION (2 tests)
+-- =============================================================================
+
+-- Insert an active storm that should be auto-resolved (no matching current spike)
+INSERT INTO flight_recorder.query_storms (queryid, query_fingerprint, storm_type, recent_count, baseline_count, multiplier)
+VALUES (99999, 'SELECT * FROM auto_resolve_test', 'SPIKE', 500, 50, 10.0);
+
+-- Enable storm detection and run auto_detect_storms
+UPDATE flight_recorder.config SET value = 'true' WHERE key = 'storm_detection_enabled';
+
+-- Run auto_detect_storms - should auto-resolve the storm since there's no actual spike
+SELECT lives_ok(
+    $$SELECT flight_recorder.auto_detect_storms()$$,
+    'auto_detect_storms() with auto-resolution should execute without error'
+);
+
+-- Verify the storm was auto-resolved (no current spike for queryid 99999)
+SELECT ok(
+    (SELECT resolved_at IS NOT NULL AND resolution_notes LIKE '%Auto-resolved%'
+     FROM flight_recorder.query_storms WHERE queryid = 99999),
+    'Storm should be auto-resolved when counts normalize'
+);
+
+-- Cleanup
+DELETE FROM flight_recorder.query_storms WHERE queryid = 99999;
+UPDATE flight_recorder.config SET value = 'false' WHERE key = 'storm_detection_enabled';
+
+-- =============================================================================
+-- 9. STORM DASHBOARD VIEW (3 tests)
 -- =============================================================================
 
 SELECT has_view(

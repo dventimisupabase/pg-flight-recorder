@@ -8,8 +8,8 @@
 --   - Add storm detection config settings (storm_detection_enabled,
 --     storm_threshold_multiplier, storm_lookback_interval, storm_baseline_days,
 --     storm_detection_interval_minutes, retention_storms_days)
---   - Add detect_query_storms(), auto_detect_storms(), storm_status(),
---     enable_storm_detection(), disable_storm_detection()
+--   - Add detect_query_storms(), auto_detect_storms() (with auto-resolution),
+--     storm_status(), enable_storm_detection(), disable_storm_detection()
 --   - Add resolve_storm(), resolve_storms_by_queryid(), resolve_all_storms(),
 --     reopen_storm() for storm resolution workflow
 --   - Add storm_dashboard view for at-a-glance monitoring
