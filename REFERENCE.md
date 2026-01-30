@@ -29,6 +29,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 **Part V: Capacity Planning**
 
 - [Capacity Planning](#capacity-planning)
+- [Performance Forecasting](#performance-forecasting)
 
 **Part VI: Reference Material**
 
@@ -1385,6 +1386,210 @@ SELECT metric, utilization_pct, headroom_pct
 FROM flight_recorder.capacity_summary(interval '30 days')
 WHERE utilization_pct < 30
 ORDER BY utilization_pct;
+```
+
+---
+
+## Performance Forecasting
+
+Flight Recorder predicts resource depletion using linear regression on historical data. This enables proactive capacity planning by answering: "When will I run out?"
+
+### Overview
+
+Forecasting extends existing capacity planning:
+
+| Feature | Question Answered | Focus |
+|---------|-------------------|-------|
+| `capacity_summary()` | "What's my current utilization?" | Present state, headroom % |
+| `capacity_dashboard` | "What's my overall status?" | At-a-glance with growth rate |
+| `forecast()` | "When will I run out?" | Future depletion time |
+| `forecast_summary()` | "What resources need attention soon?" | Prioritized by urgency |
+
+**Key benefits:**
+
+- Uses existing snapshot data (no new collection overhead)
+- Predicts when resources will be exhausted
+- Provides confidence scores (R²) for predictions
+- Supports pg_notify alerts for critical forecasts
+
+### Using forecast()
+
+Forecast a single metric:
+
+```sql
+-- Forecast database size growth
+SELECT * FROM flight_recorder.forecast('db_size');
+
+-- Custom lookback and forecast windows
+SELECT * FROM flight_recorder.forecast('db_size', '14 days', '30 days');
+
+-- Forecast connections
+SELECT * FROM flight_recorder.forecast('connections', '7 days', '7 days');
+```
+
+**Supported metrics:**
+
+| Metric | Aliases | Depletion Tracked |
+|--------|---------|-------------------|
+| `db_size` | `storage` | Yes (configurable disk capacity) |
+| `connections` | - | Yes (max_connections) |
+| `wal_bytes` | `wal` | No (informational) |
+| `xact_commit` | `transactions` | No (informational) |
+| `temp_bytes` | `temp` | No (informational) |
+
+**Output columns:**
+
+| Column | Purpose |
+|--------|---------|
+| `metric` | Metric name |
+| `current_value` | Current raw value |
+| `current_display` | Human-readable current value |
+| `forecast_value` | Predicted value at end of forecast window |
+| `forecast_display` | Human-readable forecast value |
+| `rate_per_day` | Growth rate (units per day) |
+| `rate_display` | Human-readable growth rate |
+| `confidence` | R² coefficient (0-1, higher is better) |
+| `depleted_at` | Predicted depletion timestamp (if applicable) |
+| `time_to_depletion` | Time until depletion (if applicable) |
+
+### Using forecast_summary()
+
+Multi-metric forecast dashboard:
+
+```sql
+-- All metrics with default windows (7 days lookback, 7 days forecast)
+SELECT * FROM flight_recorder.forecast_summary();
+
+-- Custom windows
+SELECT * FROM flight_recorder.forecast_summary('14 days', '30 days');
+```
+
+**Output columns:**
+
+| Column | Purpose |
+|--------|---------|
+| `metric` | Metric name |
+| `current` | Current value (display format) |
+| `forecast` | Forecast value (display format) |
+| `rate` | Growth rate per day |
+| `confidence` | R² coefficient (0-1) |
+| `depleted_at` | Predicted depletion timestamp |
+| `status` | Status classification |
+| `recommendation` | Actionable advice |
+
+**Status values:**
+
+| Status | Condition |
+|--------|-----------|
+| `critical` | Depletion within 24 hours |
+| `warning` | Depletion within 7 days |
+| `attention` | Depletion within 30 days |
+| `healthy` | No depletion predicted or >30 days |
+| `insufficient_data` | Not enough snapshots for forecast |
+| `flat` | No significant trend detected |
+
+### Config Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `forecast_enabled` | `true` | Enable/disable forecasting |
+| `forecast_lookback_days` | `7` | Default lookback window |
+| `forecast_window_days` | `7` | Default forecast window |
+| `forecast_alert_enabled` | `false` | Enable pg_notify alerts |
+| `forecast_alert_threshold` | `3 days` | Alert when depletion is within this window |
+| `forecast_notify_channel` | `flight_recorder_forecasts` | pg_notify channel name |
+| `forecast_disk_capacity_gb` | `100` | Assumed disk capacity for db_size forecasts |
+| `forecast_min_samples` | `10` | Minimum snapshots required for forecast |
+| `forecast_min_confidence` | `0.5` | Minimum R² for alerts |
+
+### Setting Up Alerts
+
+Enable forecast alerts to receive pg_notify messages when resources are predicted to deplete soon:
+
+```sql
+-- Enable alerts
+UPDATE flight_recorder.config
+SET value = 'true'
+WHERE key = 'forecast_alert_enabled';
+
+-- Configure disk capacity (if different from default)
+UPDATE flight_recorder.config
+SET value = '500'  -- 500 GB
+WHERE key = 'forecast_disk_capacity_gb';
+
+-- Schedule alert checks via pg_cron (every 4 hours)
+SELECT cron.schedule(
+    'forecast-alerts',
+    '0 */4 * * *',
+    'SELECT flight_recorder.check_forecast_alerts()'
+);
+```
+
+**Listen for alerts:**
+
+```sql
+-- In a separate session
+LISTEN flight_recorder_forecasts;
+
+-- Alerts are JSON payloads:
+-- {"type":"forecast_alert","metric":"db_size","current_value":"45 GB","depleted_at":"2026-02-15 10:30:00","confidence":0.92,"status":"warning","timestamp":"2026-01-30 14:00:00"}
+```
+
+### Interpreting Results
+
+**High confidence (R² > 0.8):**
+
+The trend is clear and predictions are reliable. Take action based on status.
+
+**Medium confidence (R² 0.5-0.8):**
+
+Some variability in data. Predictions are directionally correct but timing may vary.
+
+**Low confidence (R² < 0.5):**
+
+Data is noisy or non-linear. Consider using longer lookback windows or investigating anomalies.
+
+### Practical Examples
+
+**Weekly capacity review:**
+
+```sql
+SELECT metric, current, forecast, rate, status, recommendation
+FROM flight_recorder.forecast_summary('14 days', '30 days')
+ORDER BY
+    CASE status
+        WHEN 'critical' THEN 1
+        WHEN 'warning' THEN 2
+        WHEN 'attention' THEN 3
+        ELSE 4
+    END;
+```
+
+**Storage planning:**
+
+```sql
+-- Check when disk will be full
+SELECT
+    current_display AS "Current Size",
+    rate_display AS "Growth Rate",
+    depleted_at AS "Full At",
+    time_to_depletion AS "Time Left",
+    confidence AS "Confidence"
+FROM flight_recorder.forecast('db_size', '30 days', '90 days');
+```
+
+**Connection pool sizing:**
+
+```sql
+SELECT
+    current_display AS "Connections",
+    rate_display AS "Trend",
+    CASE
+        WHEN depleted_at IS NOT NULL THEN
+            format('Will hit limit at %s', depleted_at)
+        ELSE 'No limit reached in forecast window'
+    END AS "Prediction"
+FROM flight_recorder.forecast('connections', '7 days', '30 days');
 ```
 
 ---

@@ -21,7 +21,7 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 
 ## Table of Contents
 
-1. [Performance Forecasting / Predictive Alerts](#1-performance-forecasting--predictive-alerts)
+1. [Performance Forecasting / Predictive Alerts](#1-performance-forecasting--predictive-alerts) ✅ **DONE**
 2. [Query Fingerprinting & Storm Detection](#2-query-fingerprinting--storm-detection) ✅ **DONE**
 3. [Time-Travel Debugging](#3-time-travel-debugging-with-second-level-precision)
 4. [Blast Radius Analysis](#4-blast-radius-analysis)
@@ -32,9 +32,11 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 
 ---
 
-## 1. Performance Forecasting / Predictive Alerts
+## 1. Performance Forecasting / Predictive Alerts ✅ IMPLEMENTED
 
 **Complexity**: 🔴 High (3-5 days)
+
+> **Status**: ✅ **Fully implemented** in v2.14. Includes `_linear_regression()` helper for statistical analysis, `forecast()` for single metric prediction with depletion time, `forecast_summary()` for multi-metric dashboard with status classification, `check_forecast_alerts()` for scheduled pg_notify alerts, and configurable settings. See `REFERENCE.md` for usage.
 
 ### The Problem
 
@@ -2077,7 +2079,7 @@ Based on **value vs. complexity**:
 |------|---------|-------|------------|--------|
 | 1 | **Query Storm Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.10-2.11) - Includes severity & correlation |
 | 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.12) |
-| 3 | **Performance Forecasting** | 🟠 High | 🔴 High | ⬚ Not started |
+| 3 | **Performance Forecasting** | 🟠 High | 🔴 High | ✅ **DONE** (v2.14) |
 | 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | ⬚ Not started |
 | 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | ⬚ Not started |
 | 6 | **Canary Queries** | 🟡 Medium | 🟡 Medium | ✅ **DONE** (v2.9) |
@@ -2091,12 +2093,13 @@ Based on **value vs. complexity**:
 1. ~~**Prototype Top 2**: Build query storm + canary queries~~ ✅ Done
 2. ~~**Regression Detection**: Next priority~~ ✅ Done (v2.12)
 3. ~~**Visual Timeline**: ASCII charts for metrics~~ ✅ Done (v2.13)
-4. **Validate with Real Data**: Test on production databases
-5. **Performance Forecasting**: Next priority - proactive capacity warnings
-6. **Iterate**: Refine based on real-world usage
+4. ~~**Performance Forecasting**: Proactive capacity warnings~~ ✅ Done (v2.14)
+5. **Validate with Real Data**: Test on production databases
+6. **Time-Travel Debugging**: Next priority
+7. **Iterate**: Refine based on real-world usage
 
 ---
 
 **Last Updated**: 2026-01-30
-**Status**: 5 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline)
+**Status**: 6 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline, Performance Forecasting)
 **Maintainer**: Flight Recorder Team

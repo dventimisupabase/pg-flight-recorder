@@ -676,6 +676,104 @@ COMMENT ON FUNCTION flight_recorder._sparkline IS
 'Generates a compact sparkline from numeric array using Unicode block characters (▁▂▃▄▅▆▇█). Used for visual trend display in reports.';
 
 
+-- Performs least-squares linear regression on paired arrays
+-- Returns slope (rate of change), intercept, and R² (coefficient of determination)
+-- Used by forecast functions to predict resource depletion
+CREATE OR REPLACE FUNCTION flight_recorder._linear_regression(
+    p_x NUMERIC[],
+    p_y NUMERIC[]
+)
+RETURNS TABLE(
+    slope NUMERIC,
+    intercept NUMERIC,
+    r_squared NUMERIC
+)
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_n INTEGER;
+    v_sum_x NUMERIC := 0;
+    v_sum_y NUMERIC := 0;
+    v_sum_xy NUMERIC := 0;
+    v_sum_xx NUMERIC := 0;
+    v_sum_yy NUMERIC := 0;
+    v_mean_x NUMERIC;
+    v_mean_y NUMERIC;
+    v_slope NUMERIC;
+    v_intercept NUMERIC;
+    v_ss_tot NUMERIC;
+    v_ss_res NUMERIC;
+    v_r_squared NUMERIC;
+    i INTEGER;
+BEGIN
+    -- Validate inputs
+    IF p_x IS NULL OR p_y IS NULL THEN
+        RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
+        RETURN;
+    END IF;
+
+    v_n := array_length(p_x, 1);
+
+    -- Need at least 3 points for meaningful regression
+    IF v_n IS NULL OR v_n < 3 OR array_length(p_y, 1) != v_n THEN
+        RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
+        RETURN;
+    END IF;
+
+    -- Calculate sums
+    FOR i IN 1..v_n LOOP
+        IF p_x[i] IS NOT NULL AND p_y[i] IS NOT NULL THEN
+            v_sum_x := v_sum_x + p_x[i];
+            v_sum_y := v_sum_y + p_y[i];
+            v_sum_xy := v_sum_xy + (p_x[i] * p_y[i]);
+            v_sum_xx := v_sum_xx + (p_x[i] * p_x[i]);
+            v_sum_yy := v_sum_yy + (p_y[i] * p_y[i]);
+        END IF;
+    END LOOP;
+
+    -- Calculate means
+    v_mean_x := v_sum_x / v_n;
+    v_mean_y := v_sum_y / v_n;
+
+    -- Calculate slope: m = (n*sum(xy) - sum(x)*sum(y)) / (n*sum(x²) - sum(x)²)
+    IF (v_n * v_sum_xx - v_sum_x * v_sum_x) = 0 THEN
+        -- All x values are the same (vertical line)
+        RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
+        RETURN;
+    END IF;
+
+    v_slope := (v_n * v_sum_xy - v_sum_x * v_sum_y) / (v_n * v_sum_xx - v_sum_x * v_sum_x);
+
+    -- Calculate intercept: b = mean(y) - m * mean(x)
+    v_intercept := v_mean_y - v_slope * v_mean_x;
+
+    -- Calculate R² (coefficient of determination)
+    -- R² = 1 - SS_res / SS_tot where SS_tot = sum((y - mean(y))²) and SS_res = sum((y - predicted)²)
+    v_ss_tot := v_sum_yy - (v_sum_y * v_sum_y / v_n);
+    v_ss_res := 0;
+
+    FOR i IN 1..v_n LOOP
+        IF p_x[i] IS NOT NULL AND p_y[i] IS NOT NULL THEN
+            v_ss_res := v_ss_res + power(p_y[i] - (v_slope * p_x[i] + v_intercept), 2);
+        END IF;
+    END LOOP;
+
+    IF v_ss_tot = 0 THEN
+        -- All y values are the same (horizontal line) - perfect fit
+        v_r_squared := 1.0;
+    ELSE
+        v_r_squared := GREATEST(0, 1 - v_ss_res / v_ss_tot);
+    END IF;
+
+    RETURN QUERY SELECT
+        round(v_slope, 10),
+        round(v_intercept, 10),
+        round(v_r_squared, 4);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._linear_regression IS
+'Performs least-squares linear regression on paired numeric arrays. Returns slope (rate of change), intercept, and R² (coefficient of determination, 0-1 where 1 is perfect fit). Returns NULLs if insufficient data (<3 points) or invalid input.';
+
+
 -- Generates a horizontal progress bar showing filled/empty portions
 -- Input: Current value, maximum value, optional width (default 20)
 -- Output: String like ███████████████░░░░░ showing percentage filled
@@ -1036,7 +1134,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.13'),
+    ('schema_version', '2.14'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -1138,7 +1236,16 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('regression_severity_low_max', '200.0'),
     ('regression_severity_medium_max', '500.0'),
     ('regression_severity_high_max', '1000.0'),
-    ('retention_regressions_days', '30')
+    ('retention_regressions_days', '30'),
+    ('forecast_enabled', 'true'),
+    ('forecast_lookback_days', '7'),
+    ('forecast_window_days', '7'),
+    ('forecast_alert_enabled', 'false'),
+    ('forecast_alert_threshold', '3 days'),
+    ('forecast_notify_channel', 'flight_recorder_forecasts'),
+    ('forecast_disk_capacity_gb', '100'),
+    ('forecast_min_samples', '10'),
+    ('forecast_min_confidence', '0.5')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -10846,6 +10953,447 @@ LANGUAGE sql STABLE AS $$
 $$;
 COMMENT ON FUNCTION flight_recorder.db_role_config_summary() IS
 'Overview of database/role configuration overrides grouped by scope. Shows which databases and roles have custom settings.';
+
+
+-- =============================================================================
+-- PERFORMANCE FORECASTING
+-- =============================================================================
+-- Predicts resource depletion using linear regression on historical data.
+-- Enables proactive capacity planning by answering "When will I run out?"
+
+-- Forecasts a single metric using linear regression
+-- Supported metrics: db_size/storage, connections, wal/wal_bytes, transactions/xact_commit, temp/temp_bytes
+CREATE OR REPLACE FUNCTION flight_recorder.forecast(
+    p_metric TEXT,
+    p_lookback INTERVAL DEFAULT '7 days',
+    p_forecast_window INTERVAL DEFAULT '7 days'
+)
+RETURNS TABLE(
+    metric TEXT,
+    current_value NUMERIC,
+    current_display TEXT,
+    forecast_value NUMERIC,
+    forecast_display TEXT,
+    rate_per_day NUMERIC,
+    rate_display TEXT,
+    confidence NUMERIC,
+    depleted_at TIMESTAMPTZ,
+    time_to_depletion INTERVAL
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_min_samples INTEGER;
+    v_metric_col TEXT;
+    v_capacity NUMERIC;
+    v_x NUMERIC[];
+    v_y NUMERIC[];
+    v_regression RECORD;
+    v_current NUMERIC;
+    v_forecast NUMERIC;
+    v_rate_per_second NUMERIC;
+    v_rate_per_day NUMERIC;
+    v_depleted_at TIMESTAMPTZ;
+    v_time_to_depletion INTERVAL;
+    v_sample_count INTEGER;
+    v_max_connections INTEGER;
+    v_disk_capacity_gb NUMERIC;
+BEGIN
+    -- Check if forecasting is enabled
+    v_enabled := COALESCE(
+        flight_recorder._get_config('forecast_enabled', 'true')::boolean,
+        true
+    );
+    IF NOT v_enabled THEN
+        metric := p_metric;
+        current_display := 'Forecasting disabled';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    v_min_samples := COALESCE(
+        flight_recorder._get_config('forecast_min_samples', '10')::integer,
+        10
+    );
+
+    -- Map metric aliases to column names
+    v_metric_col := CASE lower(p_metric)
+        WHEN 'db_size' THEN 'db_size_bytes'
+        WHEN 'storage' THEN 'db_size_bytes'
+        WHEN 'connections' THEN 'connections_total'
+        WHEN 'wal' THEN 'wal_bytes'
+        WHEN 'wal_bytes' THEN 'wal_bytes'
+        WHEN 'transactions' THEN 'xact_commit'
+        WHEN 'xact_commit' THEN 'xact_commit'
+        WHEN 'temp' THEN 'temp_bytes'
+        WHEN 'temp_bytes' THEN 'temp_bytes'
+        ELSE NULL
+    END;
+
+    IF v_metric_col IS NULL THEN
+        metric := p_metric;
+        current_display := format('Unknown metric: %s. Supported: db_size, connections, wal, transactions, temp', p_metric);
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Get data points for regression
+    EXECUTE format(
+        'SELECT
+            array_agg(EXTRACT(EPOCH FROM captured_at) ORDER BY captured_at),
+            array_agg(%I::numeric ORDER BY captured_at),
+            count(*)
+         FROM flight_recorder.snapshots
+         WHERE captured_at > now() - $1
+           AND %I IS NOT NULL',
+        v_metric_col, v_metric_col
+    ) INTO v_x, v_y, v_sample_count
+    USING p_lookback;
+
+    -- Check for sufficient data
+    IF v_sample_count < v_min_samples THEN
+        metric := p_metric;
+        current_value := v_y[array_length(v_y, 1)];
+        current_display := CASE v_metric_col
+            WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
+            WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
+            WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
+            ELSE current_value::text
+        END;
+        rate_display := format('Insufficient data (%s samples, need %s)', v_sample_count, v_min_samples);
+        confidence := 0;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Perform linear regression
+    SELECT * INTO v_regression FROM flight_recorder._linear_regression(v_x, v_y);
+
+    IF v_regression.slope IS NULL THEN
+        metric := p_metric;
+        current_value := v_y[array_length(v_y, 1)];
+        current_display := CASE v_metric_col
+            WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
+            WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
+            WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
+            ELSE current_value::text
+        END;
+        rate_display := 'Unable to calculate trend (constant values or invalid data)';
+        confidence := 0;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Get current value (most recent)
+    v_current := v_y[array_length(v_y, 1)];
+
+    -- Calculate forecast value at end of forecast window
+    v_rate_per_second := v_regression.slope;
+    v_rate_per_day := v_rate_per_second * 86400;
+    v_forecast := v_current + (v_rate_per_second * EXTRACT(EPOCH FROM p_forecast_window));
+
+    -- Calculate depletion time based on metric type
+    CASE v_metric_col
+        WHEN 'db_size_bytes' THEN
+            -- Disk capacity from config
+            v_disk_capacity_gb := COALESCE(
+                flight_recorder._get_config('forecast_disk_capacity_gb', '100')::numeric,
+                100
+            );
+            v_capacity := v_disk_capacity_gb * 1024 * 1024 * 1024;
+
+            IF v_rate_per_second > 0 AND v_current < v_capacity THEN
+                v_time_to_depletion := make_interval(secs => (v_capacity - v_current) / v_rate_per_second);
+                v_depleted_at := now() + v_time_to_depletion;
+            END IF;
+
+        WHEN 'connections_total' THEN
+            -- Max connections from server settings
+            SELECT setting::integer INTO v_max_connections
+            FROM pg_settings WHERE name = 'max_connections';
+            v_capacity := v_max_connections;
+
+            IF v_rate_per_second > 0 AND v_current < v_capacity THEN
+                v_time_to_depletion := make_interval(secs => (v_capacity - v_current) / v_rate_per_second);
+                v_depleted_at := now() + v_time_to_depletion;
+            END IF;
+
+        ELSE
+            -- WAL, transactions, temp_bytes are informational (no depletion concept)
+            v_capacity := NULL;
+            v_depleted_at := NULL;
+            v_time_to_depletion := NULL;
+    END CASE;
+
+    -- Build result
+    metric := p_metric;
+    current_value := v_current;
+    current_display := CASE v_metric_col
+        WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(v_current::bigint)
+        WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(v_current::bigint)
+        WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(v_current::bigint)
+        WHEN 'connections_total' THEN format('%s / %s', v_current::integer, v_max_connections)
+        ELSE v_current::text
+    END;
+    forecast_value := v_forecast;
+    forecast_display := CASE v_metric_col
+        WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(GREATEST(0, v_forecast)::bigint)
+        WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(GREATEST(0, v_forecast)::bigint)
+        WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(GREATEST(0, v_forecast)::bigint)
+        WHEN 'connections_total' THEN format('%s / %s', GREATEST(0, v_forecast)::integer, v_max_connections)
+        ELSE GREATEST(0, v_forecast)::text
+    END;
+    rate_per_day := v_rate_per_day;
+    rate_display := CASE v_metric_col
+        WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(v_rate_per_day::bigint) || '/day'
+        WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(v_rate_per_day::bigint) || '/day'
+        WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(v_rate_per_day::bigint) || '/day'
+        WHEN 'connections_total' THEN round(v_rate_per_day, 2)::text || '/day'
+        ELSE round(v_rate_per_day, 2)::text || '/day'
+    END;
+    confidence := v_regression.r_squared;
+    depleted_at := v_depleted_at;
+    time_to_depletion := v_time_to_depletion;
+
+    RETURN NEXT;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.forecast(TEXT, INTERVAL, INTERVAL) IS
+'Forecasts a single metric using linear regression. Predicts future values and time-to-depletion for capacity planning. Supported metrics: db_size/storage, connections, wal/wal_bytes, transactions/xact_commit, temp/temp_bytes. Returns current value, forecast value, growth rate, R² confidence (0-1), and estimated depletion time for applicable metrics.';
+
+
+-- Multi-metric forecast summary dashboard
+-- Returns all forecastable metrics with status classification and recommendations
+CREATE OR REPLACE FUNCTION flight_recorder.forecast_summary(
+    p_lookback INTERVAL DEFAULT '7 days',
+    p_forecast_window INTERVAL DEFAULT '7 days'
+)
+RETURNS TABLE(
+    metric TEXT,
+    current TEXT,
+    forecast TEXT,
+    rate TEXT,
+    confidence NUMERIC,
+    depleted_at TIMESTAMPTZ,
+    status TEXT,
+    recommendation TEXT
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_metrics TEXT[] := ARRAY['db_size', 'connections', 'wal_bytes', 'xact_commit', 'temp_bytes'];
+    v_metric TEXT;
+    v_forecast RECORD;
+    v_status TEXT;
+    v_recommendation TEXT;
+    v_min_confidence NUMERIC;
+BEGIN
+    v_min_confidence := COALESCE(
+        flight_recorder._get_config('forecast_min_confidence', '0.5')::numeric,
+        0.5
+    );
+
+    FOREACH v_metric IN ARRAY v_metrics LOOP
+        SELECT * INTO v_forecast FROM flight_recorder.forecast(v_metric, p_lookback, p_forecast_window);
+
+        -- Determine status based on time_to_depletion and confidence
+        IF v_forecast.confidence IS NULL OR v_forecast.confidence < 0.1 THEN
+            v_status := 'insufficient_data';
+            v_recommendation := 'Need more data for reliable forecast';
+        ELSIF v_forecast.rate_per_day IS NOT NULL AND abs(v_forecast.rate_per_day) < 0.001 THEN
+            v_status := 'flat';
+            v_recommendation := CASE v_metric
+                WHEN 'db_size' THEN 'Database size is stable'
+                WHEN 'connections' THEN 'Connection usage is stable'
+                WHEN 'wal_bytes' THEN 'WAL generation is minimal'
+                WHEN 'xact_commit' THEN 'Transaction rate is stable'
+                WHEN 'temp_bytes' THEN 'No temp file usage detected'
+                ELSE 'Metric is stable'
+            END;
+        ELSIF v_forecast.depleted_at IS NOT NULL THEN
+            -- Calculate status based on time to depletion
+            IF v_forecast.time_to_depletion < interval '24 hours' THEN
+                v_status := 'critical';
+                v_recommendation := CASE v_metric
+                    WHEN 'db_size' THEN 'CRITICAL: Disk space will be exhausted within 24 hours. Immediate action required.'
+                    WHEN 'connections' THEN 'CRITICAL: Connection limit will be reached within 24 hours. Increase max_connections or implement pooling.'
+                    ELSE format('CRITICAL: %s will be exhausted within 24 hours', v_metric)
+                END;
+            ELSIF v_forecast.time_to_depletion < interval '7 days' THEN
+                v_status := 'warning';
+                v_recommendation := CASE v_metric
+                    WHEN 'db_size' THEN format('WARNING: Disk space will be exhausted in %s. Plan storage expansion.', v_forecast.time_to_depletion)
+                    WHEN 'connections' THEN format('WARNING: Connection limit will be reached in %s. Consider connection pooling.', v_forecast.time_to_depletion)
+                    ELSE format('WARNING: %s will be exhausted in %s', v_metric, v_forecast.time_to_depletion)
+                END;
+            ELSIF v_forecast.time_to_depletion < interval '30 days' THEN
+                v_status := 'attention';
+                v_recommendation := CASE v_metric
+                    WHEN 'db_size' THEN 'Monitor storage growth. Consider capacity increase within 30 days.'
+                    WHEN 'connections' THEN 'Monitor connection usage trend. May need adjustment soon.'
+                    ELSE format('%s trending toward capacity. Monitor closely.', v_metric)
+                END;
+            ELSE
+                v_status := 'healthy';
+                v_recommendation := CASE v_metric
+                    WHEN 'db_size' THEN 'Storage growth is sustainable'
+                    WHEN 'connections' THEN 'Connection usage is within healthy range'
+                    ELSE format('%s growth is sustainable', v_metric)
+                END;
+            END IF;
+        ELSE
+            -- No depletion concept (WAL, transactions, temp) - check trend direction
+            IF v_forecast.rate_per_day > 0 THEN
+                v_status := 'healthy';
+                v_recommendation := CASE v_metric
+                    WHEN 'wal_bytes' THEN 'WAL generation rate is normal'
+                    WHEN 'xact_commit' THEN 'Transaction rate trending up'
+                    WHEN 'temp_bytes' THEN 'Temp file usage is present. Consider increasing work_mem if excessive.'
+                    ELSE format('%s is increasing normally', v_metric)
+                END;
+            ELSIF v_forecast.rate_per_day < 0 THEN
+                v_status := 'healthy';
+                v_recommendation := CASE v_metric
+                    WHEN 'wal_bytes' THEN 'WAL generation decreasing (lower write activity)'
+                    WHEN 'xact_commit' THEN 'Transaction rate declining (reduced load or possible issue)'
+                    WHEN 'temp_bytes' THEN 'Temp file usage is declining'
+                    ELSE format('%s is decreasing', v_metric)
+                END;
+            ELSE
+                v_status := 'flat';
+                v_recommendation := 'No significant trend detected';
+            END IF;
+        END IF;
+
+        -- Low confidence warning
+        IF v_forecast.confidence IS NOT NULL
+           AND v_forecast.confidence < v_min_confidence
+           AND v_status NOT IN ('insufficient_data', 'flat') THEN
+            v_recommendation := v_recommendation || format(' (low confidence: %s%%)', round(v_forecast.confidence * 100)::integer);
+        END IF;
+
+        metric := v_metric;
+        current := v_forecast.current_display;
+        forecast := v_forecast.forecast_display;
+        rate := v_forecast.rate_display;
+        confidence := v_forecast.confidence;
+        depleted_at := v_forecast.depleted_at;
+        status := v_status;
+        recommendation := v_recommendation;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.forecast_summary(INTERVAL, INTERVAL) IS
+'Multi-metric forecast dashboard. Returns all forecastable metrics with current values, predictions, growth rates, depletion estimates, and status classification (critical/warning/attention/healthy/flat/insufficient_data). Use for proactive capacity planning.';
+
+
+-- Internal helper to send forecast alerts via pg_notify
+CREATE OR REPLACE FUNCTION flight_recorder._notify_forecast(
+    p_metric TEXT,
+    p_current_value TEXT,
+    p_depleted_at TIMESTAMPTZ,
+    p_confidence NUMERIC,
+    p_status TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_channel TEXT;
+    v_payload JSONB;
+BEGIN
+    v_channel := COALESCE(
+        flight_recorder._get_config('forecast_notify_channel', 'flight_recorder_forecasts'),
+        'flight_recorder_forecasts'
+    );
+
+    v_payload := jsonb_build_object(
+        'type', 'forecast_alert',
+        'metric', p_metric,
+        'current_value', p_current_value,
+        'depleted_at', p_depleted_at,
+        'confidence', p_confidence,
+        'status', p_status,
+        'timestamp', now()
+    );
+
+    PERFORM pg_notify(v_channel, v_payload::text);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._notify_forecast IS
+'Internal helper to send forecast alerts via pg_notify. Payload includes metric, current value, predicted depletion time, confidence, and status.';
+
+
+-- Scheduled alert checker for forecast-based capacity warnings
+-- Designed to be called via pg_cron. Sends pg_notify for resources predicted to deplete soon.
+CREATE OR REPLACE FUNCTION flight_recorder.check_forecast_alerts()
+RETURNS INTEGER
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_alert_enabled BOOLEAN;
+    v_threshold INTERVAL;
+    v_min_confidence NUMERIC;
+    v_lookback INTERVAL;
+    v_forecast RECORD;
+    v_alert_count INTEGER := 0;
+BEGIN
+    -- Check if forecasting is enabled
+    v_enabled := COALESCE(
+        flight_recorder._get_config('forecast_enabled', 'true')::boolean,
+        true
+    );
+    IF NOT v_enabled THEN
+        RETURN 0;
+    END IF;
+
+    -- Check if alerts are enabled
+    v_alert_enabled := COALESCE(
+        flight_recorder._get_config('forecast_alert_enabled', 'false')::boolean,
+        false
+    );
+    IF NOT v_alert_enabled THEN
+        RETURN 0;
+    END IF;
+
+    -- Get configuration
+    v_threshold := COALESCE(
+        flight_recorder._get_config('forecast_alert_threshold', '3 days')::interval,
+        interval '3 days'
+    );
+    v_min_confidence := COALESCE(
+        flight_recorder._get_config('forecast_min_confidence', '0.5')::numeric,
+        0.5
+    );
+    v_lookback := COALESCE(
+        (flight_recorder._get_config('forecast_lookback_days', '7') || ' days')::interval,
+        interval '7 days'
+    );
+
+    -- Check each metric
+    FOR v_forecast IN
+        SELECT *
+        FROM flight_recorder.forecast_summary(v_lookback, v_threshold)
+        WHERE status IN ('critical', 'warning')
+          AND confidence >= v_min_confidence
+          AND depleted_at IS NOT NULL
+          AND depleted_at <= now() + v_threshold
+    LOOP
+        -- Send notification
+        PERFORM flight_recorder._notify_forecast(
+            v_forecast.metric,
+            v_forecast.current,
+            v_forecast.depleted_at,
+            v_forecast.confidence,
+            v_forecast.status
+        );
+        v_alert_count := v_alert_count + 1;
+    END LOOP;
+
+    RETURN v_alert_count;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.check_forecast_alerts() IS
+'Scheduled alert checker for forecast-based capacity warnings. Call via pg_cron to receive pg_notify alerts when resources are predicted to deplete within the configured threshold. Returns count of alerts sent.';
 
 
 SELECT flight_recorder.snapshot();
