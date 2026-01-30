@@ -9898,8 +9898,8 @@ BEGIN
     provisioned_capacity := 'Target: >95%';
     utilization_pct := CASE
         WHEN v_cache_hit_ratio IS NULL THEN NULL
-        WHEN v_cache_hit_ratio >= 95 THEN round((100 - v_cache_hit_ratio) * 20, 1)
-        ELSE round(100 - (v_cache_hit_ratio / 95.0) * 100, 1)
+        WHEN v_cache_hit_ratio >= 95 THEN LEAST(100, GREATEST(0, round((100 - v_cache_hit_ratio) * 20, 1)))
+        ELSE LEAST(100, GREATEST(0, round(100 - (v_cache_hit_ratio / 95.0) * 100, 1)))
     END;
     headroom_pct := CASE WHEN utilization_pct IS NOT NULL THEN round(GREATEST(0, 100 - utilization_pct), 1) ELSE NULL END;
     status := CASE
