@@ -35,6 +35,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
 - [Testing and Benchmarking](#testing-and-benchmarking)
+- [Code Browser](#code-browser)
 
 ---
 
@@ -1746,4 +1747,34 @@ SELECT collection_type,
 FROM flight_recorder.collection_stats
 WHERE started_at > now() - interval '1 day'
 GROUP BY collection_type;
+```
+
+## Code Browser
+
+An interactive HTML code browser is available at:
+
+**<https://dventimisupabase.github.io/pg-flight-recorder/>**
+
+Generated using GNU Global with Universal CTags, it provides:
+
+- Symbol definitions and cross-references
+- File browser with syntax highlighting
+- Full-text search across the codebase
+
+The code browser is automatically updated on every push to main.
+
+### Local Code Navigation
+
+For local development, use the `./tools/gg` wrapper:
+
+```bash
+# Set up the GTAGS database (choose one method)
+./tools/setup-gtags              # requires global + universal-ctags
+./tools/setup-gtags --download   # download pre-built from GitHub Actions
+./tools/setup-gtags --docker     # use Docker (no local install needed)
+
+# Navigate code
+./tools/gg def snapshots         # find symbol definition
+./tools/gg grep take_snapshot    # search file contents
+./tools/gg ctx install.sql:100   # show context around line
 ```
