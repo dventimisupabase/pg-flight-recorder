@@ -42,9 +42,9 @@ Only fall back to Grep/Glob if `sql-find` returns nothing or for patterns `sql-f
 # Lists all files containing "snapshots"
 
 ./tools/sql-find stats
-# Files indexed: 3
-# Tables: 18
-# Functions: 78
+# Files indexed: 6
+# Tables: 30
+# Functions: 84
 # Views: 9
 ```
 
