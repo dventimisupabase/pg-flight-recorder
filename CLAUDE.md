@@ -1,16 +1,29 @@
 # Project Guidelines
 
-## Code Search
+## Code Search (IMPORTANT)
 
-The `./tools/gg` script wraps GNU Global for code navigation:
+**ALWAYS use `./tools/gg` instead of Grep/Glob for code search in this codebase.**
 
-| Command | Description |
-|---------|-------------|
-| `gg def <sym>` | Find symbol definitions (tables, columns, functions) |
-| `gg ref <sym>` | Find references (limited for SQL - often returns empty) |
-| `gg path <pattern>` | Find file paths matching pattern (e.g., `\.sql$`) |
-| `gg grep <pattern>` | List files containing pattern in content |
-| `gg ctx <file>:<line>` | Show ±20 lines of context around a location |
+The `gg` script uses GNU Global which understands SQL symbols (tables, columns, functions) and provides faster, more accurate results than regex search. GTAGS auto-fetches on first use—no setup required.
+
+### Preferred workflow
+
+1. **Find definitions**: `./tools/gg def <symbol>` (NOT Grep)
+2. **Find text occurrences**: `./tools/gg grep <pattern>` (NOT Grep)
+3. **Find files by path**: `./tools/gg path <pattern>` (NOT Glob)
+4. **View context**: `./tools/gg ctx <file>:<line>` (NOT Read with offset)
+
+Only fall back to Grep/Glob if `gg` returns nothing or for patterns `gg` doesn't support.
+
+### Command reference
+
+| Command                | Description                                             |
+|------------------------|---------------------------------------------------------|
+| `gg def <sym>`         | Find symbol definitions (tables, columns, functions)    |
+| `gg ref <sym>`         | Find references (limited for SQL - often returns empty) |
+| `gg path <pattern>`    | Find file paths matching pattern (e.g., `\.sql$`)       |
+| `gg grep <pattern>`    | List files containing pattern in content                |
+| `gg ctx <file>:<line>` | Show ±20 lines of context around a location             |
 
 ### Examples
 
