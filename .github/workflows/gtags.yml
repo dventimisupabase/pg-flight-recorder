@@ -19,25 +19,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build gtags-builder image
-        run: |
-          docker build -t gtags-builder -f tools/Dockerfile.gtags .
+      - name: Pull gtags-builder image
+        run: docker pull dventimisupabase/gtags-builder:latest
 
       - name: Generate GTAGS database
         run: |
-          docker run --rm -v "$(pwd):/src" gtags-builder
+          docker run --rm -v "$(pwd):/src" dventimisupabase/gtags-builder:latest
           echo ""
           echo "Generated files:"
           ls -lh GPATH GRTAGS GTAGS
 
       - name: Generate HTML with htags
         run: |
-          docker run --rm -v "$(pwd):/src" --entrypoint htags gtags-builder \
+          docker run --rm -v "$(pwd):/src" --entrypoint htags dventimisupabase/gtags-builder:latest \
             --suggest --frame --symbol --line-number --other \
             --title "pg-flight-recorder Code Browser"
           echo ""
           echo "HTML output:"
           ls -lh HTML/
+
+      - name: Fix permissions
+        run: sudo chown -R $USER:$USER GPATH GRTAGS GTAGS HTML/
 
       - name: Upload GTAGS as artifact
         uses: actions/upload-artifact@v4

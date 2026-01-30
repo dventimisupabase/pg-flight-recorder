@@ -118,16 +118,15 @@ run_in_docker() {
         exit 1
     fi
 
-    local script_dir
-    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local image="dventimisupabase/gtags-builder:latest"
 
-    # Build image from Dockerfile if not already built
-    if ! docker image inspect gtags-builder &>/dev/null; then
-        echo "Building gtags-builder image (first run only)..."
-        docker build -t gtags-builder -f "$script_dir/Dockerfile.gtags" "$script_dir/.." || exit 1
+    # Pull image if not present
+    if ! docker image inspect "$image" &>/dev/null; then
+        echo "Pulling $image..."
+        docker pull "$image" || exit 1
     fi
 
-    docker run --rm -v "$(pwd):/src" gtags-builder
+    docker run --rm -v "$(pwd):/src" "$image"
 
     echo ""
     echo "Done. Generated files:"
