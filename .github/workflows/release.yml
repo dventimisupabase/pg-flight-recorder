@@ -3,11 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v1.0.0)'
+        description: 'Version tag (e.g., v2.16)'
         required: true
         type: string
 
@@ -22,14 +22,21 @@ jobs:
 
       - name: Validate version tag format
         run: |
-          if [[ "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Valid version tag: ${{ github.ref_name }}"
-          elif [[ "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Valid version tag: ${{ inputs.version }}"
+          VERSION="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          fi
+
+          # Support both v#.# and v#.#.# formats
+          if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Valid version tag: $VERSION"
           else
-            echo "Invalid version tag format. Expected: v#.#.#"
+            echo "Invalid version tag format. Expected: v#.# or v#.#.#"
             exit 1
           fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Run full test suite
         run: |
@@ -58,48 +65,96 @@ jobs:
             echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate changelog
+      - name: Extract release notes from CHANGELOG
         id: changelog
         run: |
-          # Get the previous tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          VERSION="${{ steps.version.outputs.version }}"
+          # Remove 'v' prefix for matching in CHANGELOG
+          VERSION_NUM="${VERSION#v}"
 
-          if [ -z "$PREV_TAG" ]; then
-            echo "First release - including all commits"
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          # Extract section for this version from CHANGELOG.md
+          if [ -f CHANGELOG.md ]; then
+            # Get content between this version header and the next version header
+            NOTES=$(awk -v ver="$VERSION_NUM" '
+              /^## \[/ {
+                if (found) exit
+                if (index($0, "[" ver "]")) found=1
+                next
+              }
+              found {print}
+            ' CHANGELOG.md)
+
+            if [ -n "$NOTES" ]; then
+              echo "Found release notes in CHANGELOG.md"
+              echo "$NOTES" > RELEASE_NOTES.txt
+            else
+              echo "No release notes found for $VERSION_NUM, generating from commits"
+              PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+              if [ -z "$PREV_TAG" ]; then
+                git log --pretty=format:"- %s (%h)" --no-merges > RELEASE_NOTES.txt
+              else
+                git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges > RELEASE_NOTES.txt
+              fi
+            fi
           else
-            echo "Changes since $PREV_TAG"
-            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+            echo "No CHANGELOG.md found, generating from commits"
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            if [ -z "$PREV_TAG" ]; then
+              git log --pretty=format:"- %s (%h)" --no-merges > RELEASE_NOTES.txt
+            else
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges > RELEASE_NOTES.txt
+            fi
           fi
 
-          # Save to file for release notes
-          echo "$CHANGELOG" > CHANGELOG.txt
+          cat RELEASE_NOTES.txt
 
-          echo "Generated changelog with $(echo "$CHANGELOG" | wc -l) entries"
+      - name: Get release title from CHANGELOG
+        id: title
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          VERSION_NUM="${VERSION#v}"
+
+          # Try to extract title from CHANGELOG (format: ## [2.16] - 2025-01-30)
+          if [ -f CHANGELOG.md ]; then
+            TITLE_LINE=$(grep -m1 "^## \[$VERSION_NUM\]" CHANGELOG.md || echo "")
+            if [ -n "$TITLE_LINE" ]; then
+              # Extract date if present
+              DATE=$(echo "$TITLE_LINE" | grep -oP '\d{4}-\d{2}-\d{2}' || echo "")
+              if [ -n "$DATE" ]; then
+                echo "title=$VERSION - $(date -d "$DATE" '+%B %d, %Y' 2>/dev/null || echo "$DATE")" >> $GITHUB_OUTPUT
+              else
+                echo "title=Release $VERSION" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "title=Release $VERSION" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "title=Release $VERSION" >> $GITHUB_OUTPUT
+          fi
 
       - name: Create release assets
         run: |
-          # Create a release bundle
           mkdir -p release-assets
           cp install.sql release-assets/
           cp uninstall.sql release-assets/
           cp README.md release-assets/
           cp REFERENCE.md release-assets/
+          [ -f CHANGELOG.md ] && cp CHANGELOG.md release-assets/
 
           # Create tarball
           tar -czf release-assets/pg-flight-recorder-${{ steps.version.outputs.version }}.tar.gz \
-            install.sql uninstall.sql README.md REFERENCE.md
+            install.sql uninstall.sql README.md REFERENCE.md $([ -f CHANGELOG.md ] && echo CHANGELOG.md)
 
           # Create zip
           zip -q release-assets/pg-flight-recorder-${{ steps.version.outputs.version }}.zip \
-            install.sql uninstall.sql README.md REFERENCE.md
+            install.sql uninstall.sql README.md REFERENCE.md $([ -f CHANGELOG.md ] && echo CHANGELOG.md)
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
-          name: Release ${{ steps.version.outputs.version }}
-          body_path: CHANGELOG.txt
+          name: ${{ steps.title.outputs.title }}
+          body_path: RELEASE_NOTES.txt
           draft: false
           prerelease: false
           files: |
