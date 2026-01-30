@@ -2080,7 +2080,7 @@ Based on **value vs. complexity**:
 | 1 | **Query Storm Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.10-2.11) - Includes severity & correlation |
 | 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.12) |
 | 3 | **Performance Forecasting** | 🟠 High | 🔴 High | ✅ **DONE** (v2.14) |
-| 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | ⬚ Not started |
+| 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | ✅ **DONE** (v2.15) |
 | 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | ⬚ Not started |
 | 6 | **Canary Queries** | 🟡 Medium | 🟡 Medium | ✅ **DONE** (v2.9) |
 | 7 | **Fleet-Wide Analysis** | 🟡 Medium | 🟣 Very High | ⬚ Not started - Requires infrastructure |
@@ -2094,12 +2094,13 @@ Based on **value vs. complexity**:
 2. ~~**Regression Detection**: Next priority~~ ✅ Done (v2.12)
 3. ~~**Visual Timeline**: ASCII charts for metrics~~ ✅ Done (v2.13)
 4. ~~**Performance Forecasting**: Proactive capacity warnings~~ ✅ Done (v2.14)
-5. **Validate with Real Data**: Test on production databases
-6. **Time-Travel Debugging**: Next priority
-7. **Iterate**: Refine based on real-world usage
+5. ~~**Time-Travel Debugging**: Forensic analysis at any timestamp~~ ✅ Done (v2.15)
+6. **Validate with Real Data**: Test on production databases
+7. **Blast Radius Analysis**: Next priority
+8. **Iterate**: Refine based on real-world usage
 
 ---
 
 **Last Updated**: 2026-01-30
-**Status**: 6 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline, Performance Forecasting)
+**Status**: 7 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline, Performance Forecasting, Time-Travel Debugging)
 **Maintainer**: Flight Recorder Team

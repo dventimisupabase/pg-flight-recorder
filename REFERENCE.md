@@ -2452,6 +2452,178 @@ SELECT flight_recorder.resolve_regression(123, 'Ran ANALYZE on orders table');
 -- Application code: LISTEN flight_recorder_regressions
 ```
 
+## Time-Travel Debugging
+
+Time-travel debugging enables forensic analysis of "what happened at exactly 10:23:47?" by interpolating between samples and identifying events with exact timestamps.
+
+### Overview
+
+Flight Recorder samples every few minutes. When a customer reports "my query hung at exactly 10:23:47", there's no data for that specific second. Time-travel debugging bridges this gap by:
+
+1. Finding surrounding samples (before/after the timestamp)
+2. Interpolating system metrics between samples
+3. Identifying events with exact timestamps that anchor the timeline
+4. Providing confidence levels based on data proximity
+5. Generating actionable recommendations
+
+### Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `_interpolate_metric(before, time_before, after, time_after, target)` | Linear interpolation helper |
+| `what_happened_at(timestamp, context_window)` | Forensic analysis at any timestamp |
+| `incident_timeline(start_time, end_time)` | Unified event timeline for incidents |
+
+### Using what_happened_at()
+
+The main function for point-in-time analysis:
+
+```sql
+-- What was happening at a specific moment?
+SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+```
+
+Returns:
+
+| Column | Description |
+|--------|-------------|
+| `requested_time` | The timestamp you queried |
+| `sample_before` / `sample_after` | Surrounding sample timestamps |
+| `snapshot_before` / `snapshot_after` | Surrounding snapshot timestamps |
+| `est_connections_active` | Interpolated active connections |
+| `est_connections_total` | Interpolated total connections |
+| `est_xact_rate` | Estimated transactions per second |
+| `est_blks_hit_ratio` | Buffer cache hit ratio percentage |
+| `events` | JSONB array of exact-timestamp events |
+| `sessions_active` | Active sessions from nearest sample |
+| `long_running_queries` | Count of queries > 60 seconds |
+| `longest_query_secs` | Duration of longest running query |
+| `lock_contention_detected` | Whether locks were blocking sessions |
+| `blocked_sessions` | Count of blocked sessions |
+| `top_wait_events` | JSONB array of top wait events |
+| `confidence` | high, medium, low, or very_low |
+| `confidence_score` | Numeric confidence (0-1) |
+| `data_quality_notes` | Array of data quality observations |
+| `recommendations` | Array of actionable suggestions |
+
+#### Custom Context Window
+
+By default, the function looks for events within ±5 minutes of the target timestamp:
+
+```sql
+-- Wider context window (10 minutes each direction)
+SELECT * FROM flight_recorder.what_happened_at(
+    '2024-01-15 10:23:47',
+    '10 minutes'::interval
+);
+```
+
+### Using incident_timeline()
+
+Reconstructs a chronological timeline for incident analysis:
+
+```sql
+-- What happened during the incident window?
+SELECT * FROM flight_recorder.incident_timeline(
+    '2024-01-15 10:00:00',
+    '2024-01-15 11:00:00'
+);
+```
+
+Returns events ordered chronologically:
+
+| Column | Description |
+|--------|-------------|
+| `event_time` | When the event occurred |
+| `event_type` | Type of event (see below) |
+| `description` | Human-readable description |
+| `details` | JSONB with event-specific details |
+
+#### Event Types
+
+| Event Type | Source | Description |
+|------------|--------|-------------|
+| `checkpoint` | snapshots | Checkpoint completed |
+| `wal_archived` | snapshots | WAL file archived |
+| `archive_failed` | snapshots | WAL archive failure |
+| `query_started` | activity_samples | Query execution began |
+| `transaction_started` | activity_samples | Transaction began |
+| `connection_opened` | activity_samples | New connection established |
+| `lock_contention` | lock_samples | Session blocked by another |
+| `wait_spike` | wait_aggregates | Significant wait event spike |
+| `snapshot` | snapshots | System state captured |
+
+### Confidence Scoring
+
+Confidence indicates how reliable the interpolated data is:
+
+| Gap Between Samples | Score | Level |
+|---------------------|-------|-------|
+| < 60 seconds | 0.9+ | high |
+| 60-300 seconds | 0.7-0.9 | medium |
+| 300-600 seconds | 0.5-0.7 | low |
+| > 600 seconds | < 0.5 | very_low |
+
+**Bonuses:**
+
+- Exact-timestamp event in window: +0.1
+- Target close to actual sample (<30s): +0.05
+
+### Data Sources for Exact Timestamps
+
+| Source | Timestamp Column | What It Tells Us |
+|--------|------------------|------------------|
+| `snapshots` | `checkpoint_time` | When last checkpoint completed |
+| `snapshots` | `last_archived_time` | When WAL was last archived |
+| `snapshots` | `last_failed_time` | When archiving last failed |
+| `activity_samples_*` | `query_start` | When each query began |
+| `activity_samples_*` | `xact_start` | When each transaction began |
+| `activity_samples_*` | `backend_start` | When each session connected |
+| `activity_samples_*` | `state_change` | When state last changed |
+
+### Example: Incident Investigation
+
+```sql
+-- 1. Start with what_happened_at for the reported time
+SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+
+-- 2. If lock contention detected, check the timeline
+SELECT * FROM flight_recorder.incident_timeline(
+    '2024-01-15 10:20:00',
+    '2024-01-15 10:30:00'
+)
+WHERE event_type IN ('lock_contention', 'query_started');
+
+-- 3. Use the recommendations array for next steps
+SELECT unnest(recommendations) AS recommendation
+FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+```
+
+### Example Output
+
+```sql
+SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+```
+
+```
+ requested_time      | 2024-01-15 10:23:47+00
+ sample_before       | 2024-01-15 10:21:00+00
+ sample_after        | 2024-01-15 10:24:00+00
+ snapshot_before     | 2024-01-15 10:20:00+00
+ snapshot_after      | 2024-01-15 10:25:00+00
+ est_connections_active | 42
+ est_xact_rate       | 156.3
+ events              | [{"type":"checkpoint","time":"2024-01-15 10:23:15","offset_secs":-32}]
+ sessions_active     | 38
+ long_running_queries | 2
+ lock_contention_detected | true
+ blocked_sessions    | 3
+ confidence          | high
+ confidence_score    | 0.87
+ data_quality_notes  | {"Checkpoint at 10:23:15 provides anchor","Sample gap is 180 seconds"}
+ recommendations     | {"Review checkpoint impact","Investigate 3 blocked sessions"}
+```
+
 ## Visual Timeline
 
 Visual timeline functions provide ASCII-based visualization of metrics, enabling quick pattern recognition in terminal-based reports.

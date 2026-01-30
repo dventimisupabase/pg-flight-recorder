@@ -774,6 +774,61 @@ COMMENT ON FUNCTION flight_recorder._linear_regression IS
 'Performs least-squares linear regression on paired numeric arrays. Returns slope (rate of change), intercept, and R² (coefficient of determination, 0-1 where 1 is perfect fit). Returns NULLs if insufficient data (<3 points) or invalid input.';
 
 
+-- Linear interpolation helper for time-travel debugging
+-- Calculates estimated value at target time between two known data points
+-- Input: Values and timestamps at two points, target timestamp
+-- Output: Linearly interpolated value at target time
+CREATE OR REPLACE FUNCTION flight_recorder._interpolate_metric(
+    p_value_before NUMERIC,
+    p_time_before TIMESTAMPTZ,
+    p_value_after NUMERIC,
+    p_time_after TIMESTAMPTZ,
+    p_target_time TIMESTAMPTZ
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_time_span NUMERIC;
+    v_offset NUMERIC;
+    v_ratio NUMERIC;
+BEGIN
+    -- Handle NULL inputs
+    IF p_value_before IS NULL OR p_value_after IS NULL OR
+       p_time_before IS NULL OR p_time_after IS NULL OR
+       p_target_time IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Handle same timestamp (no interpolation needed)
+    IF p_time_before = p_time_after THEN
+        RETURN p_value_before;
+    END IF;
+
+    -- Calculate time span in seconds
+    v_time_span := EXTRACT(EPOCH FROM (p_time_after - p_time_before));
+
+    -- Handle zero time span (shouldn't happen but be safe)
+    IF v_time_span = 0 THEN
+        RETURN p_value_before;
+    END IF;
+
+    -- Calculate offset from before timestamp
+    v_offset := EXTRACT(EPOCH FROM (p_target_time - p_time_before));
+
+    -- Calculate interpolation ratio
+    v_ratio := v_offset / v_time_span;
+
+    -- Clamp ratio to [0, 1] to avoid extrapolation
+    v_ratio := GREATEST(0, LEAST(1, v_ratio));
+
+    -- Linear interpolation: before + ratio * (after - before)
+    RETURN round(p_value_before + v_ratio * (p_value_after - p_value_before), 4);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._interpolate_metric IS
+'Linear interpolation helper for time-travel debugging. Calculates estimated metric value at a target timestamp between two known data points. Returns rounded value (4 decimal places). Handles edge cases: NULL inputs, same timestamps, and clamps ratio to [0,1] to prevent extrapolation.';
+
+
 -- Generates a horizontal progress bar showing filled/empty portions
 -- Input: Current value, maximum value, optional width (default 20)
 -- Output: String like ███████████████░░░░░ showing percentage filled
@@ -1134,7 +1189,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.14'),
+    ('schema_version', '2.15'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -11394,6 +11449,657 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.check_forecast_alerts() IS
 'Scheduled alert checker for forecast-based capacity warnings. Call via pg_cron to receive pg_notify alerts when resources are predicted to deplete within the configured threshold. Returns count of alerts sent.';
+
+
+-- =============================================================================
+-- TIME-TRAVEL DEBUGGING
+-- =============================================================================
+-- Enables forensic analysis of "what happened at exactly 10:23:47?"
+-- Bridges the gap between sample intervals by interpolating system metrics
+-- and surfacing exact-timestamp events from activity samples
+
+
+-- Main time-travel analysis function
+-- Provides interpolated system state at any arbitrary timestamp
+-- Input: Target timestamp, context window (default 5 minutes)
+-- Output: Interpolated metrics, events, sessions, locks, wait events, confidence, recommendations
+CREATE OR REPLACE FUNCTION flight_recorder.what_happened_at(
+    p_timestamp TIMESTAMPTZ,
+    p_context_window INTERVAL DEFAULT '5 minutes'
+)
+RETURNS TABLE(
+    -- Temporal context
+    requested_time TIMESTAMPTZ,
+    sample_before TIMESTAMPTZ,
+    sample_after TIMESTAMPTZ,
+    snapshot_before TIMESTAMPTZ,
+    snapshot_after TIMESTAMPTZ,
+
+    -- Interpolated state from snapshots
+    est_connections_active NUMERIC,
+    est_connections_total NUMERIC,
+    est_xact_rate NUMERIC,
+    est_blks_hit_ratio NUMERIC,
+
+    -- Exact-timestamp events (from activity samples)
+    events JSONB,
+
+    -- Activity analysis (from activity samples ring buffer)
+    sessions_active INTEGER,
+    long_running_queries INTEGER,
+    longest_query_secs NUMERIC,
+
+    -- Lock analysis
+    lock_contention_detected BOOLEAN,
+    blocked_sessions INTEGER,
+
+    -- Wait events
+    top_wait_events JSONB,
+
+    -- Confidence assessment
+    confidence TEXT,
+    confidence_score NUMERIC,
+    data_quality_notes TEXT[],
+
+    -- Actionable recommendations
+    recommendations TEXT[]
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    -- Snapshot data
+    v_snap_before RECORD;
+    v_snap_after RECORD;
+    v_snap_gap_secs NUMERIC;
+
+    -- Sample data
+    v_sample_before RECORD;
+    v_sample_after RECORD;
+    v_sample_gap_secs NUMERIC;
+
+    -- Interpolated values
+    v_est_active NUMERIC;
+    v_est_total NUMERIC;
+    v_est_xact_rate NUMERIC;
+    v_est_hit_ratio NUMERIC;
+
+    -- Events array
+    v_events JSONB := '[]'::jsonb;
+    v_event JSONB;
+
+    -- Activity analysis
+    v_sessions INTEGER := 0;
+    v_long_running INTEGER := 0;
+    v_longest_secs NUMERIC := 0;
+
+    -- Lock analysis
+    v_lock_detected BOOLEAN := FALSE;
+    v_blocked INTEGER := 0;
+
+    -- Wait events
+    v_waits JSONB := '[]'::jsonb;
+
+    -- Confidence calculation
+    v_confidence_score NUMERIC := 0.5;
+    v_confidence_level TEXT := 'low';
+    v_notes TEXT[] := ARRAY[]::TEXT[];
+    v_recs TEXT[] := ARRAY[]::TEXT[];
+
+    -- Context window bounds
+    v_window_start TIMESTAMPTZ;
+    v_window_end TIMESTAMPTZ;
+BEGIN
+    -- Calculate window bounds
+    v_window_start := p_timestamp - p_context_window;
+    v_window_end := p_timestamp + p_context_window;
+
+    -- ==========================================================================
+    -- STEP 1: Find surrounding snapshots
+    -- ==========================================================================
+    SELECT * INTO v_snap_before
+    FROM flight_recorder.snapshots
+    WHERE captured_at <= p_timestamp
+    ORDER BY captured_at DESC
+    LIMIT 1;
+
+    SELECT * INTO v_snap_after
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= p_timestamp
+    ORDER BY captured_at ASC
+    LIMIT 1;
+
+    -- Calculate snapshot gap
+    IF v_snap_before IS NOT NULL AND v_snap_after IS NOT NULL THEN
+        v_snap_gap_secs := EXTRACT(EPOCH FROM (v_snap_after.captured_at - v_snap_before.captured_at));
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 2: Find surrounding samples (from ring buffer)
+    -- ==========================================================================
+    SELECT sr.* INTO v_sample_before
+    FROM flight_recorder.samples_ring sr
+    WHERE sr.captured_at <= p_timestamp
+      AND sr.captured_at > '1970-01-01'::timestamptz
+    ORDER BY sr.captured_at DESC
+    LIMIT 1;
+
+    SELECT sr.* INTO v_sample_after
+    FROM flight_recorder.samples_ring sr
+    WHERE sr.captured_at >= p_timestamp
+      AND sr.captured_at > '1970-01-01'::timestamptz
+    ORDER BY sr.captured_at ASC
+    LIMIT 1;
+
+    -- Calculate sample gap
+    IF v_sample_before IS NOT NULL AND v_sample_after IS NOT NULL THEN
+        v_sample_gap_secs := EXTRACT(EPOCH FROM (v_sample_after.captured_at - v_sample_before.captured_at));
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 3: Interpolate snapshot metrics
+    -- ==========================================================================
+    IF v_snap_before IS NOT NULL AND v_snap_after IS NOT NULL THEN
+        v_est_active := flight_recorder._interpolate_metric(
+            v_snap_before.connections_active::NUMERIC,
+            v_snap_before.captured_at,
+            v_snap_after.connections_active::NUMERIC,
+            v_snap_after.captured_at,
+            p_timestamp
+        );
+
+        v_est_total := flight_recorder._interpolate_metric(
+            v_snap_before.connections_total::NUMERIC,
+            v_snap_before.captured_at,
+            v_snap_after.connections_total::NUMERIC,
+            v_snap_after.captured_at,
+            p_timestamp
+        );
+
+        -- Calculate transaction rate delta
+        IF v_snap_gap_secs > 0 AND
+           v_snap_before.xact_commit IS NOT NULL AND
+           v_snap_after.xact_commit IS NOT NULL THEN
+            v_est_xact_rate := round(
+                ((v_snap_after.xact_commit - v_snap_before.xact_commit) +
+                 (v_snap_after.xact_rollback - v_snap_before.xact_rollback))::NUMERIC / v_snap_gap_secs,
+                1
+            );
+        END IF;
+
+        -- Calculate buffer hit ratio
+        IF v_snap_after.blks_hit IS NOT NULL AND
+           v_snap_after.blks_read IS NOT NULL AND
+           (v_snap_after.blks_hit + v_snap_after.blks_read) > 0 THEN
+            v_est_hit_ratio := round(
+                v_snap_after.blks_hit::NUMERIC /
+                NULLIF(v_snap_after.blks_hit + v_snap_after.blks_read, 0) * 100,
+                2
+            );
+        END IF;
+    ELSIF v_snap_before IS NOT NULL THEN
+        -- Only have before snapshot - use its values
+        v_est_active := v_snap_before.connections_active;
+        v_est_total := v_snap_before.connections_total;
+        v_notes := array_append(v_notes, 'No snapshot after target time - using last known values');
+    ELSIF v_snap_after IS NOT NULL THEN
+        -- Only have after snapshot - use its values
+        v_est_active := v_snap_after.connections_active;
+        v_est_total := v_snap_after.connections_total;
+        v_notes := array_append(v_notes, 'No snapshot before target time - using next known values');
+    ELSE
+        v_notes := array_append(v_notes, 'No snapshots found in range');
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 4: Collect exact-timestamp events from activity samples
+    -- ==========================================================================
+
+    -- Check for checkpoint event near target time
+    IF v_snap_before IS NOT NULL AND v_snap_before.checkpoint_time IS NOT NULL THEN
+        IF v_snap_before.checkpoint_time BETWEEN v_window_start AND v_window_end THEN
+            v_event := jsonb_build_object(
+                'type', 'checkpoint',
+                'time', v_snap_before.checkpoint_time,
+                'offset_secs', EXTRACT(EPOCH FROM (v_snap_before.checkpoint_time - p_timestamp))::INTEGER
+            );
+            v_events := v_events || v_event;
+            v_notes := array_append(v_notes, format('Checkpoint at %s provides anchor',
+                to_char(v_snap_before.checkpoint_time, 'HH24:MI:SS')));
+        END IF;
+    END IF;
+
+    -- Check for archiver activity
+    IF v_snap_before IS NOT NULL AND v_snap_before.last_archived_time IS NOT NULL THEN
+        IF v_snap_before.last_archived_time BETWEEN v_window_start AND v_window_end THEN
+            v_event := jsonb_build_object(
+                'type', 'wal_archived',
+                'time', v_snap_before.last_archived_time,
+                'offset_secs', EXTRACT(EPOCH FROM (v_snap_before.last_archived_time - p_timestamp))::INTEGER,
+                'wal_file', v_snap_before.last_archived_wal
+            );
+            v_events := v_events || v_event;
+        END IF;
+    END IF;
+
+    -- Check for archiver failure
+    IF v_snap_before IS NOT NULL AND v_snap_before.last_failed_time IS NOT NULL THEN
+        IF v_snap_before.last_failed_time BETWEEN v_window_start AND v_window_end THEN
+            v_event := jsonb_build_object(
+                'type', 'archive_failed',
+                'time', v_snap_before.last_failed_time,
+                'offset_secs', EXTRACT(EPOCH FROM (v_snap_before.last_failed_time - p_timestamp))::INTEGER,
+                'wal_file', v_snap_before.last_failed_wal
+            );
+            v_events := v_events || v_event;
+            v_recs := array_append(v_recs, 'Investigate WAL archiving failure');
+        END IF;
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 5: Analyze activity from samples ring buffer
+    -- ==========================================================================
+    IF v_sample_before IS NOT NULL THEN
+        -- Count active sessions
+        SELECT COUNT(*), COUNT(*) FILTER (WHERE a.state = 'active')
+        INTO v_sessions, v_sessions
+        FROM flight_recorder.activity_samples_ring a
+        WHERE a.slot_id = v_sample_before.slot_id
+          AND a.pid IS NOT NULL;
+
+        -- Find long-running queries (> 60 seconds at sample time)
+        SELECT COUNT(*), MAX(EXTRACT(EPOCH FROM (v_sample_before.captured_at - a.query_start)))
+        INTO v_long_running, v_longest_secs
+        FROM flight_recorder.activity_samples_ring a
+        WHERE a.slot_id = v_sample_before.slot_id
+          AND a.pid IS NOT NULL
+          AND a.state = 'active'
+          AND a.query_start IS NOT NULL
+          AND a.query_start < v_sample_before.captured_at - interval '60 seconds';
+
+        -- Collect query start events within window
+        FOR v_event IN
+            SELECT jsonb_build_object(
+                'type', 'query_started',
+                'time', a.query_start,
+                'offset_secs', EXTRACT(EPOCH FROM (a.query_start - p_timestamp))::INTEGER,
+                'pid', a.pid,
+                'user', a.usename,
+                'query_preview', a.query_preview
+            )
+            FROM flight_recorder.activity_samples_ring a
+            WHERE a.slot_id = v_sample_before.slot_id
+              AND a.pid IS NOT NULL
+              AND a.query_start BETWEEN v_window_start AND v_window_end
+            ORDER BY a.query_start
+            LIMIT 10
+        LOOP
+            v_events := v_events || v_event;
+        END LOOP;
+
+        -- Collect transaction start events within window
+        FOR v_event IN
+            SELECT jsonb_build_object(
+                'type', 'transaction_started',
+                'time', a.xact_start,
+                'offset_secs', EXTRACT(EPOCH FROM (a.xact_start - p_timestamp))::INTEGER,
+                'pid', a.pid,
+                'user', a.usename
+            )
+            FROM flight_recorder.activity_samples_ring a
+            WHERE a.slot_id = v_sample_before.slot_id
+              AND a.pid IS NOT NULL
+              AND a.xact_start BETWEEN v_window_start AND v_window_end
+              AND a.xact_start != a.query_start  -- Avoid duplicates
+            ORDER BY a.xact_start
+            LIMIT 10
+        LOOP
+            v_events := v_events || v_event;
+        END LOOP;
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 6: Analyze lock contention
+    -- ==========================================================================
+    IF v_sample_before IS NOT NULL THEN
+        SELECT COUNT(*) > 0, COUNT(*)
+        INTO v_lock_detected, v_blocked
+        FROM flight_recorder.lock_samples_ring l
+        WHERE l.slot_id = v_sample_before.slot_id
+          AND l.blocked_pid IS NOT NULL;
+
+        IF v_blocked > 0 THEN
+            v_recs := array_append(v_recs, format('Investigate %s blocked sessions', v_blocked));
+        END IF;
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 7: Analyze wait events
+    -- ==========================================================================
+    IF v_sample_before IS NOT NULL THEN
+        SELECT jsonb_agg(w ORDER BY w->>'count' DESC)
+        INTO v_waits
+        FROM (
+            SELECT jsonb_build_object(
+                'wait_event_type', ws.wait_event_type,
+                'wait_event', ws.wait_event,
+                'count', ws.count
+            ) AS w
+            FROM flight_recorder.wait_samples_ring ws
+            WHERE ws.slot_id = v_sample_before.slot_id
+              AND ws.wait_event IS NOT NULL
+            ORDER BY ws.count DESC NULLS LAST
+            LIMIT 5
+        ) sub;
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 8: Calculate confidence score
+    -- ==========================================================================
+    -- Base score on sample gap
+    IF v_sample_gap_secs IS NOT NULL THEN
+        IF v_sample_gap_secs < 60 THEN
+            v_confidence_score := 0.9;
+        ELSIF v_sample_gap_secs < 300 THEN
+            v_confidence_score := 0.7 + (0.2 * (300 - v_sample_gap_secs) / 240);
+        ELSIF v_sample_gap_secs < 600 THEN
+            v_confidence_score := 0.5 + (0.2 * (600 - v_sample_gap_secs) / 300);
+        ELSE
+            v_confidence_score := 0.3;
+        END IF;
+
+        v_notes := array_append(v_notes, format('Sample gap is %s seconds', v_sample_gap_secs::INTEGER));
+    ELSE
+        v_confidence_score := 0.2;
+        v_notes := array_append(v_notes, 'No sample data in ring buffer');
+    END IF;
+
+    -- Bonus for exact-timestamp events
+    IF jsonb_array_length(v_events) > 0 THEN
+        v_confidence_score := LEAST(1.0, v_confidence_score + 0.1);
+        v_notes := array_append(v_notes, format('%s exact-timestamp events found', jsonb_array_length(v_events)));
+    END IF;
+
+    -- Bonus for target close to sample
+    IF v_sample_before IS NOT NULL THEN
+        DECLARE
+            v_closest_gap NUMERIC;
+        BEGIN
+            v_closest_gap := LEAST(
+                ABS(EXTRACT(EPOCH FROM (p_timestamp - v_sample_before.captured_at))),
+                COALESCE(ABS(EXTRACT(EPOCH FROM (p_timestamp - v_sample_after.captured_at))), 999999)
+            );
+            IF v_closest_gap < 30 THEN
+                v_confidence_score := LEAST(1.0, v_confidence_score + 0.05);
+            END IF;
+        END;
+    END IF;
+
+    -- Determine confidence level
+    IF v_confidence_score >= 0.8 THEN
+        v_confidence_level := 'high';
+    ELSIF v_confidence_score >= 0.6 THEN
+        v_confidence_level := 'medium';
+    ELSIF v_confidence_score >= 0.4 THEN
+        v_confidence_level := 'low';
+    ELSE
+        v_confidence_level := 'very_low';
+    END IF;
+
+    -- ==========================================================================
+    -- STEP 9: Generate recommendations
+    -- ==========================================================================
+    IF v_long_running > 0 THEN
+        v_recs := array_append(v_recs, format('Review %s long-running queries (longest: %s sec)',
+            v_long_running, round(v_longest_secs)));
+    END IF;
+
+    IF v_est_hit_ratio IS NOT NULL AND v_est_hit_ratio < 95 THEN
+        v_recs := array_append(v_recs, format('Buffer hit ratio low (%s%%) - consider increasing shared_buffers',
+            v_est_hit_ratio));
+    END IF;
+
+    -- Check for checkpoint impact
+    FOR v_event IN SELECT * FROM jsonb_array_elements(v_events)
+    LOOP
+        IF v_event->>'type' = 'checkpoint' THEN
+            v_recs := array_append(v_recs, 'Review checkpoint impact on performance');
+        END IF;
+    END LOOP;
+
+    IF array_length(v_recs, 1) IS NULL THEN
+        v_recs := array_append(v_recs, 'No immediate concerns detected');
+    END IF;
+
+    -- ==========================================================================
+    -- RETURN RESULTS
+    -- ==========================================================================
+    RETURN QUERY SELECT
+        p_timestamp,
+        v_sample_before.captured_at,
+        v_sample_after.captured_at,
+        v_snap_before.captured_at,
+        v_snap_after.captured_at,
+        v_est_active,
+        v_est_total,
+        v_est_xact_rate,
+        v_est_hit_ratio,
+        COALESCE(v_events, '[]'::jsonb),
+        v_sessions,
+        COALESCE(v_long_running, 0),
+        COALESCE(v_longest_secs, 0),
+        v_lock_detected,
+        v_blocked,
+        COALESCE(v_waits, '[]'::jsonb),
+        v_confidence_level,
+        round(v_confidence_score, 2),
+        v_notes,
+        v_recs;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.what_happened_at IS
+'Time-travel debugging: Forensic analysis of system state at any timestamp. Interpolates between samples to estimate connections, transaction rates, and buffer hit ratio. Surfaces exact-timestamp events (checkpoints, query starts, transaction starts) and analyzes sessions, locks, and wait events. Returns confidence score (0-1) based on data proximity. Use for incident investigation: SELECT * FROM flight_recorder.what_happened_at(''2024-01-15 10:23:47'');';
+
+
+-- Timeline reconstruction for incident analysis
+-- Merges events from multiple sources into a unified, chronological timeline
+-- Input: Start and end timestamps for the incident window
+-- Output: Ordered timeline of events with type, description, and details
+CREATE OR REPLACE FUNCTION flight_recorder.incident_timeline(
+    p_start_time TIMESTAMPTZ,
+    p_end_time TIMESTAMPTZ
+)
+RETURNS TABLE(
+    event_time TIMESTAMPTZ,
+    event_type TEXT,
+    description TEXT,
+    details JSONB
+)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY
+    WITH all_events AS (
+        -- Checkpoint events from snapshots
+        SELECT DISTINCT
+            s.checkpoint_time AS event_time,
+            'checkpoint'::TEXT AS event_type,
+            format('Checkpoint completed (LSN: %s)', s.checkpoint_lsn::TEXT) AS description,
+            jsonb_build_object(
+                'checkpoint_lsn', s.checkpoint_lsn::TEXT,
+                'buffers_written', s.ckpt_buffers,
+                'write_time_ms', round(s.ckpt_write_time::NUMERIC, 1),
+                'sync_time_ms', round(s.ckpt_sync_time::NUMERIC, 1)
+            ) AS details
+        FROM flight_recorder.snapshots s
+        WHERE s.checkpoint_time BETWEEN p_start_time AND p_end_time
+          AND s.checkpoint_time IS NOT NULL
+
+        UNION ALL
+
+        -- WAL archive events
+        SELECT DISTINCT
+            s.last_archived_time AS event_time,
+            'wal_archived'::TEXT AS event_type,
+            format('WAL file archived: %s', s.last_archived_wal) AS description,
+            jsonb_build_object(
+                'wal_file', s.last_archived_wal,
+                'archived_count', s.archived_count
+            ) AS details
+        FROM flight_recorder.snapshots s
+        WHERE s.last_archived_time BETWEEN p_start_time AND p_end_time
+          AND s.last_archived_time IS NOT NULL
+
+        UNION ALL
+
+        -- WAL archive failures
+        SELECT DISTINCT
+            s.last_failed_time AS event_time,
+            'archive_failed'::TEXT AS event_type,
+            format('WAL archive failed: %s', s.last_failed_wal) AS description,
+            jsonb_build_object(
+                'wal_file', s.last_failed_wal,
+                'failed_count', s.failed_count
+            ) AS details
+        FROM flight_recorder.snapshots s
+        WHERE s.last_failed_time BETWEEN p_start_time AND p_end_time
+          AND s.last_failed_time IS NOT NULL
+
+        UNION ALL
+
+        -- Query start events from ring buffer
+        SELECT
+            a.query_start AS event_time,
+            'query_started'::TEXT AS event_type,
+            format('Query started by %s (pid %s)', COALESCE(a.usename, 'unknown'), a.pid) AS description,
+            jsonb_build_object(
+                'pid', a.pid,
+                'user', a.usename,
+                'application', a.application_name,
+                'client_addr', a.client_addr::TEXT,
+                'query_preview', a.query_preview
+            ) AS details
+        FROM flight_recorder.activity_samples_ring a
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = a.slot_id
+        WHERE a.query_start BETWEEN p_start_time AND p_end_time
+          AND a.query_start IS NOT NULL
+          AND a.pid IS NOT NULL
+          AND sr.captured_at > '1970-01-01'::timestamptz
+
+        UNION ALL
+
+        -- Transaction start events from ring buffer
+        SELECT
+            a.xact_start AS event_time,
+            'transaction_started'::TEXT AS event_type,
+            format('Transaction started by %s (pid %s)', COALESCE(a.usename, 'unknown'), a.pid) AS description,
+            jsonb_build_object(
+                'pid', a.pid,
+                'user', a.usename,
+                'application', a.application_name
+            ) AS details
+        FROM flight_recorder.activity_samples_ring a
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = a.slot_id
+        WHERE a.xact_start BETWEEN p_start_time AND p_end_time
+          AND a.xact_start IS NOT NULL
+          AND a.pid IS NOT NULL
+          AND sr.captured_at > '1970-01-01'::timestamptz
+          AND (a.xact_start != a.query_start OR a.query_start IS NULL)
+
+        UNION ALL
+
+        -- Backend start events (new connections)
+        SELECT
+            a.backend_start AS event_time,
+            'connection_opened'::TEXT AS event_type,
+            format('Connection opened by %s from %s', COALESCE(a.usename, 'unknown'),
+                   COALESCE(a.client_addr::TEXT, 'local')) AS description,
+            jsonb_build_object(
+                'pid', a.pid,
+                'user', a.usename,
+                'application', a.application_name,
+                'client_addr', a.client_addr::TEXT,
+                'backend_type', a.backend_type
+            ) AS details
+        FROM flight_recorder.activity_samples_ring a
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = a.slot_id
+        WHERE a.backend_start BETWEEN p_start_time AND p_end_time
+          AND a.backend_start IS NOT NULL
+          AND a.pid IS NOT NULL
+          AND sr.captured_at > '1970-01-01'::timestamptz
+
+        UNION ALL
+
+        -- Lock contention events
+        SELECT
+            sr.captured_at AS event_time,
+            'lock_contention'::TEXT AS event_type,
+            format('Session %s blocked by %s on %s lock',
+                   l.blocked_pid, l.blocking_pid, l.lock_type) AS description,
+            jsonb_build_object(
+                'blocked_pid', l.blocked_pid,
+                'blocked_user', l.blocked_user,
+                'blocked_query', l.blocked_query_preview,
+                'blocking_pid', l.blocking_pid,
+                'blocking_user', l.blocking_user,
+                'blocking_query', l.blocking_query_preview,
+                'lock_type', l.lock_type,
+                'duration', l.blocked_duration::TEXT
+            ) AS details
+        FROM flight_recorder.lock_samples_ring l
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = l.slot_id
+        WHERE sr.captured_at BETWEEN p_start_time AND p_end_time
+          AND l.blocked_pid IS NOT NULL
+          AND sr.captured_at > '1970-01-01'::timestamptz
+
+        UNION ALL
+
+        -- Wait event spikes from aggregates
+        SELECT
+            wa.start_time AS event_time,
+            'wait_spike'::TEXT AS event_type,
+            format('Wait spike: %s/%s (max %s concurrent)',
+                   wa.wait_event_type, wa.wait_event, wa.max_waiters) AS description,
+            jsonb_build_object(
+                'wait_event_type', wa.wait_event_type,
+                'wait_event', wa.wait_event,
+                'max_concurrent', wa.max_waiters,
+                'avg_concurrent', round(wa.avg_waiters, 1),
+                'sample_count', wa.sample_count
+            ) AS details
+        FROM flight_recorder.wait_event_aggregates wa
+        WHERE wa.start_time BETWEEN p_start_time AND p_end_time
+          AND wa.max_waiters >= 3  -- Only show significant waits
+
+        UNION ALL
+
+        -- Snapshot captures (system state markers)
+        SELECT
+            s.captured_at AS event_time,
+            'snapshot'::TEXT AS event_type,
+            format('System snapshot: %s active connections, %s TPS',
+                   s.connections_active,
+                   CASE WHEN lag(s.xact_commit) OVER (ORDER BY s.captured_at) IS NOT NULL
+                        THEN round((s.xact_commit - lag(s.xact_commit) OVER (ORDER BY s.captured_at))::NUMERIC /
+                                   EXTRACT(EPOCH FROM (s.captured_at - lag(s.captured_at) OVER (ORDER BY s.captured_at))), 1)
+                        ELSE NULL
+                   END) AS description,
+            jsonb_build_object(
+                'connections_active', s.connections_active,
+                'connections_total', s.connections_total,
+                'xact_commit', s.xact_commit,
+                'blks_hit', s.blks_hit,
+                'blks_read', s.blks_read,
+                'temp_bytes', s.temp_bytes
+            ) AS details
+        FROM flight_recorder.snapshots s
+        WHERE s.captured_at BETWEEN p_start_time AND p_end_time
+    )
+    SELECT ae.event_time, ae.event_type, ae.description, ae.details
+    FROM all_events ae
+    WHERE ae.event_time IS NOT NULL
+    ORDER BY ae.event_time;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.incident_timeline IS
+'Reconstructs a unified timeline for incident analysis by merging events from multiple sources: checkpoints, WAL archiving, query/transaction starts, connection opens, lock contention, wait spikes, and snapshots. Returns chronologically ordered events with type, description, and JSON details. Use for incident review: SELECT * FROM flight_recorder.incident_timeline(now() - interval ''2 hours'', now() - interval ''1 hour'');';
 
 
 SELECT flight_recorder.snapshot();
