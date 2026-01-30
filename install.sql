@@ -101,7 +101,9 @@ CREATE TABLE IF NOT EXISTS flight_recorder.snapshots (
     confl_snapshot              BIGINT,
     confl_bufferpin             BIGINT,
     confl_deadlock              BIGINT,
-    confl_active_logicalslot    BIGINT
+    confl_active_logicalslot    BIGINT,
+    max_catalog_oid             BIGINT,
+    large_object_count          BIGINT
 );
 CREATE INDEX IF NOT EXISTS snapshots_captured_at_idx ON flight_recorder.snapshots(captured_at);
 
@@ -2653,6 +2655,8 @@ DECLARE
     v_confl_deadlock BIGINT;
     v_confl_active_logicalslot BIGINT;
     v_is_standby BOOLEAN;
+    v_max_catalog_oid BIGINT;
+    v_large_object_count BIGINT;
 BEGIN
     v_should_skip := flight_recorder._check_circuit_breaker('snapshot');
     IF v_should_skip THEN
@@ -2834,6 +2838,9 @@ BEGIN
         INTO v_datfrozenxid_age
         FROM pg_database
         WHERE datname = current_database();
+        -- Collect OID exhaustion metrics
+        SELECT max(oid)::bigint INTO v_max_catalog_oid FROM pg_class;
+        SELECT count(*)::bigint INTO v_large_object_count FROM pg_largeobject_metadata;
         PERFORM flight_recorder._record_section_success(v_stat_id);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg-flight-recorder: Capacity planning metrics collection failed: %', SQLERRM;
@@ -2846,6 +2853,8 @@ BEGIN
         v_connections_max := NULL;
         v_db_size_bytes := NULL;
         v_datfrozenxid_age := NULL;
+        v_max_catalog_oid := NULL;
+        v_large_object_count := NULL;
     END;
     END IF;
     -- Collect archiver stats (conditional on archive_mode != 'off')
@@ -2941,7 +2950,8 @@ BEGIN
             db_size_bytes, datfrozenxid_age,
             archived_count, last_archived_wal, last_archived_time,
             failed_count, last_failed_wal, last_failed_time, archiver_stats_reset,
-            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot
+            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot,
+            max_catalog_oid, large_object_count
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -2966,7 +2976,8 @@ BEGIN
             v_db_size_bytes, v_datfrozenxid_age,
             v_archived_count, v_last_archived_wal, v_last_archived_time,
             v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset,
-            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock, v_confl_active_logicalslot
+            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock, v_confl_active_logicalslot,
+            v_max_catalog_oid, v_large_object_count
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_checkpointer c
         CROSS JOIN pg_stat_bgwriter b
@@ -2994,7 +3005,8 @@ BEGIN
             db_size_bytes, datfrozenxid_age,
             archived_count, last_archived_wal, last_archived_time,
             failed_count, last_failed_wal, last_failed_time, archiver_stats_reset,
-            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot
+            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot,
+            max_catalog_oid, large_object_count
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -3019,7 +3031,8 @@ BEGIN
             v_db_size_bytes, v_datfrozenxid_age,
             v_archived_count, v_last_archived_wal, v_last_archived_time,
             v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset,
-            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock, v_confl_active_logicalslot
+            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock, v_confl_active_logicalslot,
+            v_max_catalog_oid, v_large_object_count
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -3038,7 +3051,8 @@ BEGIN
             db_size_bytes, datfrozenxid_age,
             archived_count, last_archived_wal, last_archived_time,
             failed_count, last_failed_wal, last_failed_time, archiver_stats_reset,
-            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock
+            confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock,
+            max_catalog_oid, large_object_count
         )
         SELECT
             v_captured_at, v_pg_version,
@@ -3055,7 +3069,8 @@ BEGIN
             v_db_size_bytes, v_datfrozenxid_age,
             v_archived_count, v_last_archived_wal, v_last_archived_time,
             v_failed_count, v_last_failed_wal, v_last_failed_time, v_archiver_stats_reset,
-            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock
+            v_confl_tablespace, v_confl_lock, v_confl_snapshot, v_confl_bufferpin, v_confl_deadlock,
+            v_max_catalog_oid, v_large_object_count
         FROM pg_stat_wal w
         CROSS JOIN pg_stat_bgwriter b
         RETURNING id INTO v_snapshot_id;
@@ -4173,6 +4188,95 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.time_to_budget_exhaustion(OID, BIGINT) IS 'Estimates time until dead tuple budget is exhausted based on growth rate';
 
+-- Calculates the rate of OID consumption over a time window
+-- Returns OIDs per second based on max_catalog_oid changes in snapshots
+CREATE OR REPLACE FUNCTION flight_recorder.oid_consumption_rate(
+    p_window INTERVAL
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_first_snapshot RECORD;
+    v_last_snapshot RECORD;
+    v_delta_oids BIGINT;
+    v_delta_seconds NUMERIC;
+BEGIN
+    SELECT max_catalog_oid, captured_at
+    INTO v_first_snapshot
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= now() - p_window
+      AND max_catalog_oid IS NOT NULL
+    ORDER BY captured_at ASC
+    LIMIT 1;
+
+    SELECT max_catalog_oid, captured_at
+    INTO v_last_snapshot
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= now() - p_window
+      AND max_catalog_oid IS NOT NULL
+    ORDER BY captured_at DESC
+    LIMIT 1;
+
+    IF v_first_snapshot.captured_at IS NULL OR v_last_snapshot.captured_at IS NULL
+       OR v_first_snapshot.captured_at = v_last_snapshot.captured_at THEN
+        RETURN NULL;
+    END IF;
+
+    v_delta_oids := v_last_snapshot.max_catalog_oid - v_first_snapshot.max_catalog_oid;
+    v_delta_seconds := EXTRACT(EPOCH FROM (v_last_snapshot.captured_at - v_first_snapshot.captured_at));
+
+    IF v_delta_seconds <= 0 THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN ROUND(v_delta_oids::numeric / v_delta_seconds, 6);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.oid_consumption_rate(INTERVAL) IS 'Returns OID consumption rate (OIDs/second) over a time window';
+
+-- Estimates time until OID exhaustion based on current consumption rate
+-- OIDs are 32-bit unsigned integers (max ~4.3 billion) that are not recycled
+CREATE OR REPLACE FUNCTION flight_recorder.time_to_oid_exhaustion()
+RETURNS INTERVAL
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_current_max_oid BIGINT;
+    v_consumption_rate NUMERIC;
+    v_oid_max BIGINT := 4294967295;  -- 2^32 - 1
+    v_remaining_oids BIGINT;
+    v_seconds_to_exhaustion NUMERIC;
+BEGIN
+    SELECT max_catalog_oid
+    INTO v_current_max_oid
+    FROM flight_recorder.snapshots
+    WHERE max_catalog_oid IS NOT NULL
+    ORDER BY captured_at DESC
+    LIMIT 1;
+
+    IF v_current_max_oid IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Use 1-hour window for rate calculation
+    v_consumption_rate := flight_recorder.oid_consumption_rate('1 hour'::interval);
+
+    IF v_consumption_rate IS NULL OR v_consumption_rate <= 0 THEN
+        RETURN NULL;  -- No consumption or negative rate
+    END IF;
+
+    v_remaining_oids := v_oid_max - v_current_max_oid;
+
+    IF v_remaining_oids <= 0 THEN
+        RETURN '0 seconds'::interval;
+    END IF;
+
+    v_seconds_to_exhaustion := v_remaining_oids::numeric / v_consumption_rate;
+
+    RETURN make_interval(secs => v_seconds_to_exhaustion);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.time_to_oid_exhaustion() IS 'Estimates time until OID exhaustion based on consumption rate over the last hour';
+
 -- =============================================================================
 -- End Autovacuum Observer Functions
 -- =============================================================================
@@ -4366,6 +4470,42 @@ BEGIN
             RETURN NEXT;
         END IF;
     END LOOP;
+
+    -- OID exhaustion detection
+    -- OIDs are 32-bit unsigned integers (max ~4.3 billion)
+    -- Unlike XIDs, OIDs are not recycled - they simply exhaust
+    DECLARE
+        v_max_catalog_oid BIGINT;
+        v_large_object_count BIGINT;
+        v_oid_max BIGINT := 4294967295;  -- 2^32 - 1
+        v_oid_warning_threshold BIGINT := (v_oid_max * 0.75)::bigint;   -- 75% = ~3.22 billion
+        v_oid_critical_threshold BIGINT := (v_oid_max * 0.90)::bigint;  -- 90% = ~3.87 billion
+    BEGIN
+        SELECT max_catalog_oid, large_object_count
+        INTO v_max_catalog_oid, v_large_object_count
+        FROM flight_recorder.snapshots
+        WHERE captured_at BETWEEN p_start_time AND p_end_time
+          AND max_catalog_oid IS NOT NULL
+        ORDER BY captured_at DESC
+        LIMIT 1;
+
+        IF v_max_catalog_oid IS NOT NULL AND v_max_catalog_oid > v_oid_warning_threshold THEN
+            anomaly_type := 'OID_EXHAUSTION_RISK';
+            severity := CASE
+                WHEN v_max_catalog_oid > v_oid_critical_threshold THEN 'critical'
+                ELSE 'high'
+            END;
+            description := 'Database approaching OID exhaustion';
+            metric_value := format('Max catalog OID: %s (%s%% of 4.3 billion), Large objects: %s',
+                                  to_char(v_max_catalog_oid, 'FM999,999,999,999'),
+                                  round(v_max_catalog_oid::numeric / v_oid_max * 100, 1),
+                                  COALESCE(to_char(v_large_object_count, 'FM999,999,999'), 'N/A'));
+            threshold := format('max_catalog_oid > %s (75%% of 4,294,967,295)',
+                               to_char(v_oid_warning_threshold, 'FM999,999,999,999'));
+            recommendation := 'OID exhaustion requires pg_dump/pg_restore to reset counter. Review lo_create() usage and large object cleanup.';
+            RETURN NEXT;
+        END IF;
+    END;
 
     -- Idle-in-transaction detection
     FOR v_row IN

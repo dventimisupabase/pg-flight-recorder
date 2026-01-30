@@ -452,6 +452,7 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.8 | OID exhaustion detection: `max_catalog_oid` and `large_object_count` columns, `OID_EXHAUSTION_RISK` anomaly type, rate calculation functions (`oid_consumption_rate`, `time_to_oid_exhaustion`) |
 | 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
 | 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
@@ -1533,6 +1534,7 @@ SELECT * FROM flight_recorder.compare('...', '...');
 | `LOCK_CONTENTION` | Sessions blocked on locks | Review blocking queries, add indexes |
 | `XID_WRAPAROUND_RISK` | Database XID age approaching limit | Run VACUUM FREEZE, tune autovacuum |
 | `TABLE_XID_WRAPAROUND_RISK` | Table XID age approaching limit | Run VACUUM FREEZE on specific table |
+| `OID_EXHAUSTION_RISK` | OID counter approaching 4.3 billion limit | Review lo_create() usage, pg_dump/pg_restore to reset |
 | `IDLE_IN_TRANSACTION` | Session idle in transaction >5 min | Terminate stale sessions, blocks vacuum |
 | `DEAD_TUPLE_ACCUMULATION` | Table has >10% dead tuples | Run VACUUM, check autovacuum settings |
 | `VACUUM_STARVATION` | Dead tuples growing, no vacuum in 24h | Tune autovacuum thresholds |
@@ -1582,6 +1584,50 @@ SELECT * FROM flight_recorder.anomaly_report(
     '2024-01-15 11:00'
 );
 ```
+
+### OID Exhaustion Detection
+
+Object Identifiers (OIDs) are 32-bit unsigned integers (max ~4.3 billion) used internally by PostgreSQL for system catalog entries and large objects. Unlike XIDs, OIDs are not recycled—they simply exhaust. Recovery requires `pg_dump`/`pg_restore` to reset the counter.
+
+**What consumes OIDs:**
+
+- Large objects created via `lo_create()`
+- System catalog entries (tables, indexes, functions, etc.)
+- Toast tables and indexes
+
+**Thresholds** (based on 4,294,967,295 max):
+
+| Severity | Threshold | Meaning |
+|----------|-----------|---------|
+| `high` | > 75% (~3.22 billion) | Proactive warning |
+| `critical` | > 90% (~3.87 billion) | Urgent action needed |
+
+**Metrics collected:**
+
+- `max_catalog_oid` — Highest OID in pg_class (approximates counter position)
+- `large_object_count` — Count from pg_largeobject_metadata
+
+**Rate calculation functions:**
+
+```sql
+-- OID consumption rate over last hour (OIDs/second)
+SELECT flight_recorder.oid_consumption_rate('1 hour');
+
+-- Estimated time until OID exhaustion
+SELECT flight_recorder.time_to_oid_exhaustion();
+```
+
+**Example output:**
+
+| anomaly_type | severity | description | metric_value | threshold |
+|--------------|----------|-------------|--------------|-----------|
+| OID_EXHAUSTION_RISK | high | Database approaching OID exhaustion | Max catalog OID: 3,500,000,000 (81.5% of 4.3 billion), Large objects: 150,000 | max_catalog_oid > 3,221,225,471 (75% of 4,294,967,295) |
+
+**Remediation:**
+
+1. Identify and clean up unused large objects: `SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE ...`
+2. Review application logic that creates large objects
+3. If OIDs are near exhaustion, plan for `pg_dump`/`pg_restore` to reset the counter
 
 ### Idle-in-Transaction Detection
 
