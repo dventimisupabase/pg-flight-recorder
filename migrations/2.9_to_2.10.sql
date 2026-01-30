@@ -7,7 +7,7 @@
 --   - Add query_storms table for storm detection results
 --   - Add storm detection config settings (storm_detection_enabled,
 --     storm_threshold_multiplier, storm_lookback_interval, storm_baseline_days,
---     storm_detection_interval_minutes, retention_storms_days)
+--     storm_detection_interval_minutes, storm_min_duration_minutes, retention_storms_days)
 --   - Add detect_query_storms(), auto_detect_storms() (with auto-resolution),
 --     storm_status(), enable_storm_detection(), disable_storm_detection()
 --   - Add resolve_storm(), resolve_storms_by_queryid(), resolve_all_storms(),
@@ -78,6 +78,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('storm_lookback_interval', '1 hour'),
     ('storm_baseline_days', '7'),
     ('storm_detection_interval_minutes', '15'),
+    ('storm_min_duration_minutes', '5'),
     ('retention_storms_days', '30')
 ON CONFLICT (key) DO NOTHING;
 

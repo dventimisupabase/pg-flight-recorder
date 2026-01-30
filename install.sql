@@ -660,6 +660,7 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('storm_lookback_interval', '1 hour'),
     ('storm_baseline_days', '7'),
     ('storm_detection_interval_minutes', '15'),
+    ('storm_min_duration_minutes', '5'),
     ('retention_storms_days', '30')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
@@ -6036,18 +6037,20 @@ $$;
 COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
 
 -- Auto-detect storms and log new ones to query_storms table
--- Also auto-resolves storms when query counts return to normal
+-- Also auto-resolves storms when query counts return to normal (with anti-flapping protection)
 -- Called by pg_cron when storm detection is enabled
 CREATE OR REPLACE FUNCTION flight_recorder.auto_detect_storms()
 RETURNS INTEGER
 LANGUAGE plpgsql AS $$
 DECLARE
     v_enabled BOOLEAN;
+    v_min_duration INTERVAL;
     v_storm RECORD;
     v_active_storm RECORD;
     v_current_storms BIGINT[];
     v_new_count INTEGER := 0;
     v_resolved_count INTEGER := 0;
+    v_skipped_count INTEGER := 0;
 BEGIN
     -- Check if storm detection is enabled
     v_enabled := COALESCE(
@@ -6059,28 +6062,39 @@ BEGIN
         RETURN 0;
     END IF;
 
+    -- Get minimum duration before auto-resolution (anti-flapping)
+    v_min_duration := COALESCE(
+        (flight_recorder._get_config('storm_min_duration_minutes', '5') || ' minutes')::interval,
+        '5 minutes'::interval
+    );
+
     -- Get current storm queryids for comparison
     SELECT array_agg(queryid) INTO v_current_storms
     FROM flight_recorder.detect_query_storms()
     WHERE storm_type != 'NORMAL';
 
-    -- Auto-resolve active storms that are no longer spiking
+    -- Auto-resolve active storms that are no longer spiking (with minimum duration check)
     FOR v_active_storm IN
-        SELECT id, queryid, storm_type
+        SELECT id, queryid, storm_type, detected_at
         FROM flight_recorder.query_storms
         WHERE resolved_at IS NULL
     LOOP
-        -- If this queryid is not in current storms, auto-resolve it
+        -- If this queryid is not in current storms, consider auto-resolving
         IF v_current_storms IS NULL OR NOT (v_active_storm.queryid = ANY(v_current_storms)) THEN
-            UPDATE flight_recorder.query_storms
-            SET resolved_at = now(),
-                resolution_notes = 'Auto-resolved: query counts returned to normal'
-            WHERE id = v_active_storm.id;
+            -- Check minimum duration (anti-flapping protection)
+            IF v_active_storm.detected_at <= now() - v_min_duration THEN
+                UPDATE flight_recorder.query_storms
+                SET resolved_at = now(),
+                    resolution_notes = 'Auto-resolved: query counts returned to normal'
+                WHERE id = v_active_storm.id;
 
-            v_resolved_count := v_resolved_count + 1;
+                v_resolved_count := v_resolved_count + 1;
 
-            RAISE NOTICE 'pg-flight-recorder: Storm auto-resolved - % for queryid % (counts normalized)',
-                v_active_storm.storm_type, v_active_storm.queryid;
+                RAISE NOTICE 'pg-flight-recorder: Storm auto-resolved - % for queryid % (counts normalized)',
+                    v_active_storm.storm_type, v_active_storm.queryid;
+            ELSE
+                v_skipped_count := v_skipped_count + 1;
+            END IF;
         END IF;
     END LOOP;
 
@@ -6114,10 +6128,15 @@ BEGIN
         RAISE NOTICE 'pg-flight-recorder: Auto-resolved % storm(s)', v_resolved_count;
     END IF;
 
+    IF v_skipped_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: % storm(s) not yet eligible for auto-resolution (min duration: %)',
+            v_skipped_count, v_min_duration;
+    END IF;
+
     RETURN v_new_count;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Also auto-resolves storms when counts normalize. Called by pg_cron.';
+COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Auto-resolves storms when counts normalize, with anti-flapping protection (storm_min_duration_minutes). Called by pg_cron.';
 
 -- Returns current storm status for monitoring
 -- Shows active (unresolved) storms and recent resolved storms

@@ -2,11 +2,11 @@
 -- pg-flight-recorder pgTAP Tests - Query Storm Detection
 -- =============================================================================
 -- Tests: Query storm detection definitions, execution, status, resolution, dashboard
--- Test count: 40
+-- Test count: 41
 -- =============================================================================
 
 BEGIN;
-SELECT plan(40);
+SELECT plan(41);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -109,6 +109,11 @@ SELECT ok(
 SELECT ok(
     EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'retention_storms_days'),
     'retention_storms_days config setting should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'storm_min_duration_minutes'),
+    'storm_min_duration_minutes config setting should exist'
 );
 
 -- =============================================================================
@@ -247,8 +252,9 @@ DELETE FROM flight_recorder.query_storms WHERE queryid = 12345;
 -- =============================================================================
 
 -- Insert an active storm that should be auto-resolved (no matching current spike)
-INSERT INTO flight_recorder.query_storms (queryid, query_fingerprint, storm_type, recent_count, baseline_count, multiplier)
-VALUES (99999, 'SELECT * FROM auto_resolve_test', 'SPIKE', 500, 50, 10.0);
+-- Back-date detected_at to bypass anti-flapping protection
+INSERT INTO flight_recorder.query_storms (queryid, query_fingerprint, storm_type, recent_count, baseline_count, multiplier, detected_at)
+VALUES (99999, 'SELECT * FROM auto_resolve_test', 'SPIKE', 500, 50, 10.0, now() - interval '10 minutes');
 
 -- Enable storm detection and run auto_detect_storms
 UPDATE flight_recorder.config SET value = 'true' WHERE key = 'storm_detection_enabled';
@@ -263,7 +269,7 @@ SELECT lives_ok(
 SELECT ok(
     (SELECT resolved_at IS NOT NULL AND resolution_notes LIKE '%Auto-resolved%'
      FROM flight_recorder.query_storms WHERE queryid = 99999),
-    'Storm should be auto-resolved when counts normalize'
+    'Storm should be auto-resolved when counts normalize (after min duration)'
 );
 
 -- Cleanup
