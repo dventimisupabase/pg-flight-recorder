@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generate GNU Global tag database for code navigation
+# Requires: global, universal-ctags
+
+cd "$(dirname "$0")/.."
+
+check_cmd() {
+    if ! command -v "$1" &>/dev/null; then
+        echo "Error: $1 not found"
+        return 1
+    fi
+}
+
+echo "Checking dependencies..."
+
+if ! check_cmd global; then
+    echo ""
+    echo "Install GNU Global:"
+    echo "  macOS:  brew install global"
+    echo "  Ubuntu: sudo apt-get install global"
+    exit 1
+fi
+
+if ! check_cmd ctags; then
+    echo ""
+    echo "Install Universal CTags:"
+    echo "  macOS:  brew install universal-ctags"
+    echo "  Ubuntu: sudo apt-get install universal-ctags"
+    exit 1
+fi
+
+# Verify ctags is Universal CTags (not Exuberant)
+if ! ctags --version 2>/dev/null | grep -q "Universal Ctags"; then
+    echo "Warning: ctags does not appear to be Universal CTags"
+    echo "SQL support may be limited"
+fi
+
+echo "Generating GTAGS database..."
+GTAGSLABEL=new-ctags gtags --verbose
+
+echo ""
+echo "Done. Generated files:"
+ls -lh GPATH GRTAGS GTAGS
+
+echo ""
+echo "You can now use ./tools/gg for code navigation:"
+echo "  ./tools/gg def <symbol>      # find definitions"
+echo "  ./tools/gg grep <pattern>    # search file contents"
+echo "  ./tools/gg ctx <file>:<line> # show context"

@@ -45,12 +45,13 @@ A GitHub Actions workflow (`.github/workflows/gtags.yml`) regenerates the GTAGS 
 - **HTML Code Browser**: Deployed to GitHub Pages (see repo Settings > Pages for URL)
 - **GTAGS Artifact**: Downloadable from the workflow run for local use
 
-To generate locally (requires `global` and `universal-ctags`):
+To generate locally:
 
 ```bash
-GTAGSLABEL=new-ctags gtags
-htags --suggest --frame --symbol --line-number --other
+./tools/setup-gtags
 ```
+
+This checks for dependencies (`global`, `universal-ctags`) and generates the GTAGS database.
 
 ## Markdown Formatting
 
