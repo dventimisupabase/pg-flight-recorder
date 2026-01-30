@@ -34,6 +34,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
+- [Query Storm Detection](#query-storm-detection)
 - [Testing and Benchmarking](#testing-and-benchmarking)
 - [Code Browser](#code-browser)
 
@@ -1697,6 +1698,229 @@ Detects when replica lag is trending upward (lag is growing over time).
 | `medium` | 30-60 seconds |
 | `high` | 60-300 seconds |
 | `critical` | >300 seconds |
+
+## Query Storm Detection
+
+Query storm detection identifies when queries spike beyond baseline thresholds. Storms are classified by type and can be monitored, resolved manually, or auto-resolved when counts normalize.
+
+### Overview
+
+A "query storm" is a sudden spike in query execution frequency compared to historical baseline. Common causes include:
+
+- **Retry storms**: Application retry logic causing exponential request growth
+- **Cache misses**: Cold cache or invalidation causing repeated database hits
+- **Traffic spikes**: Legitimate load increases beyond normal patterns
+
+### Storm Types
+
+| Type | Classification Criteria | Common Causes |
+|------|------------------------|---------------|
+| `RETRY_STORM` | Query contains RETRY or FOR UPDATE keywords | Application retry loops, lock contention |
+| `CACHE_MISS` | Execution count > 10x baseline | Cache invalidation, cold start, missing indexes |
+| `SPIKE` | Execution count > threshold multiplier (default 3x) | Traffic spike, batch job, query plan regression |
+| `NORMAL` | Within normal range | No action needed |
+
+### Enabling Storm Detection
+
+Storm detection is opt-in. Enable it with:
+
+```sql
+SELECT flight_recorder.enable_storm_detection();
+```
+
+This schedules automatic detection every 15 minutes via pg_cron. To disable:
+
+```sql
+SELECT flight_recorder.disable_storm_detection();
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `storm_detection_enabled` | `false` | Master enable/disable |
+| `storm_threshold_multiplier` | `3.0` | Spike detection threshold (recent/baseline ratio) |
+| `storm_lookback_interval` | `1 hour` | Recent window for comparison |
+| `storm_baseline_days` | `7` | Historical baseline period |
+| `storm_detection_interval_minutes` | `15` | Auto-detection frequency |
+| `storm_min_duration_minutes` | `5` | Minimum storm age before auto-resolution |
+| `storm_notify_enabled` | `true` | Send pg_notify alerts |
+| `storm_notify_channel` | `flight_recorder_storms` | Notification channel name |
+| `retention_storms_days` | `30` | How long to keep storm history |
+
+Adjust configuration:
+
+```sql
+-- Increase sensitivity (detect smaller spikes)
+UPDATE flight_recorder.config
+SET value = '2.0'
+WHERE key = 'storm_threshold_multiplier';
+
+-- Longer baseline for more stable detection
+UPDATE flight_recorder.config
+SET value = '14'
+WHERE key = 'storm_baseline_days';
+```
+
+### Manual Detection
+
+Detect storms without enabling automatic detection:
+
+```sql
+-- Detect with default settings
+SELECT * FROM flight_recorder.detect_query_storms();
+
+-- Custom lookback and threshold
+SELECT * FROM flight_recorder.detect_query_storms('30 minutes'::interval, 2.0);
+```
+
+Output:
+
+| queryid | query_fingerprint | storm_type | recent_count | baseline_count | multiplier |
+|---------|-------------------|------------|--------------|----------------|------------|
+| 123456 | SELECT * FROM orders WHERE... | SPIKE | 15000 | 2500 | 6.00 |
+| 789012 | UPDATE inventory SET... FOR UPDATE | RETRY_STORM | 8500 | 200 | 42.50 |
+
+### Monitoring Storms
+
+**Dashboard view** (at-a-glance summary):
+
+```sql
+SELECT * FROM flight_recorder.storm_dashboard;
+```
+
+Returns: active storm counts by type, resolution rate, average resolution time, storm-prone queries, overall status, and recommendations.
+
+**Status function** (detailed list):
+
+```sql
+-- Active and recent storms
+SELECT * FROM flight_recorder.storm_status();
+
+-- Storms in last 4 hours
+SELECT * FROM flight_recorder.storm_status('4 hours');
+```
+
+**In reports:**
+
+```sql
+SELECT flight_recorder.report('1 hour');
+```
+
+The report includes a Query Storms section when storm detection is enabled.
+
+### Resolving Storms
+
+**Manual resolution:**
+
+```sql
+-- Resolve single storm with notes
+SELECT flight_recorder.resolve_storm(123, 'Fixed by adding index on orders.customer_id');
+
+-- Resolve all storms for a specific query
+SELECT flight_recorder.resolve_storms_by_queryid(456789, 'Query optimized, deployed v2.1');
+
+-- Bulk resolve after incident review
+SELECT flight_recorder.resolve_all_storms('Incident #42 reviewed and closed');
+
+-- Reopen if resolved incorrectly
+SELECT flight_recorder.reopen_storm(123);
+```
+
+**Auto-resolution:**
+
+When `auto_detect_storms()` runs (via pg_cron), it automatically resolves storms whose query counts have returned to normal. Auto-resolution includes anti-flapping protection:
+
+- Storms must be active for at least `storm_min_duration_minutes` (default: 5) before auto-resolution
+- Resolution note: "Auto-resolved: query counts returned to normal"
+
+### Real-Time Alerts
+
+Storm detection sends pg_notify alerts when storms are detected or resolved:
+
+```sql
+-- Listen for alerts (in psql or application)
+LISTEN flight_recorder_storms;
+```
+
+**Notification payload (JSON):**
+
+```json
+{
+  "action": "detected",
+  "storm_id": 123,
+  "queryid": 456789,
+  "storm_type": "SPIKE",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "recent_count": 15000,
+  "baseline_count": 2500,
+  "multiplier": 6.0
+}
+```
+
+```json
+{
+  "action": "resolved",
+  "storm_id": 123,
+  "queryid": 456789,
+  "storm_type": "SPIKE",
+  "timestamp": "2024-01-15T11:00:00Z",
+  "resolution_notes": "Auto-resolved: query counts returned to normal"
+}
+```
+
+Disable notifications:
+
+```sql
+UPDATE flight_recorder.config
+SET value = 'false'
+WHERE key = 'storm_notify_enabled';
+```
+
+### Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `enable_storm_detection()` | Enable and schedule automatic detection |
+| `disable_storm_detection()` | Disable and unschedule detection |
+| `detect_query_storms(interval, numeric)` | Manual storm detection |
+| `auto_detect_storms()` | Detect new storms, auto-resolve normalized (called by pg_cron) |
+| `storm_status(interval)` | List active and recent storms |
+| `resolve_storm(bigint, text)` | Resolve single storm by ID |
+| `resolve_storms_by_queryid(bigint, text)` | Resolve all storms for a queryid |
+| `resolve_all_storms(text)` | Bulk resolve all active storms |
+| `reopen_storm(bigint)` | Reopen a previously resolved storm |
+
+### Tables and Views
+
+| Object | Type | Purpose |
+|--------|------|---------|
+| `query_storms` | Table | Storm detection history |
+| `storm_dashboard` | View | At-a-glance monitoring summary |
+
+### Example Workflow
+
+```sql
+-- 1. Enable storm detection
+SELECT flight_recorder.enable_storm_detection();
+
+-- 2. Check dashboard periodically
+SELECT * FROM flight_recorder.storm_dashboard;
+
+-- 3. Investigate active storms
+SELECT * FROM flight_recorder.storm_status() WHERE status = 'ACTIVE';
+
+-- 4. Get query details (requires pg_stat_statements)
+SELECT query, calls, mean_exec_time
+FROM pg_stat_statements
+WHERE queryid = 456789;
+
+-- 5. Resolve after fixing
+SELECT flight_recorder.resolve_storm(123, 'Added missing index');
+
+-- 6. Monitor via pg_notify in your application
+-- Application code: LISTEN flight_recorder_storms
+```
 
 ## Testing and Benchmarking
 
