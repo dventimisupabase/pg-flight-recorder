@@ -661,6 +661,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('storm_baseline_days', '7'),
     ('storm_detection_interval_minutes', '15'),
     ('storm_min_duration_minutes', '5'),
+    ('storm_notify_enabled', 'true'),
+    ('storm_notify_channel', 'flight_recorder_storms'),
     ('retention_storms_days', '30')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
@@ -6036,6 +6038,69 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
 
+-- Sends a pg_notify alert for storm events
+-- Called internally when storms are detected or resolved
+CREATE OR REPLACE FUNCTION flight_recorder._notify_storm(
+    p_action TEXT,           -- 'detected' or 'resolved'
+    p_storm_id BIGINT,
+    p_queryid BIGINT,
+    p_storm_type TEXT,
+    p_recent_count BIGINT DEFAULT NULL,
+    p_baseline_count BIGINT DEFAULT NULL,
+    p_multiplier NUMERIC DEFAULT NULL,
+    p_resolution_notes TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_channel TEXT;
+    v_payload JSONB;
+BEGIN
+    -- Check if notifications are enabled
+    v_enabled := COALESCE(
+        flight_recorder._get_config('storm_notify_enabled', 'true')::boolean,
+        true
+    );
+
+    IF NOT v_enabled THEN
+        RETURN;
+    END IF;
+
+    -- Get channel name
+    v_channel := COALESCE(
+        flight_recorder._get_config('storm_notify_channel', 'flight_recorder_storms'),
+        'flight_recorder_storms'
+    );
+
+    -- Build payload
+    v_payload := jsonb_build_object(
+        'action', p_action,
+        'storm_id', p_storm_id,
+        'queryid', p_queryid,
+        'storm_type', p_storm_type,
+        'timestamp', now()
+    );
+
+    -- Add optional fields based on action
+    IF p_action = 'detected' THEN
+        v_payload := v_payload || jsonb_build_object(
+            'recent_count', p_recent_count,
+            'baseline_count', p_baseline_count,
+            'multiplier', p_multiplier
+        );
+    ELSIF p_action = 'resolved' THEN
+        v_payload := v_payload || jsonb_build_object(
+            'resolution_notes', p_resolution_notes
+        );
+    END IF;
+
+    -- Send notification
+    PERFORM pg_notify(v_channel, v_payload::text);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._notify_storm(TEXT, BIGINT, BIGINT, TEXT, BIGINT, BIGINT, NUMERIC, TEXT) IS 'Internal: Send pg_notify alert for storm events. Configure via storm_notify_enabled and storm_notify_channel settings.';
+
 -- Auto-detect storms and log new ones to query_storms table
 -- Also auto-resolves storms when query counts return to normal (with anti-flapping protection)
 -- Called by pg_cron when storm detection is enabled
@@ -6090,6 +6155,15 @@ BEGIN
 
                 v_resolved_count := v_resolved_count + 1;
 
+                -- Send notification
+                PERFORM flight_recorder._notify_storm(
+                    'resolved',
+                    v_active_storm.id,
+                    v_active_storm.queryid,
+                    v_active_storm.storm_type,
+                    p_resolution_notes := 'Auto-resolved: query counts returned to normal'
+                );
+
                 RAISE NOTICE 'pg-flight-recorder: Storm auto-resolved - % for queryid % (counts normalized)',
                     v_active_storm.storm_type, v_active_storm.queryid;
             ELSE
@@ -6112,8 +6186,21 @@ BEGIN
             ) VALUES (
                 v_storm.queryid, v_storm.query_fingerprint, v_storm.storm_type,
                 v_storm.recent_count, v_storm.baseline_count, v_storm.multiplier
-            );
+            )
+            RETURNING id INTO v_active_storm;
+
             v_new_count := v_new_count + 1;
+
+            -- Send notification
+            PERFORM flight_recorder._notify_storm(
+                'detected',
+                v_active_storm.id,
+                v_storm.queryid,
+                v_storm.storm_type,
+                v_storm.recent_count,
+                v_storm.baseline_count,
+                v_storm.multiplier
+            );
 
             RAISE NOTICE 'pg-flight-recorder: Storm detected - % for queryid % (% vs baseline %)',
                 v_storm.storm_type, v_storm.queryid, v_storm.recent_count, v_storm.baseline_count;
@@ -6136,7 +6223,7 @@ BEGIN
     RETURN v_new_count;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Auto-resolves storms when counts normalize, with anti-flapping protection (storm_min_duration_minutes). Called by pg_cron.';
+COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Auto-resolves storms when counts normalize, with anti-flapping protection. Sends pg_notify alerts when enabled (storm_notify_enabled). Called by pg_cron.';
 
 -- Returns current storm status for monitoring
 -- Shows active (unresolved) storms and recent resolved storms

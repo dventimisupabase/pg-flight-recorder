@@ -1,12 +1,12 @@
 -- =============================================================================
 -- pg-flight-recorder pgTAP Tests - Query Storm Detection
 -- =============================================================================
--- Tests: Query storm detection definitions, execution, status, resolution, dashboard
--- Test count: 41
+-- Tests: Query storm detection definitions, execution, status, resolution, dashboard, notifications
+-- Test count: 44
 -- =============================================================================
 
 BEGIN;
-SELECT plan(41);
+SELECT plan(44);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -116,8 +116,18 @@ SELECT ok(
     'storm_min_duration_minutes config setting should exist'
 );
 
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'storm_notify_enabled'),
+    'storm_notify_enabled config setting should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'storm_notify_channel'),
+    'storm_notify_channel config setting should exist'
+);
+
 -- =============================================================================
--- 4. FUNCTION EXISTENCE - Detection (5 tests)
+-- 4. FUNCTION EXISTENCE - Detection (6 tests)
 -- =============================================================================
 
 SELECT has_function(
@@ -143,6 +153,11 @@ SELECT has_function(
 SELECT has_function(
     'flight_recorder', 'disable_storm_detection', ARRAY[]::TEXT[],
     'disable_storm_detection() function should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', '_notify_storm', ARRAY['text', 'bigint', 'bigint', 'text', 'bigint', 'bigint', 'numeric', 'text'],
+    '_notify_storm() function should exist'
 );
 
 -- =============================================================================
