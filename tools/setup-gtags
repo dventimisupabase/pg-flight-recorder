@@ -1,51 +1,174 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generate GNU Global tag database for code navigation
-# Requires: global, universal-ctags
+# Generate or download GNU Global tag database for code navigation
+#
+# Usage:
+#   ./tools/setup-gtags             # generate locally (requires global + universal-ctags)
+#   ./tools/setup-gtags --download  # download pre-built from GitHub Actions
 
 cd "$(dirname "$0")/.."
 
-check_cmd() {
-    if ! command -v "$1" &>/dev/null; then
-        echo "Error: $1 not found"
-        return 1
+download_artifact() {
+    echo "Downloading pre-built GTAGS database from GitHub Actions..."
+
+    if ! command -v gh &>/dev/null; then
+        echo "Error: gh (GitHub CLI) not found"
+        echo ""
+        echo "Install it from: https://cli.github.com/"
+        echo "  macOS:  brew install gh"
+        echo "  Ubuntu: sudo apt-get install gh"
+        exit 1
     fi
+
+    # Check if authenticated
+    if ! gh auth status &>/dev/null; then
+        echo "Error: Not authenticated with GitHub"
+        echo "Run: gh auth login"
+        exit 1
+    fi
+
+    # Get the latest artifact
+    local artifact_id
+    artifact_id=$(gh api repos/:owner/:repo/actions/artifacts \
+        --jq '.artifacts[] | select(.name=="gtags-database") | .id' \
+        | head -1)
+
+    if [[ -z "$artifact_id" ]]; then
+        echo "Error: No gtags-database artifact found"
+        echo "The workflow may not have run yet. Try again after a push to main."
+        exit 1
+    fi
+
+    echo "Found artifact ID: $artifact_id"
+
+    # Download and extract
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    gh api "repos/:owner/:repo/actions/artifacts/${artifact_id}/zip" > "$tmpdir/gtags.zip"
+    unzip -o "$tmpdir/gtags.zip" -d .
+
+    rm -rf "$tmpdir"
+
+    echo ""
+    echo "Done. Downloaded files:"
+    ls -lh GPATH GRTAGS GTAGS
+
+    echo ""
+    echo "You can now use ./tools/gg for code navigation:"
+    echo "  ./tools/gg def <symbol>      # find definitions"
+    echo "  ./tools/gg grep <pattern>    # search file contents"
+    echo "  ./tools/gg ctx <file>:<line> # show context"
 }
 
-echo "Checking dependencies..."
+generate_locally() {
+    local missing=()
 
-if ! check_cmd global; then
+    if ! command -v global &>/dev/null; then
+        missing+=("global")
+    fi
+
+    if ! command -v ctags &>/dev/null; then
+        missing+=("ctags")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing dependencies: ${missing[*]}"
+        echo ""
+        echo "Options:"
+        echo ""
+        echo "  1. Install dependencies:"
+        echo "     macOS:  brew install global universal-ctags"
+        echo "     Ubuntu: sudo apt-get install global universal-ctags"
+        echo ""
+        echo "  2. Download pre-built database (no install required):"
+        echo "     ./tools/setup-gtags --download"
+        echo ""
+        echo "  3. Use Docker:"
+        echo "     ./tools/setup-gtags --docker"
+        exit 1
+    fi
+
+    # Verify ctags is Universal CTags (not Exuberant)
+    if ! ctags --version 2>/dev/null | grep -q "Universal Ctags"; then
+        echo "Warning: ctags does not appear to be Universal CTags"
+        echo "SQL support may be limited"
+    fi
+
+    echo "Generating GTAGS database..."
+    GTAGSLABEL=new-ctags gtags --verbose
+
     echo ""
-    echo "Install GNU Global:"
-    echo "  macOS:  brew install global"
-    echo "  Ubuntu: sudo apt-get install global"
-    exit 1
-fi
+    echo "Done. Generated files:"
+    ls -lh GPATH GRTAGS GTAGS
 
-if ! check_cmd ctags; then
     echo ""
-    echo "Install Universal CTags:"
-    echo "  macOS:  brew install universal-ctags"
-    echo "  Ubuntu: sudo apt-get install universal-ctags"
-    exit 1
-fi
+    echo "You can now use ./tools/gg for code navigation:"
+    echo "  ./tools/gg def <symbol>      # find definitions"
+    echo "  ./tools/gg grep <pattern>    # search file contents"
+    echo "  ./tools/gg ctx <file>:<line> # show context"
+}
 
-# Verify ctags is Universal CTags (not Exuberant)
-if ! ctags --version 2>/dev/null | grep -q "Universal Ctags"; then
-    echo "Warning: ctags does not appear to be Universal CTags"
-    echo "SQL support may be limited"
-fi
+run_in_docker() {
+    echo "Generating GTAGS database in Docker..."
 
-echo "Generating GTAGS database..."
-GTAGSLABEL=new-ctags gtags --verbose
+    if ! command -v docker &>/dev/null; then
+        echo "Error: docker not found"
+        exit 1
+    fi
 
-echo ""
-echo "Done. Generated files:"
-ls -lh GPATH GRTAGS GTAGS
+    # Build a minimal image with global + universal-ctags
+    local dockerfile
+    dockerfile=$(cat <<'DOCKERFILE'
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    global universal-ctags \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+ENTRYPOINT ["sh", "-c", "GTAGSLABEL=new-ctags gtags --verbose"]
+DOCKERFILE
+)
 
-echo ""
-echo "You can now use ./tools/gg for code navigation:"
-echo "  ./tools/gg def <symbol>      # find definitions"
-echo "  ./tools/gg grep <pattern>    # search file contents"
-echo "  ./tools/gg ctx <file>:<line> # show context"
+    echo "$dockerfile" | docker build -t gtags-builder -f - . > /dev/null
+
+    docker run --rm -v "$(pwd):/src" gtags-builder
+
+    echo ""
+    echo "Done. Generated files:"
+    ls -lh GPATH GRTAGS GTAGS
+
+    echo ""
+    echo "You can now use ./tools/gg for code navigation:"
+    echo "  ./tools/gg def <symbol>      # find definitions"
+    echo "  ./tools/gg grep <pattern>    # search file contents"
+    echo "  ./tools/gg ctx <file>:<line> # show context"
+}
+
+case "${1:-}" in
+    --download|-d)
+        download_artifact
+        ;;
+    --docker)
+        run_in_docker
+        ;;
+    --help|-h)
+        echo "Usage: setup-gtags [--download|--docker]"
+        echo ""
+        echo "Generate GNU Global tag database for code navigation."
+        echo ""
+        echo "Options:"
+        echo "  (none)      Generate locally (requires global + universal-ctags)"
+        echo "  --download  Download pre-built database from GitHub Actions"
+        echo "  --docker    Generate using Docker (no local install needed)"
+        echo "  --help      Show this help"
+        ;;
+    "")
+        generate_locally
+        ;;
+    *)
+        echo "Unknown option: $1"
+        echo "Run: setup-gtags --help"
+        exit 1
+        ;;
+esac
