@@ -1,12 +1,12 @@
 -- =============================================================================
 -- pg-flight-recorder pgTAP Tests - Query Storm Detection
 -- =============================================================================
--- Tests: Query storm detection definitions, execution, and status functions
--- Test count: 25
+-- Tests: Query storm detection definitions, execution, status, and resolution
+-- Test count: 35
 -- =============================================================================
 
 BEGIN;
-SELECT plan(25);
+SELECT plan(35);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -112,7 +112,7 @@ SELECT ok(
 );
 
 -- =============================================================================
--- 4. FUNCTION EXISTENCE (5 tests)
+-- 4. FUNCTION EXISTENCE - Detection (5 tests)
 -- =============================================================================
 
 SELECT has_function(
@@ -141,7 +141,31 @@ SELECT has_function(
 );
 
 -- =============================================================================
--- 5. FUNCTION EXECUTION (3 tests)
+-- 5. FUNCTION EXISTENCE - Resolution (4 tests)
+-- =============================================================================
+
+SELECT has_function(
+    'flight_recorder', 'resolve_storm', ARRAY['bigint', 'text'],
+    'resolve_storm(bigint, text) function should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', 'resolve_storms_by_queryid', ARRAY['bigint', 'text'],
+    'resolve_storms_by_queryid(bigint, text) function should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', 'resolve_all_storms', ARRAY['text'],
+    'resolve_all_storms(text) function should exist'
+);
+
+SELECT has_function(
+    'flight_recorder', 'reopen_storm', ARRAY['bigint'],
+    'reopen_storm(bigint) function should exist'
+);
+
+-- =============================================================================
+-- 6. FUNCTION EXECUTION - Detection (3 tests)
 -- =============================================================================
 
 -- Test detect_query_storms executes without error
@@ -161,6 +185,62 @@ SELECT lives_ok(
     $$SELECT flight_recorder.auto_detect_storms()$$,
     'auto_detect_storms() should execute without error'
 );
+
+-- =============================================================================
+-- 7. RESOLUTION WORKFLOW (6 tests)
+-- =============================================================================
+
+-- Insert a test storm for resolution testing
+INSERT INTO flight_recorder.query_storms (queryid, query_fingerprint, storm_type, recent_count, baseline_count, multiplier)
+VALUES (12345, 'SELECT * FROM test_table', 'SPIKE', 1000, 100, 10.0);
+
+-- Test resolve_storm returns success message
+SELECT matches(
+    flight_recorder.resolve_storm(
+        (SELECT id FROM flight_recorder.query_storms WHERE queryid = 12345),
+        'Test resolution'
+    ),
+    'Storm .* resolved',
+    'resolve_storm() should return success message'
+);
+
+-- Test storm is now resolved
+SELECT ok(
+    (SELECT resolved_at IS NOT NULL FROM flight_recorder.query_storms WHERE queryid = 12345),
+    'Storm should be marked as resolved'
+);
+
+-- Test resolution notes are saved
+SELECT is(
+    (SELECT resolution_notes FROM flight_recorder.query_storms WHERE queryid = 12345),
+    'Test resolution',
+    'Resolution notes should be saved'
+);
+
+-- Test reopen_storm works
+SELECT matches(
+    flight_recorder.reopen_storm(
+        (SELECT id FROM flight_recorder.query_storms WHERE queryid = 12345)
+    ),
+    'Storm .* reopened',
+    'reopen_storm() should return success message'
+);
+
+-- Test storm is now active again
+SELECT ok(
+    (SELECT resolved_at IS NULL FROM flight_recorder.query_storms WHERE queryid = 12345),
+    'Storm should be active after reopening'
+);
+
+-- Test resolve_all_storms works
+SELECT matches(
+    flight_recorder.resolve_all_storms('Bulk test resolution'),
+    'Resolved .* storm',
+    'resolve_all_storms() should return success message'
+);
+
+-- Cleanup test data
+DELETE FROM flight_recorder.query_storms WHERE queryid = 12345;
 
 -- Disable storm detection after testing (should already be disabled)
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'storm_detection_enabled';

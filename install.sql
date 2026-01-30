@@ -6196,6 +6196,127 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.disable_storm_detection() IS 'Disable storm detection and unschedule the cron job.';
 
+-- Resolves a single storm by ID, marking it as resolved with optional notes
+CREATE OR REPLACE FUNCTION flight_recorder.resolve_storm(
+    p_storm_id BIGINT,
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_storm RECORD;
+BEGIN
+    -- Check if storm exists
+    SELECT id, storm_type, queryid, resolved_at
+    INTO v_storm
+    FROM flight_recorder.query_storms
+    WHERE id = p_storm_id;
+
+    IF NOT FOUND THEN
+        RETURN format('Storm %s not found', p_storm_id);
+    END IF;
+
+    IF v_storm.resolved_at IS NOT NULL THEN
+        RETURN format('Storm %s already resolved at %s', p_storm_id, v_storm.resolved_at);
+    END IF;
+
+    -- Mark as resolved
+    UPDATE flight_recorder.query_storms
+    SET resolved_at = now(),
+        resolution_notes = p_notes
+    WHERE id = p_storm_id;
+
+    RETURN format('Storm %s (%s for queryid %s) resolved', p_storm_id, v_storm.storm_type, v_storm.queryid);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.resolve_storm(BIGINT, TEXT) IS 'Mark a storm as resolved with optional notes explaining the resolution.';
+
+-- Resolves all active storms for a specific queryid
+CREATE OR REPLACE FUNCTION flight_recorder.resolve_storms_by_queryid(
+    p_queryid BIGINT,
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    UPDATE flight_recorder.query_storms
+    SET resolved_at = now(),
+        resolution_notes = p_notes
+    WHERE queryid = p_queryid
+      AND resolved_at IS NULL;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+
+    IF v_count = 0 THEN
+        RETURN format('No active storms found for queryid %s', p_queryid);
+    END IF;
+
+    RETURN format('Resolved %s storm(s) for queryid %s', v_count, p_queryid);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.resolve_storms_by_queryid(BIGINT, TEXT) IS 'Mark all active storms for a queryid as resolved with optional notes.';
+
+-- Resolves all active storms at once (bulk resolution)
+CREATE OR REPLACE FUNCTION flight_recorder.resolve_all_storms(
+    p_notes TEXT DEFAULT 'Bulk resolution'
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    UPDATE flight_recorder.query_storms
+    SET resolved_at = now(),
+        resolution_notes = p_notes
+    WHERE resolved_at IS NULL;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+
+    IF v_count = 0 THEN
+        RETURN 'No active storms to resolve';
+    END IF;
+
+    RETURN format('Resolved %s storm(s)', v_count);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.resolve_all_storms(TEXT) IS 'Mark all active storms as resolved. Use for bulk resolution after incident review.';
+
+-- Reopens a previously resolved storm (in case of incorrect resolution)
+CREATE OR REPLACE FUNCTION flight_recorder.reopen_storm(
+    p_storm_id BIGINT
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_storm RECORD;
+BEGIN
+    -- Check if storm exists
+    SELECT id, storm_type, queryid, resolved_at
+    INTO v_storm
+    FROM flight_recorder.query_storms
+    WHERE id = p_storm_id;
+
+    IF NOT FOUND THEN
+        RETURN format('Storm %s not found', p_storm_id);
+    END IF;
+
+    IF v_storm.resolved_at IS NULL THEN
+        RETURN format('Storm %s is already active (not resolved)', p_storm_id);
+    END IF;
+
+    -- Reopen the storm
+    UPDATE flight_recorder.query_storms
+    SET resolved_at = NULL,
+        resolution_notes = NULL
+    WHERE id = p_storm_id;
+
+    RETURN format('Storm %s (%s for queryid %s) reopened', p_storm_id, v_storm.storm_type, v_storm.queryid);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.reopen_storm(BIGINT) IS 'Reopen a previously resolved storm if it was resolved incorrectly.';
+
 -- Configure autovacuum on ring buffer tables
 -- Ring buffers use pre-allocated rows with UPDATE-only pattern, achieving high HOT update ratios.
 -- With fillfactor 70-90, most updates are HOT (no dead tuples in indexes), but tuple chains still

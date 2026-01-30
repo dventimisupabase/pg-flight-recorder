@@ -10,6 +10,8 @@
 --     storm_detection_interval_minutes, retention_storms_days)
 --   - Add detect_query_storms(), auto_detect_storms(), storm_status(),
 --     enable_storm_detection(), disable_storm_detection()
+--   - Add resolve_storm(), resolve_storms_by_queryid(), resolve_all_storms(),
+--     reopen_storm() for storm resolution workflow
 --   - Update cleanup_aggregates() to include storm retention
 --   - Update disable() to unschedule storm cron job
 --
@@ -132,5 +134,9 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'To detect storms manually:';
     RAISE NOTICE '  SELECT * FROM flight_recorder.detect_query_storms();';
+    RAISE NOTICE '';
+    RAISE NOTICE 'To resolve storms:';
+    RAISE NOTICE '  SELECT flight_recorder.resolve_storm(storm_id, ''notes'');';
+    RAISE NOTICE '  SELECT flight_recorder.resolve_all_storms(''incident reviewed'');';
     RAISE NOTICE '';
 END $$;
