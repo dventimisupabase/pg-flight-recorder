@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Generate SQL_INDEX.json using pglast
+#
+# Usage:
+#   ./tools/setup-sql-index             # generate locally (requires pglast)
+#   ./tools/setup-sql-index --docker    # generate using Docker
+#   ./tools/setup-sql-index --download  # download pre-built from GitHub Actions
+
+cd "$(dirname "$0")/.."
+
+INDEX_FILE="SQL_INDEX.json"
+IMAGE="dventimisupabase/pglast-indexer:latest"
+
+download_artifact() {
+    echo "Downloading pre-built SQL_INDEX.json from GitHub Actions..."
+
+    if ! command -v gh &>/dev/null; then
+        echo "Error: gh (GitHub CLI) not found"
+        echo ""
+        echo "Install it from: https://cli.github.com/"
+        echo "  macOS:  brew install gh"
+        echo "  Ubuntu: sudo apt-get install gh"
+        exit 1
+    fi
+
+    # Check if authenticated
+    if ! gh auth status &>/dev/null; then
+        echo "Error: Not authenticated with GitHub"
+        echo "Run: gh auth login"
+        exit 1
+    fi
+
+    # Get the latest artifact
+    local artifact_id
+    artifact_id=$(gh api repos/:owner/:repo/actions/artifacts \
+        --jq '.artifacts[] | select(.name=="sql-index") | .id' \
+        | head -1)
+
+    if [[ -z "$artifact_id" ]]; then
+        echo "Error: No sql-index artifact found"
+        echo "The workflow may not have run yet. Try again after a push to main."
+        exit 1
+    fi
+
+    echo "Found artifact ID: $artifact_id"
+
+    # Download and extract
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    gh api "repos/:owner/:repo/actions/artifacts/${artifact_id}/zip" > "$tmpdir/sql-index.zip"
+    unzip -o "$tmpdir/sql-index.zip" -d .
+
+    rm -rf "$tmpdir"
+
+    echo ""
+    echo "Done. Downloaded:"
+    ls -lh "$INDEX_FILE"
+
+    show_usage_instructions
+}
+
+generate_locally() {
+    if ! command -v python3 &>/dev/null; then
+        echo "Error: python3 not found"
+        echo ""
+        echo "Options:"
+        echo "  1. Install Python 3"
+        echo "  2. Use Docker: ./tools/setup-sql-index --docker"
+        exit 1
+    fi
+
+    # Check if pglast is installed
+    if ! python3 -c "import pglast" 2>/dev/null; then
+        echo "Error: pglast not installed"
+        echo ""
+        echo "Options:"
+        echo "  1. Install pglast: pip install pglast>=7.0"
+        echo "  2. Use Docker: ./tools/setup-sql-index --docker"
+        exit 1
+    fi
+
+    echo "Generating SQL_INDEX.json using local pglast..."
+    ./tools/sql-index > "$INDEX_FILE"
+
+    echo ""
+    echo "Done. Generated:"
+    ls -lh "$INDEX_FILE"
+
+    show_usage_instructions
+}
+
+run_in_docker() {
+    echo "Generating SQL_INDEX.json using Docker..."
+
+    if ! command -v docker &>/dev/null; then
+        echo "Error: docker not found"
+        exit 1
+    fi
+
+    # Pull image if not present
+    if ! docker image inspect "$IMAGE" &>/dev/null; then
+        echo "Pulling $IMAGE..."
+        docker pull "$IMAGE" || {
+            echo ""
+            echo "Image not found on DockerHub. Building locally..."
+            docker build -t "$IMAGE" -f tools/Dockerfile.pglast .
+        }
+    fi
+
+    docker run --rm -v "$(pwd):/src" "$IMAGE" > "$INDEX_FILE"
+
+    echo ""
+    echo "Done. Generated:"
+    ls -lh "$INDEX_FILE"
+
+    show_usage_instructions
+}
+
+show_usage_instructions() {
+    echo ""
+    echo "You can now use ./tools/sql-find for code navigation:"
+    echo "  ./tools/sql-find def <symbol>      # find definitions"
+    echo "  ./tools/sql-find grep <pattern>    # search file contents"
+    echo "  ./tools/sql-find ctx <file>:<line> # show context"
+    echo "  ./tools/sql-find stats             # show index statistics"
+}
+
+case "${1:-}" in
+    --download|-d)
+        download_artifact
+        ;;
+    --docker)
+        run_in_docker
+        ;;
+    --help|-h)
+        echo "Usage: setup-sql-index [--download|--docker]"
+        echo ""
+        echo "Generate SQL_INDEX.json for code navigation using pglast."
+        echo ""
+        echo "Options:"
+        echo "  (none)      Generate locally (requires pglast: pip install pglast>=7.0)"
+        echo "  --download  Download pre-built from GitHub Actions"
+        echo "  --docker    Generate using Docker (pulls image on first run)"
+        echo "  --help      Show this help"
+        ;;
+    "")
+        generate_locally
+        ;;
+    *)
+        echo "Unknown option: $1"
+        echo "Run: setup-sql-index --help"
+        exit 1
+        ;;
+esac

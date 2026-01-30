@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Index PostgreSQL DDL objects with line numbers using pglast.
+
+This script parses SQL files and extracts CREATE statements for tables,
+functions, views, and types, outputting a JSON index with locations.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+try:
+    import pglast
+    from pglast import ast
+    from pglast.visitors import Visitor
+except ImportError:
+    print("Error: pglast not installed. Run: pip install pglast>=7.0", file=sys.stderr)
+    sys.exit(1)
+
+
+def offset_to_line(source: str, offset: int) -> int:
+    """Convert byte offset to line number (1-indexed)."""
+    if offset is None or offset < 0:
+        return 1
+    return source[:offset].count('\n') + 1
+
+
+class DDLVisitor(Visitor):
+    """Extract CREATE statements with locations."""
+
+    def __init__(self, source: str):
+        super().__init__()
+        self.source = source
+        self.tables = []
+        self.functions = []
+        self.views = []
+        self.types = []
+
+    def visit_CreateStmt(self, ancestors, node):
+        """Handle CREATE TABLE statements."""
+        name = self._get_relation_name(node.relation)
+        line = offset_to_line(self.source, getattr(node.relation, 'location', None))
+        columns = []
+        if node.tableElts:
+            for elt in node.tableElts:
+                # ColumnDef nodes have colname attribute
+                if isinstance(elt, ast.ColumnDef) and elt.colname:
+                    col_line = offset_to_line(self.source, getattr(elt, 'location', None))
+                    col_type = self._get_type_name(elt.typeName) if elt.typeName else "unknown"
+                    columns.append({"name": elt.colname, "type": col_type, "line": col_line})
+        self.tables.append({"name": name, "line": line, "columns": columns})
+
+    def visit_CreateFunctionStmt(self, ancestors, node):
+        """Handle CREATE FUNCTION statements."""
+        name = self._get_funcname(node.funcname)
+        # Get line by finding function name in source (more reliable than pglast locations)
+        line = self._find_function_line(name)
+        returns = self._get_type_name(node.returnType) if node.returnType else "void"
+        self.functions.append({"name": name, "line": line, "returns": returns})
+
+    def visit_ViewStmt(self, ancestors, node):
+        """Handle CREATE VIEW statements."""
+        name = self._get_relation_name(node.view)
+        # Try pglast location first, fall back to regex search
+        loc = getattr(node.view, 'location', None)
+        if loc is not None and loc > 0:
+            line = offset_to_line(self.source, loc)
+        else:
+            line = self._find_view_line(name)
+        self.views.append({"name": name, "line": line})
+
+    def visit_CompositeTypeStmt(self, ancestors, node):
+        """Handle CREATE TYPE ... AS (composite type)."""
+        name = self._get_relation_name(node.typevar)
+        line = offset_to_line(self.source, getattr(node.typevar, 'location', None))
+        self.types.append({"name": name, "line": line, "kind": "composite"})
+
+    def visit_CreateEnumStmt(self, ancestors, node):
+        """Handle CREATE TYPE ... AS ENUM."""
+        name = self._get_string_list(node.typeName)
+        line = 1
+        if node.typeName:
+            first = node.typeName[0]
+            loc = getattr(first, 'location', None)
+            if loc is not None:
+                line = offset_to_line(self.source, loc)
+        self.types.append({"name": name, "line": line, "kind": "enum"})
+
+    def _get_relation_name(self, relation) -> str:
+        """Extract schema.table name from RangeVar."""
+        parts = []
+        if hasattr(relation, 'schemaname') and relation.schemaname:
+            parts.append(relation.schemaname)
+        if hasattr(relation, 'relname') and relation.relname:
+            parts.append(relation.relname)
+        return '.'.join(parts) if parts else "unknown"
+
+    def _get_funcname(self, funcname) -> str:
+        """Extract function name from list of name parts."""
+        return self._get_string_list(funcname)
+
+    def _get_string_list(self, nodes) -> str:
+        """Extract string values from a list of String nodes."""
+        if not nodes:
+            return "unknown"
+        parts = []
+        for n in nodes:
+            if isinstance(n, ast.String) and n.sval:
+                parts.append(n.sval)
+        return '.'.join(parts) if parts else "unknown"
+
+    def _get_type_name(self, type_name) -> str:
+        """Extract type name from TypeName node."""
+        if not type_name:
+            return "unknown"
+        if hasattr(type_name, 'names') and type_name.names:
+            parts = []
+            for n in type_name.names:
+                if isinstance(n, ast.String) and n.sval:
+                    # Skip 'pg_catalog' prefix for built-in types
+                    if n.sval != 'pg_catalog':
+                        parts.append(n.sval)
+            return '.'.join(parts) if parts else "unknown"
+        return "unknown"
+
+    def _find_function_line(self, func_name: str) -> int:
+        """Find line number where function is defined by searching source."""
+        import re
+        # Extract just the function name without schema
+        short_name = func_name.split('.')[-1] if '.' in func_name else func_name
+        # Pattern: CREATE [OR REPLACE] FUNCTION [schema.]name(
+        pattern = rf'(?:CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+)(?:\w+\.)?{re.escape(short_name)}\s*\('
+        match = re.search(pattern, self.source, re.IGNORECASE)
+        if match:
+            return self.source[:match.start()].count('\n') + 1
+        return 1
+
+    def _find_view_line(self, view_name: str) -> int:
+        """Find line number where view is defined by searching source."""
+        import re
+        short_name = view_name.split('.')[-1] if '.' in view_name else view_name
+        pattern = rf'(?:CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+)(?:\w+\.)?{re.escape(short_name)}\s'
+        match = re.search(pattern, self.source, re.IGNORECASE)
+        if match:
+            return self.source[:match.start()].count('\n') + 1
+        return 1
+
+
+def preprocess_sql(source: str) -> tuple[str, list[tuple[int, int]]]:
+    """Strip psql meta-commands and track line mappings.
+
+    Returns:
+        - Cleaned SQL with psql commands replaced by blank lines
+        - List of (original_line, cleaned_line) for mapping back
+    """
+    import re
+    lines = source.split('\n')
+    cleaned_lines = []
+    line_map = []  # (original_line_num, text)
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.lstrip()
+        # Skip psql meta-commands (backslash commands at start of line)
+        if stripped.startswith('\\'):
+            cleaned_lines.append('')  # Keep blank to preserve line numbers
+        else:
+            cleaned_lines.append(line)
+        line_map.append(i)
+
+    return '\n'.join(cleaned_lines), line_map
+
+
+def index_file(filepath: Path) -> dict | None:
+    """Parse a SQL file and extract DDL objects."""
+    try:
+        source = filepath.read_text()
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}", file=sys.stderr)
+        return None
+
+    # Preprocess to remove psql meta-commands
+    cleaned_source, _ = preprocess_sql(source)
+
+    try:
+        tree = pglast.parse_sql(cleaned_source)
+    except pglast.parser.ParseError as e:
+        print(f"Parse error in {filepath}: {e}", file=sys.stderr)
+        return None
+
+    # Use cleaned_source for offset-to-line calculation (preserves line numbers)
+    visitor = DDLVisitor(cleaned_source)
+    visitor(tree)
+
+    # Only return results if we found something
+    if not (visitor.tables or visitor.functions or visitor.views or visitor.types):
+        return None
+
+    return {
+        "file": str(filepath),
+        "tables": visitor.tables,
+        "functions": visitor.functions,
+        "views": visitor.views,
+        "types": visitor.types,
+    }
+
+
+def main():
+    """Index all SQL files in the repository."""
+    # Find all SQL files, excluding hidden files and directories
+    sql_files = []
+    for sql_file in Path(".").rglob("*.sql"):
+        # Skip hidden files/directories
+        if any(part.startswith(".") for part in sql_file.parts):
+            continue
+        sql_files.append(sql_file)
+
+    sql_files.sort()
+
+    results = []
+    for sql_file in sql_files:
+        result = index_file(sql_file)
+        if result:
+            results.append(result)
+
+    # Output JSON
+    print(json.dumps(results, indent=2))
+
+    # Summary to stderr
+    total_tables = sum(len(r["tables"]) for r in results)
+    total_functions = sum(len(r["functions"]) for r in results)
+    total_views = sum(len(r["views"]) for r in results)
+    total_types = sum(len(r["types"]) for r in results)
+    print(f"\nIndexed {len(results)} files: {total_tables} tables, {total_functions} functions, {total_views} views, {total_types} types", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
