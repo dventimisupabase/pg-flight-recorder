@@ -1,0 +1,62 @@
+# Dockerfile for GNU Global + Universal CTags with full SQL support
+#
+# Build: docker build -t gtags-builder -f tools/Dockerfile.gtags .
+# Run:   docker run --rm -v "$(pwd):/src" gtags-builder
+#
+FROM ubuntu:24.04 AS builder
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    autoconf \
+    automake \
+    pkg-config \
+    libtool \
+    libncurses-dev \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build Universal CTags from source
+WORKDIR /build/ctags
+RUN curl -fsSL https://github.com/universal-ctags/ctags/archive/refs/tags/v6.1.0.tar.gz | tar xz --strip-components=1 \
+    && ./autogen.sh \
+    && ./configure --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install
+
+# Build GNU Global from source with Universal CTags support
+WORKDIR /build/global
+RUN curl -fsSL https://ftp.gnu.org/pub/gnu/global/global-6.6.13.tar.gz | tar xz --strip-components=1 \
+    && ./configure --prefix=/usr/local --with-universal-ctags=/usr/local/bin/ctags \
+    && make -j$(nproc) \
+    && make install \
+    && mkdir -p /usr/local/etc \
+    && cp gtags.conf /usr/local/etc/gtags.conf
+
+# Runtime image
+FROM ubuntu:24.04
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libncurses6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built binaries and configuration
+COPY --from=builder /usr/local/bin/ctags /usr/local/bin/
+COPY --from=builder /usr/local/bin/global /usr/local/bin/
+COPY --from=builder /usr/local/bin/gtags /usr/local/bin/
+COPY --from=builder /usr/local/bin/htags /usr/local/bin/
+COPY --from=builder /usr/local/share/gtags /usr/local/share/gtags
+COPY --from=builder /usr/local/lib/gtags /usr/local/lib/gtags
+COPY --from=builder /usr/local/etc/gtags.conf /usr/local/etc/gtags.conf
+
+# Set up gtags configuration for universal-ctags
+ENV GTAGSLABEL=new-ctags
+
+WORKDIR /src
+
+ENTRYPOINT ["gtags", "--verbose"]

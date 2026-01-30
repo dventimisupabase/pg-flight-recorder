@@ -112,29 +112,20 @@ generate_locally() {
 
 run_in_docker() {
     echo "Generating GTAGS database in Docker..."
-    echo "Note: Docker build may have fewer SQL symbols than native install."
-    echo "      For best results, use --download or install locally."
-    echo ""
 
     if ! command -v docker &>/dev/null; then
         echo "Error: docker not found"
         exit 1
     fi
 
-    # Build a minimal image with global + universal-ctags
-    # Using Ubuntu 24.04 for newer universal-ctags with better SQL support
-    local dockerfile
-    dockerfile=$(cat <<'DOCKERFILE'
-FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    global universal-ctags \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-ENTRYPOINT ["sh", "-c", "GTAGSLABEL=new-ctags gtags --verbose"]
-DOCKERFILE
-)
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
 
-    echo "$dockerfile" | docker build -t gtags-builder -f - . > /dev/null
+    # Build image from Dockerfile if not already built
+    if ! docker image inspect gtags-builder &>/dev/null; then
+        echo "Building gtags-builder image (first run only)..."
+        docker build -t gtags-builder -f "$script_dir/Dockerfile.gtags" "$script_dir/.." || exit 1
+    fi
 
     docker run --rm -v "$(pwd):/src" gtags-builder
 
@@ -163,8 +154,8 @@ case "${1:-}" in
         echo ""
         echo "Options:"
         echo "  (none)      Generate locally (requires global + universal-ctags)"
-        echo "  --download  Download pre-built database from GitHub Actions (recommended)"
-        echo "  --docker    Generate using Docker (limited SQL symbol support)"
+        echo "  --download  Download pre-built database from GitHub Actions"
+        echo "  --docker    Generate using Docker (builds image on first run)"
         echo "  --help      Show this help"
         ;;
     "")
