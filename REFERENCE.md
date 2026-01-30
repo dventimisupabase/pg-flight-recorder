@@ -1720,6 +1720,19 @@ A "query storm" is a sudden spike in query execution frequency compared to histo
 | `SPIKE` | Execution count > threshold multiplier (default 3x) | Traffic spike, batch job, query plan regression |
 | `NORMAL` | Within normal range | No action needed |
 
+### Severity Levels
+
+Storms are classified by severity based on how far the query count exceeds the baseline:
+
+| Severity | Multiplier Range | Description |
+|----------|-----------------|-------------|
+| `LOW` | <= 5.0x | Minor spike, may be normal traffic variation |
+| `MEDIUM` | 5.0x - 10.0x | Significant spike, warrants monitoring |
+| `HIGH` | 10.0x - 50.0x | Major spike, likely requires investigation |
+| `CRITICAL` | > 50.0x or RETRY_STORM | Severe spike, immediate attention needed |
+
+Severity thresholds are configurable (see Configuration below).
+
 ### Enabling Storm Detection
 
 Storm detection is opt-in. Enable it with:
@@ -1746,6 +1759,9 @@ SELECT flight_recorder.disable_storm_detection();
 | `storm_min_duration_minutes` | `5` | Minimum storm age before auto-resolution |
 | `storm_notify_enabled` | `true` | Send pg_notify alerts |
 | `storm_notify_channel` | `flight_recorder_storms` | Notification channel name |
+| `storm_severity_low_max` | `5.0` | Maximum multiplier for LOW severity |
+| `storm_severity_medium_max` | `10.0` | Maximum multiplier for MEDIUM severity |
+| `storm_severity_high_max` | `50.0` | Maximum multiplier for HIGH severity |
 | `retention_storms_days` | `30` | How long to keep storm history |
 
 Adjust configuration:
@@ -1760,6 +1776,11 @@ WHERE key = 'storm_threshold_multiplier';
 UPDATE flight_recorder.config
 SET value = '14'
 WHERE key = 'storm_baseline_days';
+
+-- Adjust severity thresholds for more sensitive alerting
+UPDATE flight_recorder.config
+SET value = '3.0'
+WHERE key = 'storm_severity_low_max';
 ```
 
 ### Manual Detection
@@ -1776,10 +1797,10 @@ SELECT * FROM flight_recorder.detect_query_storms('30 minutes'::interval, 2.0);
 
 Output:
 
-| queryid | query_fingerprint | storm_type | recent_count | baseline_count | multiplier |
-|---------|-------------------|------------|--------------|----------------|------------|
-| 123456 | SELECT * FROM orders WHERE... | SPIKE | 15000 | 2500 | 6.00 |
-| 789012 | UPDATE inventory SET... FOR UPDATE | RETRY_STORM | 8500 | 200 | 42.50 |
+| queryid | query_fingerprint | storm_type | severity | recent_count | baseline_count | multiplier |
+|---------|-------------------|------------|----------|--------------|----------------|------------|
+| 789012 | UPDATE inventory SET... FOR UPDATE | RETRY_STORM | CRITICAL | 8500 | 200 | 42.50 |
+| 123456 | SELECT * FROM orders WHERE... | SPIKE | MEDIUM | 15000 | 2500 | 6.00 |
 
 ### Monitoring Storms
 
@@ -1789,7 +1810,7 @@ Output:
 SELECT * FROM flight_recorder.storm_dashboard;
 ```
 
-Returns: active storm counts by type, resolution rate, average resolution time, storm-prone queries, overall status, and recommendations.
+Returns: active storm counts by type and severity, resolution rate, average resolution time, storm-prone queries, overall status, and recommendations.
 
 **Status function** (detailed list):
 
@@ -1834,6 +1855,56 @@ When `auto_detect_storms()` runs (via pg_cron), it automatically resolves storms
 - Storms must be active for at least `storm_min_duration_minutes` (default: 5) before auto-resolution
 - Resolution note: "Auto-resolved: query counts returned to normal"
 
+### Correlation Data
+
+When a storm is detected, pg-flight-recorder captures correlated metrics to help identify root causes. This data is stored in the `correlation` JSONB column of `query_storms`:
+
+```sql
+SELECT severity, correlation FROM flight_recorder.storm_status() WHERE status = 'ACTIVE';
+```
+
+**Correlation structure:**
+
+```json
+{
+  "checkpoint": {
+    "active": true,
+    "ckpt_write_time_ms": 1234,
+    "ckpt_sync_time_ms": 567,
+    "ckpt_buffers": 8192
+  },
+  "locks": {
+    "blocked_count": 5,
+    "max_duration_seconds": 12.5,
+    "lock_types": ["RowExclusiveLock", "AccessShareLock"]
+  },
+  "waits": {
+    "top_events": [
+      {"event": "LWLock:buffer_content", "count": 150},
+      {"event": "IO:DataFileRead", "count": 89}
+    ],
+    "total_waiters": 239
+  },
+  "io": {
+    "temp_bytes_delta": 104857600,
+    "blks_read_delta": 5000,
+    "connections_active": 45,
+    "connections_total": 100
+  }
+}
+```
+
+**Correlation sections:**
+
+| Section | Source | Indicators |
+|---------|--------|------------|
+| `checkpoint` | `snapshots` | Active checkpoint can cause I/O contention |
+| `locks` | `lock_aggregates` | Lock contention may indicate retry storms |
+| `waits` | `wait_event_aggregates` | Wait events show resource bottlenecks |
+| `io` | `snapshots` | Temp file usage, block reads, connection pressure |
+
+Empty sections are omitted when no relevant data is found.
+
 ### Real-Time Alerts
 
 Storm detection sends pg_notify alerts when storms are detected or resolved:
@@ -1851,6 +1922,7 @@ LISTEN flight_recorder_storms;
   "storm_id": 123,
   "queryid": 456789,
   "storm_type": "SPIKE",
+  "severity": "MEDIUM",
   "timestamp": "2024-01-15T10:30:00Z",
   "recent_count": 15000,
   "baseline_count": 2500,
@@ -1864,6 +1936,7 @@ LISTEN flight_recorder_storms;
   "storm_id": 123,
   "queryid": 456789,
   "storm_type": "SPIKE",
+  "severity": "MEDIUM",
   "timestamp": "2024-01-15T11:00:00Z",
   "resolution_notes": "Auto-resolved: query counts returned to normal"
 }
@@ -1883,13 +1956,14 @@ WHERE key = 'storm_notify_enabled';
 |----------|---------|
 | `enable_storm_detection()` | Enable and schedule automatic detection |
 | `disable_storm_detection()` | Disable and unschedule detection |
-| `detect_query_storms(interval, numeric)` | Manual storm detection |
+| `detect_query_storms(interval, numeric)` | Manual storm detection (returns severity) |
 | `auto_detect_storms()` | Detect new storms, auto-resolve normalized (called by pg_cron) |
-| `storm_status(interval)` | List active and recent storms |
+| `storm_status(interval)` | List active and recent storms (includes severity and correlation) |
 | `resolve_storm(bigint, text)` | Resolve single storm by ID |
 | `resolve_storms_by_queryid(bigint, text)` | Resolve all storms for a queryid |
 | `resolve_all_storms(text)` | Bulk resolve all active storms |
 | `reopen_storm(bigint)` | Reopen a previously resolved storm |
+| `_compute_storm_correlation(interval)` | Internal: gather correlated metrics for storm context |
 
 ### Tables and Views
 

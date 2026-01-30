@@ -531,9 +531,11 @@ CREATE TABLE IF NOT EXISTS flight_recorder.query_storms (
     queryid             BIGINT NOT NULL,
     query_fingerprint   TEXT NOT NULL,
     storm_type          TEXT NOT NULL,  -- RETRY_STORM, CACHE_MISS, SPIKE, NORMAL
+    severity            TEXT NOT NULL DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
     recent_count        BIGINT NOT NULL,
     baseline_count      BIGINT NOT NULL,
     multiplier          NUMERIC,
+    correlation         JSONB,  -- Correlated metrics at detection time
     resolved_at         TIMESTAMPTZ,
     resolution_notes    TEXT
 );
@@ -543,7 +545,9 @@ CREATE INDEX IF NOT EXISTS query_storms_queryid_idx
     ON flight_recorder.query_storms(queryid);
 CREATE INDEX IF NOT EXISTS query_storms_storm_type_idx
     ON flight_recorder.query_storms(storm_type) WHERE resolved_at IS NULL;
-COMMENT ON TABLE flight_recorder.query_storms IS 'Query storm detection results. Tracks query execution spikes classified as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
+CREATE INDEX IF NOT EXISTS query_storms_severity_idx
+    ON flight_recorder.query_storms(severity) WHERE resolved_at IS NULL;
+COMMENT ON TABLE flight_recorder.query_storms IS 'Query storm detection results. Tracks query execution spikes classified as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
 
 
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
@@ -576,7 +580,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.10'),
+    ('schema_version', '2.11'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -663,6 +667,9 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('storm_min_duration_minutes', '5'),
     ('storm_notify_enabled', 'true'),
     ('storm_notify_channel', 'flight_recorder_storms'),
+    ('storm_severity_low_max', '5.0'),
+    ('storm_severity_medium_max', '10.0'),
+    ('storm_severity_high_max', '50.0'),
     ('retention_storms_days', '30')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
@@ -5946,7 +5953,7 @@ INSERT INTO flight_recorder.canaries (name, description, query_text) VALUES
 ON CONFLICT (name) DO NOTHING;
 
 -- Detects query storms by comparing recent query execution counts to baseline
--- Returns queries with execution spikes classified by type
+-- Returns queries with execution spikes classified by type and severity
 CREATE OR REPLACE FUNCTION flight_recorder.detect_query_storms(
     p_lookback INTERVAL DEFAULT NULL,
     p_threshold_multiplier NUMERIC DEFAULT NULL
@@ -5955,6 +5962,7 @@ RETURNS TABLE(
     queryid BIGINT,
     query_fingerprint TEXT,
     storm_type TEXT,
+    severity TEXT,
     recent_count BIGINT,
     baseline_count BIGINT,
     multiplier NUMERIC
@@ -5964,6 +5972,9 @@ DECLARE
     v_lookback INTERVAL;
     v_threshold NUMERIC;
     v_baseline_days INTEGER;
+    v_low_max NUMERIC;
+    v_medium_max NUMERIC;
+    v_high_max NUMERIC;
 BEGIN
     -- Get configuration with defaults
     v_lookback := COALESCE(
@@ -5978,6 +5989,11 @@ BEGIN
         flight_recorder._get_config('storm_baseline_days', '7')::integer,
         7
     );
+
+    -- Get severity thresholds
+    v_low_max := flight_recorder._get_config('storm_severity_low_max', '5.0')::numeric;
+    v_medium_max := flight_recorder._get_config('storm_severity_medium_max', '10.0')::numeric;
+    v_high_max := flight_recorder._get_config('storm_severity_high_max', '50.0')::numeric;
 
     RETURN QUERY
     WITH recent_stats AS (
@@ -6003,40 +6019,59 @@ BEGIN
           AND s.captured_at < now() - v_lookback
         GROUP BY ss.queryid
         HAVING COUNT(DISTINCT date_trunc('day', s.captured_at)) >= 2  -- Need at least 2 days of baseline
+    ),
+    storms AS (
+        SELECT
+            r.queryid,
+            r.query_preview AS query_fingerprint,
+            CASE
+                WHEN r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%'
+                    THEN 'RETRY_STORM'
+                WHEN r.total_calls > COALESCE(b.avg_calls, 0) * 10
+                    THEN 'CACHE_MISS'
+                WHEN r.total_calls > COALESCE(b.avg_calls, 1) * v_threshold
+                    THEN 'SPIKE'
+                ELSE 'NORMAL'
+            END AS storm_type,
+            r.total_calls::BIGINT AS recent_count,
+            COALESCE(b.avg_calls, 0)::BIGINT AS baseline_count,
+            CASE
+                WHEN COALESCE(b.avg_calls, 0) > 0
+                THEN ROUND(r.total_calls::numeric / b.avg_calls, 2)
+                ELSE NULL
+            END AS multiplier
+        FROM recent_stats r
+        LEFT JOIN baseline_stats b ON b.queryid = r.queryid
+        WHERE r.total_calls > COALESCE(b.avg_calls, 1) * v_threshold
+           OR (r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%')
     )
     SELECT
-        r.queryid,
-        r.query_preview AS query_fingerprint,
+        st.queryid,
+        st.query_fingerprint,
+        st.storm_type,
         CASE
-            WHEN r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%'
-                THEN 'RETRY_STORM'
-            WHEN r.total_calls > COALESCE(b.avg_calls, 0) * 10
-                THEN 'CACHE_MISS'
-            WHEN r.total_calls > COALESCE(b.avg_calls, 1) * v_threshold
-                THEN 'SPIKE'
-            ELSE 'NORMAL'
-        END AS storm_type,
-        r.total_calls::BIGINT AS recent_count,
-        COALESCE(b.avg_calls, 0)::BIGINT AS baseline_count,
-        CASE
-            WHEN COALESCE(b.avg_calls, 0) > 0
-            THEN ROUND(r.total_calls::numeric / b.avg_calls, 2)
-            ELSE NULL
-        END AS multiplier
-    FROM recent_stats r
-    LEFT JOIN baseline_stats b ON b.queryid = r.queryid
-    WHERE r.total_calls > COALESCE(b.avg_calls, 1) * v_threshold
-       OR (r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%')
+            WHEN st.storm_type = 'RETRY_STORM' THEN 'CRITICAL'
+            WHEN st.multiplier > v_high_max THEN 'CRITICAL'
+            WHEN st.multiplier > v_medium_max THEN 'HIGH'
+            WHEN st.multiplier > v_low_max THEN 'MEDIUM'
+            ELSE 'LOW'
+        END AS severity,
+        st.recent_count,
+        st.baseline_count,
+        st.multiplier
+    FROM storms st
     ORDER BY
         CASE
-            WHEN r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%' THEN 1
-            WHEN r.total_calls > COALESCE(b.avg_calls, 0) * 10 THEN 2
-            ELSE 3
+            WHEN st.storm_type = 'RETRY_STORM' THEN 1
+            WHEN st.multiplier > v_high_max THEN 2
+            WHEN st.multiplier > v_medium_max THEN 3
+            WHEN st.multiplier > v_low_max THEN 4
+            ELSE 5
         END,
-        r.total_calls DESC;
+        st.recent_count DESC;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
+COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL with severity levels (LOW, MEDIUM, HIGH, CRITICAL).';
 
 -- Sends a pg_notify alert for storm events
 -- Called internally when storms are detected or resolved
@@ -6045,6 +6080,7 @@ CREATE OR REPLACE FUNCTION flight_recorder._notify_storm(
     p_storm_id BIGINT,
     p_queryid BIGINT,
     p_storm_type TEXT,
+    p_severity TEXT DEFAULT NULL,
     p_recent_count BIGINT DEFAULT NULL,
     p_baseline_count BIGINT DEFAULT NULL,
     p_multiplier NUMERIC DEFAULT NULL,
@@ -6079,6 +6115,7 @@ BEGIN
         'storm_id', p_storm_id,
         'queryid', p_queryid,
         'storm_type', p_storm_type,
+        'severity', p_severity,
         'timestamp', now()
     );
 
@@ -6099,7 +6136,144 @@ BEGIN
     PERFORM pg_notify(v_channel, v_payload::text);
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder._notify_storm(TEXT, BIGINT, BIGINT, TEXT, BIGINT, BIGINT, NUMERIC, TEXT) IS 'Internal: Send pg_notify alert for storm events. Configure via storm_notify_enabled and storm_notify_channel settings.';
+COMMENT ON FUNCTION flight_recorder._notify_storm(TEXT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BIGINT, NUMERIC, TEXT) IS 'Internal: Send pg_notify alert for storm events. Configure via storm_notify_enabled and storm_notify_channel settings.';
+
+-- Compute correlation data for storm detection
+-- Gathers metrics from snapshots, lock_aggregates, and wait_event_aggregates
+-- to provide context about what else was happening when a storm was detected
+CREATE OR REPLACE FUNCTION flight_recorder._compute_storm_correlation(
+    p_lookback INTERVAL DEFAULT '5 minutes'
+)
+RETURNS JSONB
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_result JSONB := '{}';
+    v_checkpoint JSONB;
+    v_locks JSONB;
+    v_waits JSONB;
+    v_io JSONB;
+    v_cutoff TIMESTAMPTZ := now() - p_lookback;
+BEGIN
+    -- Checkpoint correlation from most recent snapshot
+    SELECT jsonb_build_object(
+        'active', CASE
+            WHEN s.checkpoint_time > v_cutoff THEN true
+            ELSE false
+        END,
+        'ckpt_write_time_ms', COALESCE(s.ckpt_write_time, 0),
+        'ckpt_sync_time_ms', COALESCE(s.ckpt_sync_time, 0),
+        'ckpt_buffers', COALESCE(s.ckpt_buffers, 0)
+    )
+    INTO v_checkpoint
+    FROM flight_recorder.snapshots s
+    WHERE s.captured_at >= v_cutoff
+    ORDER BY s.captured_at DESC
+    LIMIT 1;
+
+    IF v_checkpoint IS NOT NULL THEN
+        v_result := v_result || jsonb_build_object('checkpoint', v_checkpoint);
+    END IF;
+
+    -- Lock contention correlation
+    SELECT jsonb_build_object(
+        'blocked_count', COALESCE(SUM(la.occurrence_count), 0),
+        'max_duration_seconds', COALESCE(
+            EXTRACT(EPOCH FROM MAX(la.max_duration)),
+            0
+        ),
+        'lock_types', COALESCE(
+            jsonb_agg(DISTINCT la.lock_type) FILTER (WHERE la.lock_type IS NOT NULL),
+            '[]'::jsonb
+        )
+    )
+    INTO v_locks
+    FROM flight_recorder.lock_aggregates la
+    WHERE la.start_time >= v_cutoff
+       OR la.end_time >= v_cutoff;
+
+    IF v_locks IS NOT NULL AND (v_locks->>'blocked_count')::int > 0 THEN
+        v_result := v_result || jsonb_build_object('locks', v_locks);
+    END IF;
+
+    -- Wait event correlation
+    SELECT jsonb_build_object(
+        'top_events', COALESCE(
+            (SELECT jsonb_agg(t)
+             FROM (
+                 SELECT jsonb_build_object(
+                     'event', wa.wait_event_type || ':' || wa.wait_event,
+                     'count', wa.total_waiters
+                 ) AS t
+                 FROM flight_recorder.wait_event_aggregates wa
+                 WHERE (wa.start_time >= v_cutoff OR wa.end_time >= v_cutoff)
+                   AND wa.wait_event IS NOT NULL
+                 ORDER BY wa.total_waiters DESC
+                 LIMIT 5
+             ) sub),
+            '[]'::jsonb
+        ),
+        'total_waiters', COALESCE(
+            (SELECT SUM(wa.total_waiters)
+             FROM flight_recorder.wait_event_aggregates wa
+             WHERE wa.start_time >= v_cutoff OR wa.end_time >= v_cutoff),
+            0
+        )
+    )
+    INTO v_waits;
+
+    IF v_waits IS NOT NULL AND (v_waits->>'total_waiters')::bigint > 0 THEN
+        v_result := v_result || jsonb_build_object('waits', v_waits);
+    END IF;
+
+    -- IO correlation from snapshots (compute delta if we have 2+ snapshots)
+    SELECT jsonb_build_object(
+        'temp_bytes_delta', COALESCE(
+            (SELECT MAX(s.temp_bytes) - MIN(s.temp_bytes)
+             FROM flight_recorder.snapshots s
+             WHERE s.captured_at >= v_cutoff),
+            0
+        ),
+        'blks_read_delta', COALESCE(
+            (SELECT MAX(s.blks_read) - MIN(s.blks_read)
+             FROM flight_recorder.snapshots s
+             WHERE s.captured_at >= v_cutoff),
+            0
+        ),
+        'connections_active', COALESCE(
+            (SELECT s.connections_active
+             FROM flight_recorder.snapshots s
+             WHERE s.captured_at >= v_cutoff
+             ORDER BY s.captured_at DESC
+             LIMIT 1),
+            0
+        ),
+        'connections_total', COALESCE(
+            (SELECT s.connections_total
+             FROM flight_recorder.snapshots s
+             WHERE s.captured_at >= v_cutoff
+             ORDER BY s.captured_at DESC
+             LIMIT 1),
+            0
+        )
+    )
+    INTO v_io;
+
+    IF v_io IS NOT NULL AND (
+        (v_io->>'temp_bytes_delta')::bigint > 0 OR
+        (v_io->>'blks_read_delta')::bigint > 0
+    ) THEN
+        v_result := v_result || jsonb_build_object('io', v_io);
+    END IF;
+
+    -- Return NULL if no correlation data found
+    IF v_result = '{}'::jsonb THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN v_result;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._compute_storm_correlation(INTERVAL) IS 'Internal: Compute correlation data (checkpoint, locks, waits, IO) for storm detection context.';
 
 -- Auto-detect storms and log new ones to query_storms table
 -- Also auto-resolves storms when query counts return to normal (with anti-flapping protection)
@@ -6116,6 +6290,7 @@ DECLARE
     v_new_count INTEGER := 0;
     v_resolved_count INTEGER := 0;
     v_skipped_count INTEGER := 0;
+    v_correlation JSONB;
 BEGIN
     -- Check if storm detection is enabled
     v_enabled := COALESCE(
@@ -6140,9 +6315,9 @@ BEGIN
 
     -- Auto-resolve active storms that are no longer spiking (with minimum duration check)
     FOR v_active_storm IN
-        SELECT id, queryid, storm_type, detected_at
-        FROM flight_recorder.query_storms
-        WHERE resolved_at IS NULL
+        SELECT qs.id, qs.queryid, qs.storm_type, qs.severity, qs.detected_at
+        FROM flight_recorder.query_storms qs
+        WHERE qs.resolved_at IS NULL
     LOOP
         -- If this queryid is not in current storms, consider auto-resolving
         IF v_current_storms IS NULL OR NOT (v_active_storm.queryid = ANY(v_current_storms)) THEN
@@ -6161,6 +6336,7 @@ BEGIN
                     v_active_storm.id,
                     v_active_storm.queryid,
                     v_active_storm.storm_type,
+                    v_active_storm.severity,
                     p_resolution_notes := 'Auto-resolved: query counts returned to normal'
                 );
 
@@ -6172,6 +6348,9 @@ BEGIN
         END IF;
     END LOOP;
 
+    -- Compute correlation data once for all new storms
+    v_correlation := flight_recorder._compute_storm_correlation();
+
     -- Detect and insert new storms (avoid duplicates for same queryid in last hour)
     FOR v_storm IN SELECT * FROM flight_recorder.detect_query_storms() WHERE storm_type != 'NORMAL' LOOP
         -- Only insert if no unresolved storm exists for this queryid
@@ -6182,10 +6361,11 @@ BEGIN
               AND detected_at > now() - interval '1 hour'
         ) THEN
             INSERT INTO flight_recorder.query_storms (
-                queryid, query_fingerprint, storm_type, recent_count, baseline_count, multiplier
+                queryid, query_fingerprint, storm_type, severity,
+                recent_count, baseline_count, multiplier, correlation
             ) VALUES (
-                v_storm.queryid, v_storm.query_fingerprint, v_storm.storm_type,
-                v_storm.recent_count, v_storm.baseline_count, v_storm.multiplier
+                v_storm.queryid, v_storm.query_fingerprint, v_storm.storm_type, v_storm.severity,
+                v_storm.recent_count, v_storm.baseline_count, v_storm.multiplier, v_correlation
             )
             RETURNING id INTO v_active_storm;
 
@@ -6197,13 +6377,14 @@ BEGIN
                 v_active_storm.id,
                 v_storm.queryid,
                 v_storm.storm_type,
+                v_storm.severity,
                 v_storm.recent_count,
                 v_storm.baseline_count,
                 v_storm.multiplier
             );
 
-            RAISE NOTICE 'pg-flight-recorder: Storm detected - % for queryid % (% vs baseline %)',
-                v_storm.storm_type, v_storm.queryid, v_storm.recent_count, v_storm.baseline_count;
+            RAISE NOTICE 'pg-flight-recorder: Storm detected - % (%) for queryid % (% vs baseline %)',
+                v_storm.storm_type, v_storm.severity, v_storm.queryid, v_storm.recent_count, v_storm.baseline_count;
         END IF;
     END LOOP;
 
@@ -6236,9 +6417,11 @@ RETURNS TABLE(
     queryid BIGINT,
     query_fingerprint TEXT,
     storm_type TEXT,
+    severity TEXT,
     recent_count BIGINT,
     baseline_count BIGINT,
     multiplier NUMERIC,
+    correlation JSONB,
     status TEXT,
     duration INTERVAL
 )
@@ -6251,9 +6434,11 @@ BEGIN
         qs.queryid,
         qs.query_fingerprint,
         qs.storm_type,
+        qs.severity,
         qs.recent_count,
         qs.baseline_count,
         qs.multiplier,
+        qs.correlation,
         CASE
             WHEN qs.resolved_at IS NULL THEN 'ACTIVE'
             ELSE 'RESOLVED'
@@ -6264,10 +6449,17 @@ BEGIN
        OR qs.resolved_at IS NULL
     ORDER BY
         CASE WHEN qs.resolved_at IS NULL THEN 0 ELSE 1 END,
+        CASE qs.severity
+            WHEN 'CRITICAL' THEN 1
+            WHEN 'HIGH' THEN 2
+            WHEN 'MEDIUM' THEN 3
+            WHEN 'LOW' THEN 4
+            ELSE 5
+        END,
         qs.detected_at DESC;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.storm_status(INTERVAL) IS 'Show current storm status including active and recently resolved storms.';
+COMMENT ON FUNCTION flight_recorder.storm_status(INTERVAL) IS 'Show current storm status including active and recently resolved storms with severity and correlation data.';
 
 -- Enables storm detection and schedules periodic detection via pg_cron
 CREATE OR REPLACE FUNCTION flight_recorder.enable_storm_detection()
@@ -8693,7 +8885,11 @@ active_storms AS (
         count(*) AS active_count,
         count(*) FILTER (WHERE storm_type = 'RETRY_STORM') AS retry_storms,
         count(*) FILTER (WHERE storm_type = 'CACHE_MISS') AS cache_miss_storms,
-        count(*) FILTER (WHERE storm_type = 'SPIKE') AS spike_storms
+        count(*) FILTER (WHERE storm_type = 'SPIKE') AS spike_storms,
+        count(*) FILTER (WHERE severity = 'LOW') AS low_severity,
+        count(*) FILTER (WHERE severity = 'MEDIUM') AS medium_severity,
+        count(*) FILTER (WHERE severity = 'HIGH') AS high_severity,
+        count(*) FILTER (WHERE severity = 'CRITICAL') AS critical_severity
     FROM flight_recorder.query_storms
     WHERE resolved_at IS NULL
 ),
@@ -8748,6 +8944,10 @@ SELECT
     a.retry_storms AS active_retry_storms,
     a.cache_miss_storms AS active_cache_miss_storms,
     a.spike_storms AS active_spike_storms,
+    a.low_severity AS active_low_severity,
+    a.medium_severity AS active_medium_severity,
+    a.high_severity AS active_high_severity,
+    a.critical_severity AS active_critical_severity,
     r.total_24h AS storms_last_24h,
     r.resolved_24h AS resolved_last_24h,
     CASE
@@ -8764,17 +8964,22 @@ SELECT
     CASE
         WHEN NOT cfg.detection_enabled THEN 'disabled'
         WHEN a.active_count = 0 THEN 'healthy'
-        WHEN a.active_count >= 5 OR a.retry_storms > 0 THEN 'critical'
-        WHEN a.active_count >= 2 THEN 'warning'
-        ELSE 'attention'
+        WHEN a.critical_severity > 0 OR a.retry_storms > 0 THEN 'critical'
+        WHEN a.high_severity > 0 OR a.active_count >= 5 THEN 'warning'
+        WHEN a.medium_severity > 0 OR a.active_count >= 2 THEN 'attention'
+        ELSE 'healthy'
     END AS overall_status,
     CASE
         WHEN NOT cfg.detection_enabled THEN
             'Storm detection is disabled. Use enable_storm_detection() to enable.'
         WHEN a.active_count = 0 THEN
             'No active storms. System operating normally.'
+        WHEN a.critical_severity > 0 THEN
+            format('CRITICAL: %s critical severity storm(s). Immediate investigation required.', a.critical_severity)
         WHEN a.retry_storms > 0 THEN
             format('CRITICAL: %s active retry storm(s) detected. Check for transaction conflicts or lock contention.', a.retry_storms)
+        WHEN a.high_severity > 0 THEN
+            format('WARNING: %s high severity storm(s). Review with storm_status() for details.', a.high_severity)
         WHEN a.cache_miss_storms > 0 THEN
             format('WARNING: %s cache miss storm(s) detected. Check for cold cache or missing indexes.', a.cache_miss_storms)
         ELSE
@@ -8787,7 +8992,7 @@ CROSS JOIN resolution_stats rs
 CROSS JOIN storm_prone_queries sq
 CROSS JOIN oldest_active o;
 COMMENT ON VIEW flight_recorder.storm_dashboard IS
-'At-a-glance query storm monitoring dashboard. Shows active storms by type, resolution metrics, storm-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
+'At-a-glance query storm monitoring dashboard. Shows active storms by type and severity, resolution metrics, storm-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
 
 
 -- =============================================================================
