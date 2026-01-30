@@ -23,8 +23,8 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 
 1. [Performance Forecasting / Predictive Alerts](#1-performance-forecasting--predictive-alerts) ✅ **DONE**
 2. [Query Fingerprinting & Storm Detection](#2-query-fingerprinting--storm-detection) ✅ **DONE**
-3. [Time-Travel Debugging](#3-time-travel-debugging-with-second-level-precision)
-4. [Blast Radius Analysis](#4-blast-radius-analysis)
+3. [Time-Travel Debugging](#3-time-travel-debugging-with-second-level-precision) ✅ **DONE**
+4. [Blast Radius Analysis](#4-blast-radius-analysis) ✅ **DONE**
 5. [Continuous Benchmarking / Canary Queries](#5-continuous-benchmarking--canary-queries) ✅ **DONE**
 6. [Fleet-Wide Analysis](#6-fleet-wide-analysis--is-this-normal)
 7. [Automatic Regression Detection](#7-automatic-performance-regression-detection) ✅ **DONE**
@@ -712,9 +712,11 @@ When exact timing is impossible, provide ranges:
 
 ---
 
-## 4. Blast Radius Analysis
+## 4. Blast Radius Analysis ✅ IMPLEMENTED
 
 **Complexity**: 🔴 High (3-5 days)
+
+> **Status**: ✅ **Fully implemented** in v2.16. Includes `blast_radius()` for structured impact assessment (lock impact, query degradation, connection spike, affected applications, wait events, throughput changes), severity classification (low/medium/high/critical), and `blast_radius_report()` for ASCII-formatted postmortem reports. See `REFERENCE.md` for usage.
 
 ### The Problem
 
@@ -2081,7 +2083,7 @@ Based on **value vs. complexity**:
 | 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.12) |
 | 3 | **Performance Forecasting** | 🟠 High | 🔴 High | ✅ **DONE** (v2.14) |
 | 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | ✅ **DONE** (v2.15) |
-| 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | ⬚ Not started |
+| 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | ✅ **DONE** (v2.16) |
 | 6 | **Canary Queries** | 🟡 Medium | 🟡 Medium | ✅ **DONE** (v2.9) |
 | 7 | **Fleet-Wide Analysis** | 🟡 Medium | 🟣 Very High | ⬚ Not started - Requires infrastructure |
 | 8 | **Visual Timeline** | 🟢 Low | 🟢 Low | ✅ **DONE** (v2.13) - Sparklines, bars, timeline charts |
@@ -2095,12 +2097,12 @@ Based on **value vs. complexity**:
 3. ~~**Visual Timeline**: ASCII charts for metrics~~ ✅ Done (v2.13)
 4. ~~**Performance Forecasting**: Proactive capacity warnings~~ ✅ Done (v2.14)
 5. ~~**Time-Travel Debugging**: Forensic analysis at any timestamp~~ ✅ Done (v2.15)
-6. **Validate with Real Data**: Test on production databases
-7. **Blast Radius Analysis**: Next priority
+6. ~~**Blast Radius Analysis**: Incident impact assessment~~ ✅ Done (v2.16)
+7. **Validate with Real Data**: Test on production databases
 8. **Iterate**: Refine based on real-world usage
 
 ---
 
 **Last Updated**: 2026-01-30
-**Status**: 7 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline, Performance Forecasting, Time-Travel Debugging)
+**Status**: 8 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline, Performance Forecasting, Time-Travel Debugging, Blast Radius Analysis)
 **Maintainer**: Flight Recorder Team

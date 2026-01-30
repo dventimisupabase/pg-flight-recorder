@@ -1189,7 +1189,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.15'),
+    ('schema_version', '2.16'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -12100,6 +12100,716 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.incident_timeline IS
 'Reconstructs a unified timeline for incident analysis by merging events from multiple sources: checkpoints, WAL archiving, query/transaction starts, connection opens, lock contention, wait spikes, and snapshots. Returns chronologically ordered events with type, description, and JSON details. Use for incident review: SELECT * FROM flight_recorder.incident_timeline(now() - interval ''2 hours'', now() - interval ''1 hour'');';
+
+
+-- Blast Radius Analysis
+-- Comprehensive impact assessment of database incidents
+-- Answers: "What was the collateral damage from this incident?"
+-- Input: Start and end timestamps for the incident window
+-- Output: Structured impact assessment including locks, queries, connections, applications
+CREATE OR REPLACE FUNCTION flight_recorder.blast_radius(
+    p_start_time TIMESTAMPTZ,
+    p_end_time TIMESTAMPTZ
+)
+RETURNS TABLE(
+    -- Time window
+    incident_start TIMESTAMPTZ,
+    incident_end TIMESTAMPTZ,
+    duration_seconds NUMERIC,
+
+    -- Lock impact
+    blocked_sessions_total INTEGER,
+    blocked_sessions_max_concurrent INTEGER,
+    max_block_duration INTERVAL,
+    avg_block_duration INTERVAL,
+    lock_types JSONB,
+
+    -- Query degradation
+    degraded_queries_count INTEGER,
+    degraded_queries JSONB,
+
+    -- Connection impact
+    connections_before INTEGER,
+    connections_during_avg INTEGER,
+    connections_during_max INTEGER,
+    connection_increase_pct NUMERIC,
+
+    -- Application impact
+    affected_applications JSONB,
+
+    -- Wait event impact
+    top_wait_events JSONB,
+
+    -- Transaction throughput
+    tps_before NUMERIC,
+    tps_during NUMERIC,
+    tps_change_pct NUMERIC,
+
+    -- Summary
+    severity TEXT,
+    impact_summary TEXT[],
+    recommendations TEXT[]
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_duration INTERVAL;
+    v_baseline_start TIMESTAMPTZ;
+    v_baseline_end TIMESTAMPTZ;
+
+    -- Lock impact variables
+    v_blocked_total INTEGER := 0;
+    v_blocked_max_concurrent INTEGER := 0;
+    v_max_block_duration INTERVAL;
+    v_avg_block_duration INTERVAL;
+    v_lock_types JSONB := '[]'::jsonb;
+
+    -- Query degradation variables
+    v_degraded_count INTEGER := 0;
+    v_degraded_queries JSONB := '[]'::jsonb;
+
+    -- Connection variables
+    v_conn_before INTEGER := 0;
+    v_conn_during_avg INTEGER := 0;
+    v_conn_during_max INTEGER := 0;
+    v_conn_increase_pct NUMERIC := 0;
+
+    -- Application impact
+    v_affected_apps JSONB := '[]'::jsonb;
+
+    -- Wait events
+    v_top_waits JSONB := '[]'::jsonb;
+
+    -- Throughput variables
+    v_tps_before NUMERIC := 0;
+    v_tps_during NUMERIC := 0;
+    v_tps_change_pct NUMERIC := 0;
+
+    -- Severity calculation
+    v_severity TEXT := 'low';
+    v_impact_summary TEXT[] := ARRAY[]::TEXT[];
+    v_recommendations TEXT[] := ARRAY[]::TEXT[];
+
+    -- Severity scores
+    v_lock_severity INTEGER := 0;
+    v_duration_severity INTEGER := 0;
+    v_conn_severity INTEGER := 0;
+    v_tps_severity INTEGER := 0;
+    v_query_severity INTEGER := 0;
+BEGIN
+    -- Calculate duration and baseline period
+    v_duration := p_end_time - p_start_time;
+    v_baseline_start := p_start_time - v_duration;
+    v_baseline_end := p_start_time;
+
+    -- =========================================================================
+    -- Lock Impact Analysis
+    -- =========================================================================
+
+    -- Total blocked sessions and durations from ring buffer
+    SELECT
+        COUNT(DISTINCT l.blocked_pid),
+        MAX(l.blocked_duration),
+        AVG(l.blocked_duration)
+    INTO v_blocked_total, v_max_block_duration, v_avg_block_duration
+    FROM flight_recorder.lock_samples_ring l
+    JOIN flight_recorder.samples_ring sr ON sr.slot_id = l.slot_id
+    WHERE sr.captured_at BETWEEN p_start_time AND p_end_time
+      AND l.blocked_pid IS NOT NULL;
+
+    -- Also check archive for longer incidents
+    IF v_blocked_total = 0 OR v_blocked_total IS NULL THEN
+        SELECT
+            COUNT(DISTINCT blocked_pid),
+            MAX(blocked_duration),
+            AVG(blocked_duration)
+        INTO v_blocked_total, v_max_block_duration, v_avg_block_duration
+        FROM flight_recorder.lock_samples_archive
+        WHERE captured_at BETWEEN p_start_time AND p_end_time
+          AND blocked_pid IS NOT NULL;
+    END IF;
+
+    v_blocked_total := COALESCE(v_blocked_total, 0);
+
+    -- Max concurrent blocked sessions (per sample)
+    SELECT COALESCE(MAX(blocked_count), 0)
+    INTO v_blocked_max_concurrent
+    FROM (
+        SELECT COUNT(DISTINCT l.blocked_pid) AS blocked_count
+        FROM flight_recorder.lock_samples_ring l
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = l.slot_id
+        WHERE sr.captured_at BETWEEN p_start_time AND p_end_time
+          AND l.blocked_pid IS NOT NULL
+        GROUP BY sr.slot_id
+    ) per_sample;
+
+    -- Lock types breakdown
+    SELECT COALESCE(jsonb_agg(jsonb_build_object('type', lock_type, 'count', cnt) ORDER BY cnt DESC), '[]'::jsonb)
+    INTO v_lock_types
+    FROM (
+        SELECT l.lock_type, COUNT(*) AS cnt
+        FROM flight_recorder.lock_samples_ring l
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = l.slot_id
+        WHERE sr.captured_at BETWEEN p_start_time AND p_end_time
+          AND l.blocked_pid IS NOT NULL
+          AND l.lock_type IS NOT NULL
+        GROUP BY l.lock_type
+        ORDER BY cnt DESC
+        LIMIT 10
+    ) lt;
+
+    -- =========================================================================
+    -- Query Degradation Analysis
+    -- =========================================================================
+
+    WITH baseline AS (
+        SELECT
+            ss.queryid,
+            left(ss.query_preview, 80) AS query_preview,
+            AVG(ss.mean_exec_time) AS baseline_ms
+        FROM flight_recorder.statement_snapshots ss
+        JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+        WHERE s.captured_at BETWEEN v_baseline_start AND v_baseline_end
+          AND ss.mean_exec_time IS NOT NULL
+          AND ss.mean_exec_time > 0
+        GROUP BY ss.queryid, left(ss.query_preview, 80)
+        HAVING COUNT(*) >= 1
+    ),
+    during AS (
+        SELECT
+            ss.queryid,
+            AVG(ss.mean_exec_time) AS during_ms
+        FROM flight_recorder.statement_snapshots ss
+        JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+        WHERE s.captured_at BETWEEN p_start_time AND p_end_time
+          AND ss.mean_exec_time IS NOT NULL
+          AND ss.mean_exec_time > 0
+        GROUP BY ss.queryid
+        HAVING COUNT(*) >= 1
+    ),
+    degraded AS (
+        SELECT
+            b.queryid,
+            b.query_preview,
+            round(b.baseline_ms::numeric, 2) AS baseline_ms,
+            round(d.during_ms::numeric, 2) AS during_ms,
+            round((100.0 * (d.during_ms - b.baseline_ms) / NULLIF(b.baseline_ms, 0))::numeric, 1) AS slowdown_pct
+        FROM baseline b
+        JOIN during d ON d.queryid = b.queryid
+        WHERE d.during_ms > b.baseline_ms * 1.5  -- 50%+ slower
+        ORDER BY (d.during_ms - b.baseline_ms) DESC
+        LIMIT 10
+    )
+    SELECT
+        COUNT(*)::integer,
+        COALESCE(jsonb_agg(jsonb_build_object(
+            'queryid', queryid,
+            'query_preview', query_preview,
+            'baseline_ms', baseline_ms,
+            'during_ms', during_ms,
+            'slowdown_pct', slowdown_pct
+        )), '[]'::jsonb)
+    INTO v_degraded_count, v_degraded_queries
+    FROM degraded;
+
+    v_degraded_count := COALESCE(v_degraded_count, 0);
+
+    -- =========================================================================
+    -- Connection Impact Analysis
+    -- =========================================================================
+
+    -- Baseline connections (average before incident)
+    SELECT COALESCE(AVG(connections_total), 0)::integer
+    INTO v_conn_before
+    FROM flight_recorder.snapshots
+    WHERE captured_at BETWEEN v_baseline_start AND v_baseline_end;
+
+    -- During incident connections
+    SELECT
+        COALESCE(AVG(connections_total), 0)::integer,
+        COALESCE(MAX(connections_total), 0)::integer
+    INTO v_conn_during_avg, v_conn_during_max
+    FROM flight_recorder.snapshots
+    WHERE captured_at BETWEEN p_start_time AND p_end_time;
+
+    -- Connection increase percentage
+    IF v_conn_before > 0 THEN
+        v_conn_increase_pct := round(100.0 * (v_conn_during_avg - v_conn_before) / v_conn_before, 1);
+    END IF;
+
+    -- =========================================================================
+    -- Application Impact Analysis
+    -- =========================================================================
+
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'app_name', app,
+        'blocked_count', blocked_count,
+        'max_wait', max_wait
+    ) ORDER BY blocked_count DESC), '[]'::jsonb)
+    INTO v_affected_apps
+    FROM (
+        SELECT
+            COALESCE(l.blocked_app, 'unknown') AS app,
+            COUNT(DISTINCT l.blocked_pid) AS blocked_count,
+            MAX(l.blocked_duration) AS max_wait
+        FROM flight_recorder.lock_samples_ring l
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = l.slot_id
+        WHERE sr.captured_at BETWEEN p_start_time AND p_end_time
+          AND l.blocked_pid IS NOT NULL
+        GROUP BY COALESCE(l.blocked_app, 'unknown')
+        ORDER BY blocked_count DESC
+        LIMIT 10
+    ) apps;
+
+    -- =========================================================================
+    -- Wait Event Analysis
+    -- =========================================================================
+
+    WITH baseline_waits AS (
+        SELECT
+            w.wait_event_type,
+            w.wait_event,
+            SUM(w.count) AS total_count
+        FROM flight_recorder.wait_samples_ring w
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = w.slot_id
+        WHERE sr.captured_at BETWEEN v_baseline_start AND v_baseline_end
+          AND w.wait_event IS NOT NULL
+        GROUP BY w.wait_event_type, w.wait_event
+    ),
+    during_waits AS (
+        SELECT
+            w.wait_event_type,
+            w.wait_event,
+            SUM(w.count) AS total_count
+        FROM flight_recorder.wait_samples_ring w
+        JOIN flight_recorder.samples_ring sr ON sr.slot_id = w.slot_id
+        WHERE sr.captured_at BETWEEN p_start_time AND p_end_time
+          AND w.wait_event IS NOT NULL
+        GROUP BY w.wait_event_type, w.wait_event
+    )
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'wait_type', d.wait_event_type,
+        'wait_event', d.wait_event,
+        'total_count', d.total_count,
+        'pct_increase', CASE
+            WHEN COALESCE(b.total_count, 0) > 0
+            THEN round(100.0 * (d.total_count - COALESCE(b.total_count, 0)) / b.total_count, 1)
+            ELSE NULL
+        END
+    ) ORDER BY d.total_count DESC), '[]'::jsonb)
+    INTO v_top_waits
+    FROM during_waits d
+    LEFT JOIN baseline_waits b ON b.wait_event_type = d.wait_event_type
+                               AND b.wait_event = d.wait_event
+    WHERE d.total_count > 0
+    LIMIT 10;
+
+    -- =========================================================================
+    -- Transaction Throughput Analysis
+    -- =========================================================================
+
+    -- Calculate TPS before incident
+    WITH baseline_tps AS (
+        SELECT
+            xact_commit,
+            captured_at,
+            LAG(xact_commit) OVER (ORDER BY captured_at) AS prev_commit,
+            LAG(captured_at) OVER (ORDER BY captured_at) AS prev_time
+        FROM flight_recorder.snapshots
+        WHERE captured_at BETWEEN v_baseline_start AND v_baseline_end
+    )
+    SELECT COALESCE(AVG(
+        CASE
+            WHEN prev_commit IS NOT NULL AND prev_time IS NOT NULL
+                 AND EXTRACT(EPOCH FROM (captured_at - prev_time)) > 0
+            THEN (xact_commit - prev_commit)::numeric / EXTRACT(EPOCH FROM (captured_at - prev_time))
+            ELSE NULL
+        END
+    ), 0)
+    INTO v_tps_before
+    FROM baseline_tps;
+
+    -- Calculate TPS during incident
+    WITH during_tps AS (
+        SELECT
+            xact_commit,
+            captured_at,
+            LAG(xact_commit) OVER (ORDER BY captured_at) AS prev_commit,
+            LAG(captured_at) OVER (ORDER BY captured_at) AS prev_time
+        FROM flight_recorder.snapshots
+        WHERE captured_at BETWEEN p_start_time AND p_end_time
+    )
+    SELECT COALESCE(AVG(
+        CASE
+            WHEN prev_commit IS NOT NULL AND prev_time IS NOT NULL
+                 AND EXTRACT(EPOCH FROM (captured_at - prev_time)) > 0
+            THEN (xact_commit - prev_commit)::numeric / EXTRACT(EPOCH FROM (captured_at - prev_time))
+            ELSE NULL
+        END
+    ), 0)
+    INTO v_tps_during
+    FROM during_tps;
+
+    -- TPS change percentage
+    IF v_tps_before > 0 THEN
+        v_tps_change_pct := round(100.0 * (v_tps_during - v_tps_before) / v_tps_before, 1);
+    END IF;
+
+    -- =========================================================================
+    -- Severity Classification
+    -- =========================================================================
+
+    -- Blocked sessions severity: 1-5=low, 6-20=medium, 21-50=high, >50=critical
+    v_lock_severity := CASE
+        WHEN v_blocked_total > 50 THEN 4
+        WHEN v_blocked_total > 20 THEN 3
+        WHEN v_blocked_total > 5 THEN 2
+        WHEN v_blocked_total > 0 THEN 1
+        ELSE 0
+    END;
+
+    -- Block duration severity: <10s=low, 10-60s=medium, 1-5min=high, >5min=critical
+    v_duration_severity := CASE
+        WHEN v_max_block_duration > interval '5 minutes' THEN 4
+        WHEN v_max_block_duration > interval '1 minute' THEN 3
+        WHEN v_max_block_duration > interval '10 seconds' THEN 2
+        WHEN v_max_block_duration IS NOT NULL THEN 1
+        ELSE 0
+    END;
+
+    -- Connection increase severity: <25%=low, 25-50%=medium, 50-100%=high, >100%=critical
+    v_conn_severity := CASE
+        WHEN v_conn_increase_pct > 100 THEN 4
+        WHEN v_conn_increase_pct > 50 THEN 3
+        WHEN v_conn_increase_pct > 25 THEN 2
+        WHEN v_conn_increase_pct > 0 THEN 1
+        ELSE 0
+    END;
+
+    -- TPS decrease severity: <10%=low, 10-25%=medium, 25-50%=high, >50%=critical
+    v_tps_severity := CASE
+        WHEN v_tps_change_pct < -50 THEN 4
+        WHEN v_tps_change_pct < -25 THEN 3
+        WHEN v_tps_change_pct < -10 THEN 2
+        WHEN v_tps_change_pct < 0 THEN 1
+        ELSE 0
+    END;
+
+    -- Degraded queries severity: 1-3=low, 4-10=medium, 11-25=high, >25=critical
+    v_query_severity := CASE
+        WHEN v_degraded_count > 25 THEN 4
+        WHEN v_degraded_count > 10 THEN 3
+        WHEN v_degraded_count > 3 THEN 2
+        WHEN v_degraded_count > 0 THEN 1
+        ELSE 0
+    END;
+
+    -- Overall severity = highest individual severity
+    v_severity := CASE GREATEST(v_lock_severity, v_duration_severity, v_conn_severity, v_tps_severity, v_query_severity)
+        WHEN 4 THEN 'critical'
+        WHEN 3 THEN 'high'
+        WHEN 2 THEN 'medium'
+        WHEN 1 THEN 'low'
+        ELSE 'low'
+    END;
+
+    -- =========================================================================
+    -- Impact Summary
+    -- =========================================================================
+
+    IF v_blocked_total > 0 THEN
+        v_impact_summary := array_append(v_impact_summary,
+            format('%s sessions blocked (max %s)',
+                   v_blocked_total,
+                   COALESCE(to_char(v_max_block_duration, 'MI"m" SS"s"'), 'unknown')));
+    END IF;
+
+    IF v_tps_change_pct < -10 THEN
+        v_impact_summary := array_append(v_impact_summary,
+            format('TPS dropped %s%%', abs(v_tps_change_pct)::integer));
+    END IF;
+
+    IF v_degraded_count > 0 THEN
+        v_impact_summary := array_append(v_impact_summary,
+            format('%s queries degraded >50%%', v_degraded_count));
+    END IF;
+
+    IF v_conn_increase_pct > 25 THEN
+        v_impact_summary := array_append(v_impact_summary,
+            format('Connections increased %s%%', v_conn_increase_pct::integer));
+    END IF;
+
+    IF array_length(v_impact_summary, 1) IS NULL THEN
+        v_impact_summary := array_append(v_impact_summary, 'No significant impact detected');
+    END IF;
+
+    -- =========================================================================
+    -- Recommendations
+    -- =========================================================================
+
+    IF v_max_block_duration > interval '1 minute' THEN
+        v_recommendations := array_append(v_recommendations,
+            'Review the blocking query that held locks for extended duration');
+    END IF;
+
+    IF v_blocked_total > 10 THEN
+        v_recommendations := array_append(v_recommendations,
+            'Consider setting lock_timeout to prevent long waits');
+    END IF;
+
+    IF v_conn_increase_pct > 50 THEN
+        v_recommendations := array_append(v_recommendations,
+            format('Investigate connection pool sizing (reached %s connections)', v_conn_during_max));
+    END IF;
+
+    IF v_degraded_count > 3 THEN
+        v_recommendations := array_append(v_recommendations,
+            format('%s queries showed >50%% degradation - review execution plans', v_degraded_count));
+    END IF;
+
+    IF v_tps_change_pct < -25 THEN
+        v_recommendations := array_append(v_recommendations,
+            'Throughput dropped significantly - analyze root cause of slowdown');
+    END IF;
+
+    IF array_length(v_recommendations, 1) IS NULL THEN
+        v_recommendations := array_append(v_recommendations, 'No specific recommendations');
+    END IF;
+
+    -- =========================================================================
+    -- Return Results
+    -- =========================================================================
+
+    RETURN QUERY SELECT
+        p_start_time,
+        p_end_time,
+        round(EXTRACT(EPOCH FROM v_duration), 0),
+        v_blocked_total,
+        v_blocked_max_concurrent,
+        v_max_block_duration,
+        v_avg_block_duration,
+        v_lock_types,
+        v_degraded_count,
+        v_degraded_queries,
+        v_conn_before,
+        v_conn_during_avg,
+        v_conn_during_max,
+        v_conn_increase_pct,
+        v_affected_apps,
+        v_top_waits,
+        round(v_tps_before, 1),
+        round(v_tps_during, 1),
+        v_tps_change_pct,
+        v_severity,
+        v_impact_summary,
+        v_recommendations;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.blast_radius IS
+'Comprehensive blast radius analysis for incident impact assessment. Analyzes lock impact (blocked sessions, duration, types), query degradation (before vs during), connection spike, affected applications, wait events, and transaction throughput. Returns severity classification (low/medium/high/critical) with impact summary and recommendations. Use for incident postmortems: SELECT * FROM flight_recorder.blast_radius(''2024-01-15 10:23:00'', ''2024-01-15 10:35:00'');';
+
+
+-- Blast Radius Report
+-- Human-readable formatted report for incident postmortems
+-- Returns ASCII-art styled report suitable for sharing and documentation
+CREATE OR REPLACE FUNCTION flight_recorder.blast_radius_report(
+    p_start_time TIMESTAMPTZ,
+    p_end_time TIMESTAMPTZ
+)
+RETURNS TEXT
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_data RECORD;
+    v_result TEXT := '';
+    v_bar TEXT;
+    v_max_bar_width INTEGER := 20;
+    v_app RECORD;
+    v_query RECORD;
+    v_wait RECORD;
+    v_lock RECORD;
+    v_severity_bar TEXT;
+BEGIN
+    -- Get blast radius data
+    SELECT * INTO v_data FROM flight_recorder.blast_radius(p_start_time, p_end_time);
+
+    -- Header
+    v_result := v_result || E'══════════════════════════════════════════════════════════════════════\n';
+    v_result := v_result || E'                    BLAST RADIUS ANALYSIS REPORT\n';
+    v_result := v_result || E'══════════════════════════════════════════════════════════════════════\n';
+
+    -- Time window and severity
+    v_result := v_result || format('Time Window: %s → %s (%s)',
+        to_char(p_start_time, 'YYYY-MM-DD HH24:MI:SS'),
+        to_char(p_end_time, 'HH24:MI:SS'),
+        CASE
+            WHEN v_data.duration_seconds >= 3600 THEN format('%s hours', round(v_data.duration_seconds / 3600, 1))
+            WHEN v_data.duration_seconds >= 60 THEN format('%s minutes', round(v_data.duration_seconds / 60, 0))
+            ELSE format('%s seconds', v_data.duration_seconds::integer)
+        END
+    ) || E'\n';
+
+    -- Severity indicator with visual bar
+    v_severity_bar := CASE v_data.severity
+        WHEN 'critical' THEN '██████████'
+        WHEN 'high' THEN '███████░░░'
+        WHEN 'medium' THEN '█████░░░░░'
+        ELSE '██░░░░░░░░'
+    END;
+    v_result := v_result || format('Severity: %s %s', v_severity_bar, upper(v_data.severity)) || E'\n\n';
+
+    -- =========================================================================
+    -- Lock Impact Section
+    -- =========================================================================
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+    v_result := v_result || E'LOCK IMPACT\n';
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+
+    IF v_data.blocked_sessions_total > 0 THEN
+        v_result := v_result || format('  Total blocked sessions:     %s', v_data.blocked_sessions_total) || E'\n';
+        v_result := v_result || format('  Max concurrent blocked:     %s', v_data.blocked_sessions_max_concurrent) || E'\n';
+        v_result := v_result || format('  Longest block duration:     %s',
+            CASE
+                WHEN v_data.max_block_duration >= interval '1 hour'
+                THEN format('%sh %sm', EXTRACT(HOUR FROM v_data.max_block_duration)::integer,
+                                       EXTRACT(MINUTE FROM v_data.max_block_duration)::integer)
+                WHEN v_data.max_block_duration >= interval '1 minute'
+                THEN format('%sm %ss', EXTRACT(MINUTE FROM v_data.max_block_duration)::integer,
+                                       EXTRACT(SECOND FROM v_data.max_block_duration)::integer)
+                ELSE format('%ss', round(EXTRACT(EPOCH FROM v_data.max_block_duration), 1))
+            END
+        ) || E'\n';
+        v_result := v_result || format('  Average block duration:     %s',
+            CASE
+                WHEN v_data.avg_block_duration >= interval '1 minute'
+                THEN format('%sm %ss', EXTRACT(MINUTE FROM v_data.avg_block_duration)::integer,
+                                       EXTRACT(SECOND FROM v_data.avg_block_duration)::integer)
+                ELSE format('%ss', round(EXTRACT(EPOCH FROM v_data.avg_block_duration), 1))
+            END
+        ) || E'\n\n';
+
+        -- Lock types with bar chart
+        IF jsonb_array_length(v_data.lock_types) > 0 THEN
+            v_result := v_result || E'  Lock types:\n';
+            FOR v_lock IN SELECT * FROM jsonb_to_recordset(v_data.lock_types) AS x(type text, count integer) LOOP
+                v_bar := repeat('█', LEAST(v_lock.count, v_max_bar_width));
+                v_result := v_result || format('    %-12s %s %s', v_lock.type, rpad(v_bar, v_max_bar_width), v_lock.count) || E'\n';
+            END LOOP;
+        END IF;
+    ELSE
+        v_result := v_result || E'  No lock contention detected.\n';
+    END IF;
+    v_result := v_result || E'\n';
+
+    -- =========================================================================
+    -- Affected Applications Section
+    -- =========================================================================
+    IF jsonb_array_length(v_data.affected_applications) > 0 THEN
+        v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+        v_result := v_result || E'AFFECTED APPLICATIONS\n';
+        v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+
+        FOR v_app IN SELECT * FROM jsonb_to_recordset(v_data.affected_applications)
+                     AS x(app_name text, blocked_count integer, max_wait interval) LOOP
+            v_bar := repeat('█', LEAST(v_app.blocked_count, v_max_bar_width));
+            v_result := v_result || format('  %-16s %s %s blocked',
+                left(v_app.app_name, 16), rpad(v_bar, v_max_bar_width), v_app.blocked_count) || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- =========================================================================
+    -- Query Degradation Section
+    -- =========================================================================
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+    v_result := v_result || format('QUERY DEGRADATION (%s queries slowed >50%%)', v_data.degraded_queries_count) || E'\n';
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+
+    IF v_data.degraded_queries_count > 0 THEN
+        FOR v_query IN SELECT * FROM jsonb_to_recordset(v_data.degraded_queries)
+                       AS x(queryid bigint, query_preview text, baseline_ms numeric, during_ms numeric, slowdown_pct numeric)
+                       LIMIT 5 LOOP
+            v_result := v_result || format('  %s', left(v_query.query_preview, 50)) || E'\n';
+            v_result := v_result || format('    %sms → %sms  (+%s%%)',
+                v_query.baseline_ms, v_query.during_ms, v_query.slowdown_pct::integer) || E'\n';
+        END LOOP;
+        IF v_data.degraded_queries_count > 5 THEN
+            v_result := v_result || format('  ... and %s more', v_data.degraded_queries_count - 5) || E'\n';
+        END IF;
+    ELSE
+        v_result := v_result || E'  No significant query degradation detected.\n';
+    END IF;
+    v_result := v_result || E'\n';
+
+    -- =========================================================================
+    -- Resource Impact Section
+    -- =========================================================================
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+    v_result := v_result || E'RESOURCE IMPACT\n';
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+
+    v_result := v_result || format('  Connections:  %s → %s avg (%s max)  %s',
+        v_data.connections_before,
+        v_data.connections_during_avg,
+        v_data.connections_during_max,
+        CASE
+            WHEN v_data.connection_increase_pct > 0 THEN format('+%s%%', v_data.connection_increase_pct::integer)
+            WHEN v_data.connection_increase_pct < 0 THEN format('%s%%', v_data.connection_increase_pct::integer)
+            ELSE 'unchanged'
+        END
+    ) || E'\n';
+
+    v_result := v_result || format('  Throughput:   %s TPS → %s TPS    %s',
+        round(v_data.tps_before, 0)::integer,
+        round(v_data.tps_during, 0)::integer,
+        CASE
+            WHEN v_data.tps_change_pct > 0 THEN format('+%s%%', v_data.tps_change_pct::integer)
+            WHEN v_data.tps_change_pct < 0 THEN format('%s%%', v_data.tps_change_pct::integer)
+            ELSE 'unchanged'
+        END
+    ) || E'\n\n';
+
+    -- =========================================================================
+    -- Wait Events Section
+    -- =========================================================================
+    IF jsonb_array_length(v_data.top_wait_events) > 0 THEN
+        v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+        v_result := v_result || E'TOP WAIT EVENTS\n';
+        v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+
+        FOR v_wait IN SELECT * FROM jsonb_to_recordset(v_data.top_wait_events)
+                      AS x(wait_type text, wait_event text, total_count integer, pct_increase numeric)
+                      LIMIT 5 LOOP
+            v_result := v_result || format('  %s:%s  count=%s',
+                v_wait.wait_type, v_wait.wait_event, v_wait.total_count);
+            IF v_wait.pct_increase IS NOT NULL THEN
+                v_result := v_result || format('  (%s%s%%)',
+                    CASE WHEN v_wait.pct_increase >= 0 THEN '+' ELSE '' END,
+                    v_wait.pct_increase::integer);
+            END IF;
+            v_result := v_result || E'\n';
+        END LOOP;
+        v_result := v_result || E'\n';
+    END IF;
+
+    -- =========================================================================
+    -- Recommendations Section
+    -- =========================================================================
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+    v_result := v_result || E'RECOMMENDATIONS\n';
+    v_result := v_result || E'──────────────────────────────────────────────────────────────────────\n';
+
+    FOR i IN 1..array_length(v_data.recommendations, 1) LOOP
+        v_result := v_result || format('  • %s', v_data.recommendations[i]) || E'\n';
+    END LOOP;
+    v_result := v_result || E'\n';
+
+    -- Footer
+    v_result := v_result || E'══════════════════════════════════════════════════════════════════════\n';
+
+    RETURN v_result;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.blast_radius_report IS
+'Human-readable blast radius analysis report with ASCII-art formatting. Suitable for incident postmortems, Slack/email sharing, and documentation. Includes visual severity indicators, bar charts for lock types and affected apps, and actionable recommendations. Use: SELECT flight_recorder.blast_radius_report(''2024-01-15 10:23:00'', ''2024-01-15 10:35:00'');';
 
 
 SELECT flight_recorder.snapshot();

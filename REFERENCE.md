@@ -2624,6 +2624,185 @@ SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
  recommendations     | {"Review checkpoint impact","Investigate 3 blocked sessions"}
 ```
 
+## Blast Radius Analysis
+
+Blast radius analysis provides comprehensive impact assessment of database incidents. When something goes wrong, it answers: "What was the collateral damage?"
+
+### Overview
+
+| Function | Purpose |
+|----------|---------|
+| `blast_radius(start_time, end_time)` | Structured impact assessment with metrics |
+| `blast_radius_report(start_time, end_time)` | Human-readable ASCII-formatted report |
+
+### Impact Categories
+
+Blast radius analysis examines multiple impact dimensions:
+
+| Category | Metrics |
+|----------|---------|
+| Lock Impact | Blocked sessions, max/avg duration, lock types |
+| Query Degradation | Queries slowed >50% vs baseline |
+| Connection Impact | Before/during comparison, increase percentage |
+| Application Impact | Affected apps grouped by blocked count |
+| Wait Events | Top waits with percentage increase |
+| Transaction Throughput | TPS before vs during |
+
+### Severity Classification
+
+Overall severity is the highest individual severity across all categories:
+
+| Category | low | medium | high | critical |
+|----------|-----|--------|------|----------|
+| Blocked sessions | 1-5 | 6-20 | 21-50 | >50 |
+| Max block duration | <10s | 10-60s | 1-5min | >5min |
+| Connection increase | <25% | 25-50% | 50-100% | >100% |
+| TPS decrease | <10% | 10-25% | 25-50% | >50% |
+| Degraded queries | 1-3 | 4-10 | 11-25 | >25 |
+
+### Basic Usage
+
+```sql
+-- Get structured blast radius analysis
+SELECT * FROM flight_recorder.blast_radius(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+
+-- Get formatted report for postmortem
+SELECT flight_recorder.blast_radius_report(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+```
+
+### Return Columns
+
+The `blast_radius()` function returns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| incident_start | TIMESTAMPTZ | Start of analysis window |
+| incident_end | TIMESTAMPTZ | End of analysis window |
+| duration_seconds | NUMERIC | Incident duration |
+| blocked_sessions_total | INTEGER | Total unique blocked sessions |
+| blocked_sessions_max_concurrent | INTEGER | Max blocked at once |
+| max_block_duration | INTERVAL | Longest single block |
+| avg_block_duration | INTERVAL | Average block time |
+| lock_types | JSONB | Lock type breakdown |
+| degraded_queries_count | INTEGER | Queries slowed >50% |
+| degraded_queries | JSONB | Details of degraded queries |
+| connections_before | INTEGER | Baseline connections |
+| connections_during_avg | INTEGER | Average during incident |
+| connections_during_max | INTEGER | Peak connections |
+| connection_increase_pct | NUMERIC | Connection growth |
+| affected_applications | JSONB | Apps with blocked sessions |
+| top_wait_events | JSONB | Top waits during incident |
+| tps_before | NUMERIC | Baseline TPS |
+| tps_during | NUMERIC | TPS during incident |
+| tps_change_pct | NUMERIC | TPS change (negative = drop) |
+| severity | TEXT | low/medium/high/critical |
+| impact_summary | TEXT[] | Human-readable impact bullets |
+| recommendations | TEXT[] | Actionable recommendations |
+
+### Example Output
+
+```sql
+SELECT * FROM flight_recorder.blast_radius(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+```
+
+```
+ incident_start          | 2024-01-15 10:23:00
+ incident_end            | 2024-01-15 10:35:00
+ duration_seconds        | 720
+ blocked_sessions_total  | 47
+ blocked_sessions_max    | 23
+ max_block_duration      | 00:08:32
+ avg_block_duration      | 00:02:45
+ lock_types              | [{"type":"relation","count":42},{"type":"tuple","count":5}]
+ degraded_queries_count  | 8
+ degraded_queries        | [{"queryid":123,"query_preview":"SELECT...","baseline_ms":0.4,...}]
+ connections_before      | 42
+ connections_during_avg  | 87
+ connections_during_max  | 98
+ connection_increase_pct | 107
+ affected_applications   | [{"app_name":"web-server","blocked_count":43}]
+ top_wait_events         | [{"wait_type":"Lock","wait_event":"relation","total_count":156}]
+ tps_before              | 1200
+ tps_during              | 340
+ tps_change_pct          | -72
+ severity                | critical
+ impact_summary          | {"47 sessions blocked (max 8m32s)","TPS dropped 72%"}
+ recommendations         | {"Review blocking query","Consider lock_timeout"}
+```
+
+### Report Output
+
+```sql
+SELECT flight_recorder.blast_radius_report(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+```
+
+```
+══════════════════════════════════════════════════════════════════════
+                    BLAST RADIUS ANALYSIS REPORT
+══════════════════════════════════════════════════════════════════════
+Time Window: 2024-01-15 10:23:00 → 10:35:00 (12 minutes)
+Severity: ██████████ CRITICAL
+
+──────────────────────────────────────────────────────────────────────
+LOCK IMPACT
+──────────────────────────────────────────────────────────────────────
+  Total blocked sessions:     47
+  Max concurrent blocked:     23
+  Longest block duration:     8m 32s
+  Average block duration:     2m 45s
+
+  Lock types:
+    relation     ████████████████████ 42
+    tuple        ███                   5
+
+──────────────────────────────────────────────────────────────────────
+AFFECTED APPLICATIONS
+──────────────────────────────────────────────────────────────────────
+  web-server       ████████████████████ 43 blocked
+  api-service      ██████               12 blocked
+  background-job   ██                    4 blocked
+
+──────────────────────────────────────────────────────────────────────
+QUERY DEGRADATION (8 queries slowed >50%)
+──────────────────────────────────────────────────────────────────────
+  SELECT * FROM users WHERE...     0.4ms → 1.8ms  (+350%)
+  INSERT INTO posts...             0.2ms → 0.6ms  (+180%)
+
+──────────────────────────────────────────────────────────────────────
+RESOURCE IMPACT
+──────────────────────────────────────────────────────────────────────
+  Connections:  42 → 87 avg (98 max)  +107%
+  Throughput:   1200 TPS → 340 TPS    -72%
+
+──────────────────────────────────────────────────────────────────────
+RECOMMENDATIONS
+──────────────────────────────────────────────────────────────────────
+  • Review the blocking query that held locks for 8+ minutes
+  • Consider setting lock_timeout to prevent long waits
+  • Investigate connection pool sizing (reached 98 connections)
+
+══════════════════════════════════════════════════════════════════════
+```
+
+### Use Cases
+
+1. **Incident Postmortem**: Generate comprehensive report for post-incident review
+2. **Impact Assessment**: Quantify collateral damage during outages
+3. **Capacity Planning**: Identify connection pool and throughput limits
+4. **Application Mapping**: Discover which apps were affected by lock contention
+
 ## Visual Timeline
 
 Visual timeline functions provide ASCII-based visualization of metrics, enabling quick pattern recognition in terminal-based reports.
