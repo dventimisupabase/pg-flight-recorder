@@ -587,6 +587,438 @@ LANGUAGE sql IMMUTABLE AS $$
     END
 $$;
 
+
+-- =============================================================================
+-- VISUAL TIMELINE FUNCTIONS (Sparklines and ASCII Charts)
+-- =============================================================================
+
+-- Generates a compact sparkline from an array of numeric values using Unicode block characters
+-- Input: Array of numeric values, optional width (default 20)
+-- Output: String like ▁▂▃▅▇█▆▄▃▂ showing relative values
+-- Handles NULLs in array, empty arrays, and constant values
+CREATE OR REPLACE FUNCTION flight_recorder._sparkline(
+    p_values NUMERIC[],
+    p_width INTEGER DEFAULT 20
+)
+RETURNS TEXT
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_blocks CONSTANT TEXT := '▁▂▃▄▅▆▇█';
+    v_min NUMERIC;
+    v_max NUMERIC;
+    v_range NUMERIC;
+    v_result TEXT := '';
+    v_value NUMERIC;
+    v_index INTEGER;
+    v_len INTEGER;
+    v_step INTEGER;
+    i INTEGER;
+BEGIN
+    -- Handle NULL or empty array
+    IF p_values IS NULL OR array_length(p_values, 1) IS NULL THEN
+        RETURN '';
+    END IF;
+
+    v_len := array_length(p_values, 1);
+
+    -- Calculate min/max excluding NULLs
+    SELECT min(val), max(val)
+    INTO v_min, v_max
+    FROM unnest(p_values) AS val
+    WHERE val IS NOT NULL;
+
+    -- Handle all-NULL array
+    IF v_min IS NULL THEN
+        RETURN '';
+    END IF;
+
+    v_range := v_max - v_min;
+
+    -- Handle constant values (all same) - return middle height bars
+    IF v_range = 0 THEN
+        FOR i IN 1..LEAST(p_width, v_len) LOOP
+            v_result := v_result || '▄';
+        END LOOP;
+        RETURN v_result;
+    END IF;
+
+    -- Sample or use all values based on width
+    IF v_len <= p_width THEN
+        -- Use all values
+        FOR i IN 1..v_len LOOP
+            v_value := p_values[i];
+            IF v_value IS NULL THEN
+                v_result := v_result || ' ';
+            ELSE
+                -- Scale to 0-7 index
+                v_index := LEAST(7, FLOOR((v_value - v_min) / v_range * 7.999)::integer);
+                v_result := v_result || substr(v_blocks, v_index + 1, 1);
+            END IF;
+        END LOOP;
+    ELSE
+        -- Sample evenly across the array
+        v_step := v_len / p_width;
+        FOR i IN 1..p_width LOOP
+            v_value := p_values[1 + ((i - 1) * v_step)];
+            IF v_value IS NULL THEN
+                v_result := v_result || ' ';
+            ELSE
+                v_index := LEAST(7, FLOOR((v_value - v_min) / v_range * 7.999)::integer);
+                v_result := v_result || substr(v_blocks, v_index + 1, 1);
+            END IF;
+        END LOOP;
+    END IF;
+
+    RETURN v_result;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._sparkline IS
+'Generates a compact sparkline from numeric array using Unicode block characters (▁▂▃▄▅▆▇█). Used for visual trend display in reports.';
+
+
+-- Generates a horizontal progress bar showing filled/empty portions
+-- Input: Current value, maximum value, optional width (default 20)
+-- Output: String like ███████████████░░░░░ showing percentage filled
+CREATE OR REPLACE FUNCTION flight_recorder._bar(
+    p_value NUMERIC,
+    p_max NUMERIC,
+    p_width INTEGER DEFAULT 20
+)
+RETURNS TEXT
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_filled INTEGER;
+    v_pct NUMERIC;
+BEGIN
+    -- Handle edge cases
+    IF p_value IS NULL OR p_max IS NULL OR p_max <= 0 THEN
+        RETURN repeat('░', p_width);
+    END IF;
+
+    -- Clamp percentage to 0-100
+    v_pct := GREATEST(0, LEAST(100, (p_value / p_max) * 100));
+
+    -- Calculate filled portion
+    v_filled := round(v_pct / 100 * p_width)::integer;
+
+    RETURN repeat('█', v_filled) || repeat('░', p_width - v_filled);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._bar IS
+'Generates a horizontal progress bar using Unicode block characters (█ filled, ░ empty). Useful for displaying utilization percentages.';
+
+
+-- Generates an ASCII timeline chart for a metric over a time period
+-- Supported metrics: connections_active, connections_total, wal_bytes, temp_bytes,
+--                   xact_commit, xact_rollback, blks_read, blks_hit, db_size_bytes
+CREATE OR REPLACE FUNCTION flight_recorder.timeline(
+    p_metric TEXT,
+    p_duration INTERVAL DEFAULT '4 hours',
+    p_width INTEGER DEFAULT 60,
+    p_height INTEGER DEFAULT 10
+)
+RETURNS TEXT
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_data NUMERIC[];
+    v_times TIMESTAMPTZ[];
+    v_min NUMERIC;
+    v_max NUMERIC;
+    v_range NUMERIC;
+    v_chart TEXT := '';
+    v_row TEXT;
+    v_y_label TEXT;
+    v_scaled_data INTEGER[];
+    v_value NUMERIC;
+    v_scaled INTEGER;
+    v_prev_scaled INTEGER;
+    v_char TEXT;
+    i INTEGER;
+    j INTEGER;
+    v_label_width INTEGER := 6;
+    v_metric_col TEXT;
+BEGIN
+    -- Map metric aliases to actual column names
+    v_metric_col := CASE lower(p_metric)
+        WHEN 'connections' THEN 'connections_active'
+        WHEN 'connections_active' THEN 'connections_active'
+        WHEN 'connections_total' THEN 'connections_total'
+        WHEN 'wal' THEN 'wal_bytes'
+        WHEN 'wal_bytes' THEN 'wal_bytes'
+        WHEN 'temp' THEN 'temp_bytes'
+        WHEN 'temp_bytes' THEN 'temp_bytes'
+        WHEN 'commits' THEN 'xact_commit'
+        WHEN 'xact_commit' THEN 'xact_commit'
+        WHEN 'rollbacks' THEN 'xact_rollback'
+        WHEN 'xact_rollback' THEN 'xact_rollback'
+        WHEN 'blks_read' THEN 'blks_read'
+        WHEN 'blks_hit' THEN 'blks_hit'
+        WHEN 'db_size' THEN 'db_size_bytes'
+        WHEN 'db_size_bytes' THEN 'db_size_bytes'
+        ELSE NULL
+    END;
+
+    IF v_metric_col IS NULL THEN
+        RETURN E'Error: Unsupported metric ''' || p_metric || E'''\n' ||
+               E'Supported: connections, wal_bytes, temp_bytes, xact_commit, xact_rollback, blks_read, blks_hit, db_size_bytes';
+    END IF;
+
+    -- Fetch data points
+    EXECUTE format(
+        'SELECT array_agg(%I ORDER BY captured_at), array_agg(captured_at ORDER BY captured_at)
+         FROM (
+             SELECT %I, captured_at
+             FROM flight_recorder.snapshots
+             WHERE captured_at > now() - $1
+               AND %I IS NOT NULL
+             ORDER BY captured_at
+             LIMIT $2
+         ) sub',
+        v_metric_col, v_metric_col, v_metric_col
+    ) INTO v_data, v_times
+    USING p_duration, p_width;
+
+    -- Handle no data
+    IF v_data IS NULL OR array_length(v_data, 1) IS NULL OR array_length(v_data, 1) < 2 THEN
+        RETURN p_metric || E' (last ' || p_duration || E')\nInsufficient data - need at least 2 data points';
+    END IF;
+
+    -- Calculate min/max
+    SELECT min(val), max(val) INTO v_min, v_max FROM unnest(v_data) AS val;
+    v_range := GREATEST(v_max - v_min, 1);
+
+    -- Add some padding to min/max for better visualization
+    v_min := v_min - v_range * 0.05;
+    v_max := v_max + v_range * 0.05;
+    v_range := v_max - v_min;
+
+    -- Pre-calculate scaled values (0 to p_height)
+    v_scaled_data := ARRAY[]::INTEGER[];
+    FOR i IN 1..array_length(v_data, 1) LOOP
+        v_value := v_data[i];
+        IF v_value IS NOT NULL THEN
+            v_scaled := round((v_value - v_min) / v_range * p_height)::integer;
+        ELSE
+            v_scaled := NULL;
+        END IF;
+        v_scaled_data := v_scaled_data || v_scaled;
+    END LOOP;
+
+    -- Build header
+    v_chart := p_metric || ' (last ' || p_duration || ')' || E'\n';
+
+    -- Build chart from top to bottom
+    FOR i IN REVERSE p_height..0 LOOP
+        -- Y-axis label
+        v_value := v_min + (v_range * i / p_height);
+        IF v_metric_col IN ('wal_bytes', 'temp_bytes', 'db_size_bytes') THEN
+            v_y_label := flight_recorder._pretty_bytes(v_value::bigint);
+        ELSE
+            v_y_label := to_char(v_value, 'FM999999');
+        END IF;
+        v_row := lpad(left(v_y_label, v_label_width), v_label_width) || ' ┤';
+
+        -- Plot data points
+        v_prev_scaled := NULL;
+        FOR j IN 1..array_length(v_scaled_data, 1) LOOP
+            v_scaled := v_scaled_data[j];
+
+            IF v_scaled IS NULL THEN
+                v_char := ' ';
+            ELSIF v_scaled = i THEN
+                -- Determine line character based on neighbors
+                IF v_prev_scaled IS NULL THEN
+                    v_char := '─';
+                ELSIF v_prev_scaled < i THEN
+                    v_char := '╭';  -- Coming up from below
+                ELSIF v_prev_scaled > i THEN
+                    v_char := '╮';  -- Coming down from above
+                ELSE
+                    v_char := '─';  -- Same level
+                END IF;
+            ELSIF v_prev_scaled IS NOT NULL AND
+                  ((v_prev_scaled <= i AND v_scaled > i) OR (v_prev_scaled > i AND v_scaled <= i)) THEN
+                -- Vertical line between two points that cross this row
+                v_char := '│';
+            ELSE
+                v_char := ' ';
+            END IF;
+
+            v_row := v_row || v_char;
+            v_prev_scaled := v_scaled;
+        END LOOP;
+
+        v_chart := v_chart || v_row || E'\n';
+    END LOOP;
+
+    -- X-axis
+    v_row := repeat(' ', v_label_width) || ' └' || repeat('─', array_length(v_scaled_data, 1));
+    v_chart := v_chart || v_row || E'\n';
+
+    -- Time labels (start, middle, end)
+    IF array_length(v_times, 1) >= 3 THEN
+        v_row := repeat(' ', v_label_width + 2) ||
+                 to_char(v_times[1], 'HH24:MI') ||
+                 repeat(' ', GREATEST(1, array_length(v_times, 1)/2 - 8)) ||
+                 to_char(v_times[array_length(v_times, 1)/2], 'HH24:MI') ||
+                 repeat(' ', GREATEST(1, array_length(v_times, 1)/2 - 8)) ||
+                 to_char(v_times[array_length(v_times, 1)], 'HH24:MI');
+        v_chart := v_chart || v_row || E'\n';
+    END IF;
+
+    RETURN v_chart;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.timeline IS
+'Generates an ASCII timeline chart for a metric. Supported metrics: connections, wal_bytes, temp_bytes, xact_commit, xact_rollback, blks_read, blks_hit, db_size_bytes.';
+
+
+-- Returns a summary table with sparkline trends for key metrics
+CREATE OR REPLACE FUNCTION flight_recorder.sparkline_metrics(
+    p_duration INTERVAL DEFAULT '1 hour'
+)
+RETURNS TABLE(
+    metric TEXT,
+    current_value TEXT,
+    trend TEXT,
+    min_value TEXT,
+    max_value TEXT
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_values NUMERIC[];
+    v_min NUMERIC;
+    v_max NUMERIC;
+    v_current NUMERIC;
+BEGIN
+    -- Connections Active
+    SELECT array_agg(connections_active ORDER BY captured_at),
+           min(connections_active), max(connections_active),
+           (array_agg(connections_active ORDER BY captured_at DESC))[1]
+    INTO v_values, v_min, v_max, v_current
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - p_duration
+      AND connections_active IS NOT NULL;
+
+    IF v_current IS NOT NULL THEN
+        metric := 'connections_active';
+        current_value := v_current::text;
+        trend := flight_recorder._sparkline(v_values);
+        min_value := v_min::text;
+        max_value := v_max::text;
+        RETURN NEXT;
+    END IF;
+
+    -- Cache Hit Ratio (computed)
+    SELECT array_agg(
+               CASE WHEN blks_hit + blks_read > 0
+                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
+                    ELSE NULL
+               END ORDER BY captured_at
+           ),
+           min(CASE WHEN blks_hit + blks_read > 0
+                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
+                    ELSE NULL END),
+           max(CASE WHEN blks_hit + blks_read > 0
+                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
+                    ELSE NULL END),
+           (array_agg(
+               CASE WHEN blks_hit + blks_read > 0
+                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
+                    ELSE NULL
+               END ORDER BY captured_at DESC
+           ))[1]
+    INTO v_values, v_min, v_max, v_current
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - p_duration
+      AND blks_hit IS NOT NULL;
+
+    IF v_current IS NOT NULL THEN
+        metric := 'cache_hit_ratio';
+        current_value := v_current::text || '%';
+        trend := flight_recorder._sparkline(v_values);
+        min_value := COALESCE(v_min::text, '-') || '%';
+        max_value := COALESCE(v_max::text, '-') || '%';
+        RETURN NEXT;
+    END IF;
+
+    -- WAL Bytes
+    SELECT array_agg(wal_bytes ORDER BY captured_at),
+           min(wal_bytes), max(wal_bytes),
+           (array_agg(wal_bytes ORDER BY captured_at DESC))[1]
+    INTO v_values, v_min, v_max, v_current
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - p_duration
+      AND wal_bytes IS NOT NULL;
+
+    IF v_current IS NOT NULL THEN
+        metric := 'wal_bytes';
+        current_value := flight_recorder._pretty_bytes(v_current::bigint);
+        trend := flight_recorder._sparkline(v_values);
+        min_value := flight_recorder._pretty_bytes(v_min::bigint);
+        max_value := flight_recorder._pretty_bytes(v_max::bigint);
+        RETURN NEXT;
+    END IF;
+
+    -- Temp Bytes
+    SELECT array_agg(temp_bytes ORDER BY captured_at),
+           min(temp_bytes), max(temp_bytes),
+           (array_agg(temp_bytes ORDER BY captured_at DESC))[1]
+    INTO v_values, v_min, v_max, v_current
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - p_duration
+      AND temp_bytes IS NOT NULL;
+
+    IF v_current IS NOT NULL THEN
+        metric := 'temp_bytes';
+        current_value := flight_recorder._pretty_bytes(v_current::bigint);
+        trend := flight_recorder._sparkline(v_values);
+        min_value := flight_recorder._pretty_bytes(v_min::bigint);
+        max_value := flight_recorder._pretty_bytes(v_max::bigint);
+        RETURN NEXT;
+    END IF;
+
+    -- Transactions per interval (xact_commit)
+    SELECT array_agg(xact_commit ORDER BY captured_at),
+           min(xact_commit), max(xact_commit),
+           (array_agg(xact_commit ORDER BY captured_at DESC))[1]
+    INTO v_values, v_min, v_max, v_current
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - p_duration
+      AND xact_commit IS NOT NULL;
+
+    IF v_current IS NOT NULL THEN
+        metric := 'xact_commit';
+        current_value := v_current::text;
+        trend := flight_recorder._sparkline(v_values);
+        min_value := v_min::text;
+        max_value := v_max::text;
+        RETURN NEXT;
+    END IF;
+
+    -- Database Size
+    SELECT array_agg(db_size_bytes ORDER BY captured_at),
+           min(db_size_bytes), max(db_size_bytes),
+           (array_agg(db_size_bytes ORDER BY captured_at DESC))[1]
+    INTO v_values, v_min, v_max, v_current
+    FROM flight_recorder.snapshots
+    WHERE captured_at > now() - p_duration
+      AND db_size_bytes IS NOT NULL;
+
+    IF v_current IS NOT NULL THEN
+        metric := 'db_size_bytes';
+        current_value := flight_recorder._pretty_bytes(v_current::bigint);
+        trend := flight_recorder._sparkline(v_values);
+        min_value := flight_recorder._pretty_bytes(v_min::bigint);
+        max_value := flight_recorder._pretty_bytes(v_max::bigint);
+        RETURN NEXT;
+    END IF;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.sparkline_metrics IS
+'Returns a summary table with sparkline trends for key metrics (connections, cache hit ratio, WAL, temp bytes, transactions, database size).';
+
+
 -- Returns the PostgreSQL major version number
 -- Extracts major version by dividing server_version_num by 10000
 CREATE OR REPLACE FUNCTION flight_recorder._pg_version()
@@ -604,7 +1036,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.12'),
+    ('schema_version', '2.13'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),

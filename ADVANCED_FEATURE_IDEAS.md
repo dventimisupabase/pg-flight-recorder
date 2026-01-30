@@ -28,7 +28,7 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 5. [Continuous Benchmarking / Canary Queries](#5-continuous-benchmarking--canary-queries) ✅ **DONE**
 6. [Fleet-Wide Analysis](#6-fleet-wide-analysis--is-this-normal)
 7. [Automatic Regression Detection](#7-automatic-performance-regression-detection) ✅ **DONE**
-8. [Visual Performance Timeline](#8-visual-performance-timeline-ascii-art)
+8. [Visual Performance Timeline](#8-visual-performance-timeline-ascii-art) ✅ **DONE**
 
 ---
 
@@ -1862,9 +1862,11 @@ SELECT cron.schedule(
 
 ---
 
-## 8. Visual Performance Timeline (ASCII Art)
+## 8. Visual Performance Timeline (ASCII Art) ✅ IMPLEMENTED
 
 **Complexity**: 🟢 Low (4-8 hours)
+
+> **Status**: ✅ **Fully implemented** in v2.13. Includes `_sparkline()` for compact Unicode sparklines, `_bar()` for horizontal progress bars, `timeline()` for full ASCII charts, and `sparkline_metrics()` for summary tables with trend visualization. See `REFERENCE.md` for usage.
 
 ### The Problem
 
@@ -2074,25 +2076,27 @@ Based on **value vs. complexity**:
 | Rank | Feature | Value | Complexity | Status |
 |------|---------|-------|------------|--------|
 | 1 | **Query Storm Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.10-2.11) - Includes severity & correlation |
-| 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | ⬚ Not started - **Next priority** |
+| 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.12) |
 | 3 | **Performance Forecasting** | 🟠 High | 🔴 High | ⬚ Not started |
 | 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | ⬚ Not started |
 | 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | ⬚ Not started |
 | 6 | **Canary Queries** | 🟡 Medium | 🟡 Medium | ✅ **DONE** (v2.9) |
 | 7 | **Fleet-Wide Analysis** | 🟡 Medium | 🟣 Very High | ⬚ Not started - Requires infrastructure |
-| 8 | **Visual Timeline** | 🟢 Low | 🟢 Low | ⬚ Not started |
+| 8 | **Visual Timeline** | 🟢 Low | 🟢 Low | ✅ **DONE** (v2.13) - Sparklines, bars, timeline charts |
 
 ---
 
 ## Next Steps
 
 1. ~~**Prototype Top 2**: Build query storm + canary queries~~ ✅ Done
-2. **Regression Detection**: Next priority - catches problems before customers complain
-3. **Validate with Real Data**: Test on production databases
-4. **Iterate**: Refine based on real-world usage
+2. ~~**Regression Detection**: Next priority~~ ✅ Done (v2.12)
+3. ~~**Visual Timeline**: ASCII charts for metrics~~ ✅ Done (v2.13)
+4. **Validate with Real Data**: Test on production databases
+5. **Performance Forecasting**: Next priority - proactive capacity warnings
+6. **Iterate**: Refine based on real-world usage
 
 ---
 
 **Last Updated**: 2026-01-30
-**Status**: 2 of 8 features implemented (Query Storms, Canary Queries)
+**Status**: 5 of 8 features implemented (Query Storms, Canary Queries, Regression Detection, Visual Timeline)
 **Maintainer**: Flight Recorder Team

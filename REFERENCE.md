@@ -36,6 +36,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 - [Anomaly Detection Reference](#anomaly-detection-reference)
 - [Query Storm Detection](#query-storm-detection)
 - [Performance Regression Detection](#performance-regression-detection)
+- [Visual Timeline](#visual-timeline)
 - [Testing and Benchmarking](#testing-and-benchmarking)
 - [Code Browser](#code-browser)
 
@@ -454,6 +455,11 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.13 | Visual Timeline: `_sparkline()`, `_bar()`, `timeline()`, `sparkline_metrics()` functions for ASCII-based metric visualization |
+| 2.12 | Performance regression detection: `query_regressions` table, `detect_regressions()`, `regression_status()`, `regression_dashboard` view |
+| 2.11 | Query storm severity levels and correlation data, anti-flapping protection for auto-resolution |
+| 2.10 | Query storm detection: `query_storms` table, `detect_query_storms()`, `storm_status()`, `storm_dashboard` view |
+| 2.9 | Canary queries: `canaries` and `canary_results` tables, `run_canaries()`, `canary_status()` functions |
 | 2.8 | OID exhaustion detection: `max_catalog_oid` and `large_object_count` columns, `OID_EXHAUSTION_RISK` anomaly type, rate calculation functions (`oid_consumption_rate`, `time_to_oid_exhaustion`) |
 | 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
@@ -2239,6 +2245,166 @@ SELECT flight_recorder.resolve_regression(123, 'Ran ANALYZE on orders table');
 
 -- 7. Monitor via pg_notify in your application
 -- Application code: LISTEN flight_recorder_regressions
+```
+
+## Visual Timeline
+
+Visual timeline functions provide ASCII-based visualization of metrics, enabling quick pattern recognition in terminal-based reports.
+
+### Overview
+
+Visual timeline includes four functions:
+
+| Function | Purpose |
+|----------|---------|
+| `_sparkline(numeric[])` | Compact Unicode sparkline from numeric array |
+| `_bar(value, max)` | Horizontal progress bar |
+| `timeline(metric, duration)` | Full ASCII chart with Y-axis and time labels |
+| `sparkline_metrics(duration)` | Summary table with sparkline trends |
+
+### Sparklines
+
+Sparklines are compact inline charts using Unicode block characters (▁▂▃▄▅▆▇█):
+
+```sql
+-- Basic sparkline from array
+SELECT flight_recorder._sparkline(ARRAY[1,2,4,8,4,2,1,2,4,8]);
+-- Returns: ▁▂▃█▃▂▁▂▃█
+
+-- With custom width (samples if array is larger)
+SELECT flight_recorder._sparkline(ARRAY[1,2,3,4,5,6,7,8,9,10], 5);
+-- Returns: ▁▃▄▆█
+```
+
+**Edge cases handled:**
+
+- NULL array → empty string
+- Empty array → empty string
+- All-NULL values → empty string
+- Constant values → middle-height bars (▄▄▄▄)
+- Mixed NULL values → space character for NULLs
+
+### Progress Bars
+
+Horizontal progress bars show filled/empty portions:
+
+```sql
+-- 75% progress bar
+SELECT flight_recorder._bar(75, 100, 20);
+-- Returns: ███████████████░░░░░
+
+-- 0% and 100%
+SELECT flight_recorder._bar(0, 100, 10);   -- ░░░░░░░░░░
+SELECT flight_recorder._bar(100, 100, 10); -- ██████████
+```
+
+### Timeline Charts
+
+Full ASCII charts with Y-axis labels and time markers:
+
+```sql
+SELECT flight_recorder.timeline('connections', '2 hours');
+```
+
+**Example output:**
+
+```
+connections (last 2 hours)
+    87 ┤          ╭────╮
+    72 ┤    ╭─────╯    ╰──╮
+    58 ┤╭───╯             ╰──
+    43 ┼╯
+       └───────┬───────┬───────
+            14:00   15:00   16:00
+```
+
+**Supported metrics:**
+
+| Alias | Column | Description |
+|-------|--------|-------------|
+| `connections` | `connections_active` | Active database connections |
+| `connections_total` | `connections_total` | Total connections |
+| `wal` | `wal_bytes` | WAL bytes generated |
+| `temp` | `temp_bytes` | Temp file bytes |
+| `commits` | `xact_commit` | Committed transactions |
+| `rollbacks` | `xact_rollback` | Rolled back transactions |
+| `blks_read` | `blks_read` | Blocks read from disk |
+| `blks_hit` | `blks_hit` | Blocks found in cache |
+| `db_size` | `db_size_bytes` | Database size |
+
+**Parameters:**
+
+```sql
+flight_recorder.timeline(
+    p_metric TEXT,             -- Metric name or alias
+    p_duration INTERVAL DEFAULT '4 hours',
+    p_width INTEGER DEFAULT 60,
+    p_height INTEGER DEFAULT 10
+)
+```
+
+### Sparkline Metrics Summary
+
+Get an at-a-glance summary with sparkline trends for key metrics:
+
+```sql
+SELECT * FROM flight_recorder.sparkline_metrics('1 hour');
+```
+
+**Example output:**
+
+```
+     metric      │ current_value │     trend      │ min_value │ max_value
+─────────────────┼───────────────┼────────────────┼───────────┼───────────
+ connections_active │ 87          │ ▁▂▃▅▇█▆▄▃▂    │ 43        │ 87
+ cache_hit_ratio │ 98.2%        │ █████████▇    │ 97.1%     │ 99.0%
+ wal_bytes       │ 1.2 GB       │ ▃▃▃▄▅▇█▅▄▃    │ 0.8 GB    │ 1.5 GB
+ temp_bytes      │ 0 B          │ ▁▁▁▁▁▁▁▁▁▁    │ 0 B       │ 0 B
+ xact_commit     │ 15234        │ ▂▃▄▅▆▇█▇▆▅    │ 12000     │ 18000
+ db_size_bytes   │ 2.5 GB       │ ▁▁▁▁▁▁▁▂▂▂    │ 2.4 GB    │ 2.5 GB
+```
+
+**Metrics included:**
+
+- `connections_active` - Active connections
+- `cache_hit_ratio` - Computed from blks_hit/(blks_hit+blks_read)
+- `wal_bytes` - WAL generated
+- `temp_bytes` - Temp file usage
+- `xact_commit` - Committed transactions
+- `db_size_bytes` - Database size
+
+### Use Cases
+
+**Quick health check:**
+
+```sql
+SELECT * FROM flight_recorder.sparkline_metrics('1 hour');
+```
+
+**Incident investigation:**
+
+```sql
+-- What did connections look like during the incident?
+SELECT flight_recorder.timeline('connections', '4 hours');
+```
+
+**Capacity monitoring:**
+
+```sql
+-- Database growth trend
+SELECT flight_recorder.timeline('db_size', '24 hours');
+```
+
+**Progress bars in reports:**
+
+```sql
+SELECT
+    'Connections' AS resource,
+    connections_active || '/' || connections_max AS usage,
+    flight_recorder._bar(connections_active, connections_max) AS utilization
+FROM flight_recorder.snapshots
+ORDER BY captured_at DESC
+LIMIT 1;
 ```
 
 ## Testing and Benchmarking
