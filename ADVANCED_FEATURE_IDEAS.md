@@ -1,7 +1,7 @@
 # Advanced Feature Ideas for Flight Recorder
 
 **Purpose**: Explore advanced diagnostic and predictive capabilities that could be added to pg-flight-recorder.
-**Status**: Brainstorming Phase - Not Yet Designed
+**Status**: Partially Implemented - See status markers below
 **Audience**: Future development, CSA feedback, prioritization discussions
 
 ---
@@ -22,12 +22,12 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 ## Table of Contents
 
 1. [Performance Forecasting / Predictive Alerts](#1-performance-forecasting--predictive-alerts)
-2. [Query Fingerprinting & Storm Detection](#2-query-fingerprinting--storm-detection)
+2. [Query Fingerprinting & Storm Detection](#2-query-fingerprinting--storm-detection) ✅ **DONE**
 3. [Time-Travel Debugging](#3-time-travel-debugging-with-second-level-precision)
 4. [Blast Radius Analysis](#4-blast-radius-analysis)
-5. [Continuous Benchmarking / Canary Queries](#5-continuous-benchmarking--canary-queries)
+5. [Continuous Benchmarking / Canary Queries](#5-continuous-benchmarking--canary-queries) ✅ **DONE**
 6. [Fleet-Wide Analysis](#6-fleet-wide-analysis--is-this-normal)
-7. [Automatic Regression Detection](#7-automatic-performance-regression-detection)
+7. [Automatic Regression Detection](#7-automatic-performance-regression-detection) ✅ **DONE**
 8. [Visual Performance Timeline](#8-visual-performance-timeline-ascii-art)
 
 ---
@@ -254,9 +254,11 @@ SELECT cron.schedule(
 
 ---
 
-## 2. Query Fingerprinting & Storm Detection
+## 2. Query Fingerprinting & Storm Detection ✅ IMPLEMENTED
 
 **Complexity**: 🟡 Medium (1-2 days)
+
+> **Status**: ✅ **Fully implemented** in v2.10-2.11. Includes storm detection, classification (RETRY_STORM, CACHE_MISS, SPIKE), severity levels (LOW/MEDIUM/HIGH/CRITICAL), correlation data, auto-resolution with anti-flapping, pg_notify alerts, dashboard view, and resolution workflow. See `REFERENCE.md` for usage.
 
 ### The Problem
 
@@ -937,9 +939,11 @@ $$;
 
 ---
 
-## 5. Continuous Benchmarking / Canary Queries
+## 5. Continuous Benchmarking / Canary Queries ✅ IMPLEMENTED
 
 **Complexity**: 🟡 Medium (1-2 days)
+
+> **Status**: ✅ **Fully implemented** in v2.9. Includes canaries table, canary_results table, run_canaries(), canary_status(), enable_canaries(), disable_canaries(), pre-defined system catalog canary queries, and optional EXPLAIN capture. See `REFERENCE.md` for usage.
 
 ### The Problem
 
@@ -2067,28 +2071,28 @@ FROM metrics;
 
 Based on **value vs. complexity**:
 
-| Rank | Feature | Value | Complexity | Recommendation |
-|------|---------|-------|------------|----------------|
-| 1 | **Query Storm Detection** | 🔥 Very High | 🟡 Medium | **Implement First** - Leverages existing data, huge diagnostic value |
-| 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | **Implement Second** - Catches problems before customers complain |
-| 3 | **Performance Forecasting** | 🟠 High | 🔴 High | **Phase 2** - Proactive but complex |
-| 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | **Phase 2** - Nice-to-have for detailed investigations |
-| 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | **Phase 3** - Great for post-mortems but complex |
-| 6 | **Canary Queries** | 🟡 Medium | 🟡 Medium | **Optional** - Good for silent degradation, but adds overhead |
-| 7 | **Fleet-Wide Analysis** | 🟡 Medium | 🟣 Very High | **Long-term** - Requires infrastructure investment |
-| 8 | **Visual Timeline** | 🟢 Low | 🟢 Low | **Nice-to-have** - Fun but low value |
+| Rank | Feature | Value | Complexity | Status |
+|------|---------|-------|------------|--------|
+| 1 | **Query Storm Detection** | 🔥 Very High | 🟡 Medium | ✅ **DONE** (v2.10-2.11) - Includes severity & correlation |
+| 2 | **Regression Detection** | 🔥 Very High | 🟡 Medium | ⬚ Not started - **Next priority** |
+| 3 | **Performance Forecasting** | 🟠 High | 🔴 High | ⬚ Not started |
+| 4 | **Time-Travel Debugging** | 🟠 High | 🟡 Medium | ⬚ Not started |
+| 5 | **Blast Radius Analysis** | 🟠 High | 🔴 High | ⬚ Not started |
+| 6 | **Canary Queries** | 🟡 Medium | 🟡 Medium | ✅ **DONE** (v2.9) |
+| 7 | **Fleet-Wide Analysis** | 🟡 Medium | 🟣 Very High | ⬚ Not started - Requires infrastructure |
+| 8 | **Visual Timeline** | 🟢 Low | 🟢 Low | ⬚ Not started |
 
 ---
 
 ## Next Steps
 
-1. **Gather Feedback**: Show this doc to CSAs - what resonates?
-2. **Prototype Top 2**: Build query storm + regression detection
+1. ~~**Prototype Top 2**: Build query storm + canary queries~~ ✅ Done
+2. **Regression Detection**: Next priority - catches problems before customers complain
 3. **Validate with Real Data**: Test on production databases
 4. **Iterate**: Refine based on real-world usage
 
 ---
 
-**Last Updated**: 2026-01-18
-**Status**: Brainstorming Complete - Ready for Prioritization
+**Last Updated**: 2026-01-30
+**Status**: 2 of 8 features implemented (Query Storms, Canary Queries)
 **Maintainer**: Flight Recorder Team

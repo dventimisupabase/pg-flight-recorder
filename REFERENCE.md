@@ -35,6 +35,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
 - [Query Storm Detection](#query-storm-detection)
+- [Performance Regression Detection](#performance-regression-detection)
 - [Testing and Benchmarking](#testing-and-benchmarking)
 - [Code Browser](#code-browser)
 
@@ -1994,6 +1995,250 @@ SELECT flight_recorder.resolve_storm(123, 'Added missing index');
 
 -- 6. Monitor via pg_notify in your application
 -- Application code: LISTEN flight_recorder_storms
+```
+
+## Performance Regression Detection
+
+Performance regression detection identifies queries whose execution time has significantly increased compared to historical baselines. Regressions are classified by severity and can be monitored, resolved manually, or auto-resolved when performance normalizes.
+
+### Overview
+
+A "performance regression" is a significant slowdown in query execution time compared to historical baseline. Unlike storm detection (which tracks execution frequency), regression detection focuses on **execution time** changes. Common causes include:
+
+- **Plan changes**: Query planner choosing a worse execution plan
+- **Statistics staleness**: Out-of-date table statistics leading to suboptimal plans
+- **Data growth**: Table size increases affecting sequential scans
+- **Cache misses**: Data falling out of shared buffers
+- **Resource contention**: Competing workloads affecting I/O
+
+### Severity Levels
+
+Regressions are classified by severity based on percentage change from baseline:
+
+| Severity | Change % | Description |
+|----------|----------|-------------|
+| `LOW` | 50% - 200% | Minor slowdown, may be normal variation |
+| `MEDIUM` | 200% - 500% | Noticeable degradation, warrants monitoring |
+| `HIGH` | 500% - 1000% | Significant regression, investigate |
+| `CRITICAL` | > 1000% | Severe regression, immediate attention needed |
+
+Severity thresholds are configurable (see Configuration below).
+
+### Enabling Regression Detection
+
+Regression detection is opt-in. Enable it with:
+
+```sql
+SELECT flight_recorder.enable_regression_detection();
+```
+
+This schedules automatic detection every 60 minutes via pg_cron. To disable:
+
+```sql
+SELECT flight_recorder.disable_regression_detection();
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `regression_detection_enabled` | `false` | Master enable/disable |
+| `regression_threshold_pct` | `50.0` | Minimum % increase to detect |
+| `regression_lookback_interval` | `1 hour` | Recent window for comparison |
+| `regression_baseline_days` | `7` | Historical baseline period |
+| `regression_detection_interval_minutes` | `60` | Auto-detection frequency |
+| `regression_min_duration_minutes` | `30` | Minimum age before auto-resolution |
+| `regression_notify_enabled` | `true` | Send pg_notify alerts |
+| `regression_notify_channel` | `flight_recorder_regressions` | Notification channel name |
+| `regression_severity_low_max` | `200.0` | Maximum % for LOW severity |
+| `regression_severity_medium_max` | `500.0` | Maximum % for MEDIUM severity |
+| `regression_severity_high_max` | `1000.0` | Maximum % for HIGH severity |
+| `retention_regressions_days` | `30` | How long to keep regression history |
+
+Adjust configuration:
+
+```sql
+-- Increase sensitivity (detect smaller slowdowns)
+UPDATE flight_recorder.config
+SET value = '25.0'
+WHERE key = 'regression_threshold_pct';
+
+-- Check more frequently
+UPDATE flight_recorder.config
+SET value = '30'
+WHERE key = 'regression_detection_interval_minutes';
+
+-- Adjust severity thresholds
+UPDATE flight_recorder.config
+SET value = '300.0'
+WHERE key = 'regression_severity_medium_max';
+```
+
+### Manual Detection
+
+Detect regressions without enabling automatic detection:
+
+```sql
+-- Detect with default settings
+SELECT * FROM flight_recorder.detect_regressions();
+
+-- Custom lookback and threshold
+SELECT * FROM flight_recorder.detect_regressions('2 hours'::interval, 100.0);
+```
+
+Output:
+
+| queryid | query_fingerprint | severity | baseline_avg_ms | current_avg_ms | change_pct | probable_causes |
+|---------|-------------------|----------|-----------------|----------------|------------|-----------------|
+| 789012 | SELECT * FROM orders WHERE... | CRITICAL | 5.23 | 85.67 | 1538.24 | {Statistics may be out of date} |
+| 123456 | UPDATE inventory SET... | MEDIUM | 12.50 | 45.00 | 260.00 | {Low cache hit ratio} |
+
+### Monitoring Regressions
+
+**Dashboard view** (at-a-glance summary):
+
+```sql
+SELECT * FROM flight_recorder.regression_dashboard;
+```
+
+Returns: active regression counts by severity, resolution rate, average resolution time, regression-prone queries, overall status, and recommendations.
+
+**Status function** (detailed list):
+
+```sql
+-- Active and recent regressions
+SELECT * FROM flight_recorder.regression_status();
+
+-- Regressions in last 4 hours
+SELECT * FROM flight_recorder.regression_status('4 hours');
+```
+
+### Resolving Regressions
+
+**Manual resolution:**
+
+```sql
+-- Resolve single regression with notes
+SELECT flight_recorder.resolve_regression(123, 'Fixed by running ANALYZE on orders table');
+
+-- Resolve all regressions for a specific query
+SELECT flight_recorder.resolve_regressions_by_queryid(456789, 'Query optimized, deployed v2.1');
+
+-- Bulk resolve after incident review
+SELECT flight_recorder.resolve_all_regressions('Incident #42 reviewed and closed');
+
+-- Reopen if resolved incorrectly
+SELECT flight_recorder.reopen_regression(123);
+```
+
+**Auto-resolution:**
+
+When `auto_detect_regressions()` runs (via pg_cron), it automatically resolves regressions whose query execution times have returned to normal. Auto-resolution includes anti-flapping protection:
+
+- Regressions must be active for at least `regression_min_duration_minutes` (default: 30) before auto-resolution
+- Resolution note: "Auto-resolved: performance returned to normal"
+
+### Probable Causes
+
+When a regression is detected, pg-flight-recorder analyzes the query to suggest probable causes:
+
+- **Temp file spills**: Query is spilling to disk
+- **Low cache hit ratio**: Data not in shared buffers
+- **Recent checkpoint**: I/O contention from checkpoint activity
+- **Statistics staleness**: Tables may need ANALYZE
+
+### Real-Time Alerts
+
+Regression detection sends pg_notify alerts when regressions are detected or resolved:
+
+```sql
+-- Listen for alerts (in psql or application)
+LISTEN flight_recorder_regressions;
+```
+
+**Notification payload (JSON):**
+
+```json
+{
+  "action": "detected",
+  "regression_id": 123,
+  "queryid": 456789,
+  "severity": "HIGH",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "baseline_avg_ms": 12.5,
+  "current_avg_ms": 87.3,
+  "change_pct": 598.4
+}
+```
+
+```json
+{
+  "action": "resolved",
+  "regression_id": 123,
+  "queryid": 456789,
+  "severity": "HIGH",
+  "timestamp": "2024-01-15T11:00:00Z",
+  "resolution_notes": "Auto-resolved: performance returned to normal"
+}
+```
+
+Disable notifications:
+
+```sql
+UPDATE flight_recorder.config
+SET value = 'false'
+WHERE key = 'regression_notify_enabled';
+```
+
+### Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `enable_regression_detection()` | Enable and schedule automatic detection |
+| `disable_regression_detection()` | Disable and unschedule detection |
+| `detect_regressions(interval, numeric)` | Manual regression detection |
+| `auto_detect_regressions()` | Detect new regressions, auto-resolve normalized (called by pg_cron) |
+| `regression_status(interval)` | List active and recent regressions |
+| `resolve_regression(bigint, text)` | Resolve single regression by ID |
+| `resolve_regressions_by_queryid(bigint, text)` | Resolve all regressions for a queryid |
+| `resolve_all_regressions(text)` | Bulk resolve all active regressions |
+| `reopen_regression(bigint)` | Reopen a previously resolved regression |
+| `_diagnose_regression_causes(bigint)` | Internal: analyze query for probable causes |
+
+### Tables and Views
+
+| Object | Type | Purpose |
+|--------|------|---------|
+| `query_regressions` | Table | Regression detection history |
+| `regression_dashboard` | View | At-a-glance monitoring summary |
+
+### Example Workflow
+
+```sql
+-- 1. Enable regression detection
+SELECT flight_recorder.enable_regression_detection();
+
+-- 2. Check dashboard periodically
+SELECT * FROM flight_recorder.regression_dashboard;
+
+-- 3. Investigate active regressions
+SELECT * FROM flight_recorder.regression_status() WHERE status = 'ACTIVE';
+
+-- 4. Get query details and run EXPLAIN
+SELECT query, mean_exec_time, calls
+FROM pg_stat_statements
+WHERE queryid = 456789;
+
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 123;
+
+-- 5. Fix the issue (e.g., run ANALYZE, add index)
+ANALYZE orders;
+
+-- 6. Resolve after fixing
+SELECT flight_recorder.resolve_regression(123, 'Ran ANALYZE on orders table');
+
+-- 7. Monitor via pg_notify in your application
+-- Application code: LISTEN flight_recorder_regressions
 ```
 
 ## Testing and Benchmarking

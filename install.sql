@@ -549,6 +549,30 @@ CREATE INDEX IF NOT EXISTS query_storms_severity_idx
     ON flight_recorder.query_storms(severity) WHERE resolved_at IS NULL;
 COMMENT ON TABLE flight_recorder.query_storms IS 'Query storm detection results. Tracks query execution spikes classified as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
 
+-- Performance regression detection results
+-- Stores detected query performance regressions with classification and resolution tracking
+CREATE TABLE IF NOT EXISTS flight_recorder.query_regressions (
+    id                  BIGSERIAL PRIMARY KEY,
+    detected_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    queryid             BIGINT NOT NULL,
+    query_fingerprint   TEXT NOT NULL,
+    severity            TEXT NOT NULL DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
+    baseline_avg_ms     NUMERIC NOT NULL,
+    current_avg_ms      NUMERIC NOT NULL,
+    change_pct          NUMERIC NOT NULL,
+    correlation         JSONB,  -- Correlated metrics at detection time
+    probable_causes     TEXT[],
+    resolved_at         TIMESTAMPTZ,
+    resolution_notes    TEXT
+);
+CREATE INDEX IF NOT EXISTS query_regressions_detected_at_idx
+    ON flight_recorder.query_regressions(detected_at);
+CREATE INDEX IF NOT EXISTS query_regressions_queryid_idx
+    ON flight_recorder.query_regressions(queryid);
+CREATE INDEX IF NOT EXISTS query_regressions_severity_idx
+    ON flight_recorder.query_regressions(severity) WHERE resolved_at IS NULL;
+COMMENT ON TABLE flight_recorder.query_regressions IS 'Performance regression detection results. Tracks queries whose execution time has increased significantly compared to historical baseline with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
+
 
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
 CREATE OR REPLACE FUNCTION flight_recorder._pretty_bytes(bytes BIGINT)
@@ -580,7 +604,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.11'),
+    ('schema_version', '2.12'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -670,7 +694,19 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('storm_severity_low_max', '5.0'),
     ('storm_severity_medium_max', '10.0'),
     ('storm_severity_high_max', '50.0'),
-    ('retention_storms_days', '30')
+    ('retention_storms_days', '30'),
+    ('regression_detection_enabled', 'false'),
+    ('regression_threshold_pct', '50.0'),
+    ('regression_lookback_interval', '1 hour'),
+    ('regression_baseline_days', '7'),
+    ('regression_detection_interval_minutes', '60'),
+    ('regression_min_duration_minutes', '30'),
+    ('regression_notify_enabled', 'true'),
+    ('regression_notify_channel', 'flight_recorder_regressions'),
+    ('regression_severity_low_max', '200.0'),
+    ('regression_severity_medium_max', '500.0'),
+    ('regression_severity_high_max', '1000.0'),
+    ('retention_regressions_days', '30')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -2199,7 +2235,7 @@ COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'Raw archives: Arc
 
 
 -- Removes aged aggregate and archived sample data based on configured retention periods
--- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, canary_results, query_storms, and all *_samples_archive tables
+-- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, canary_results, query_storms, query_regressions, and all *_samples_archive tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
 RETURNS VOID
 LANGUAGE plpgsql AS $$
@@ -2208,6 +2244,7 @@ DECLARE
     v_archive_retention interval;
     v_canary_retention interval;
     v_storm_retention interval;
+    v_regression_retention interval;
     v_deleted_waits INTEGER;
     v_deleted_locks INTEGER;
     v_deleted_queries INTEGER;
@@ -2216,6 +2253,7 @@ DECLARE
     v_deleted_wait_archive INTEGER;
     v_deleted_canary INTEGER;
     v_deleted_storms INTEGER;
+    v_deleted_regressions INTEGER;
 BEGIN
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
@@ -2231,6 +2269,10 @@ BEGIN
     );
     v_storm_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_storms_days')::interval,
+        '30 days'::interval
+    );
+    v_regression_retention := COALESCE(
+        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_regressions_days')::interval,
         '30 days'::interval
     );
     DELETE FROM flight_recorder.wait_event_aggregates
@@ -2257,15 +2299,18 @@ BEGIN
     DELETE FROM flight_recorder.query_storms
     WHERE detected_at < now() - v_storm_retention;
     GET DIAGNOSTICS v_deleted_storms = ROW_COUNT;
+    DELETE FROM flight_recorder.query_regressions
+    WHERE detected_at < now() - v_regression_retention;
+    GET DIAGNOSTICS v_deleted_regressions = ROW_COUNT;
     IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 OR
        v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 OR
-       v_deleted_canary > 0 OR v_deleted_storms > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives, % canary results, % storms',
-            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive, v_deleted_canary, v_deleted_storms;
+       v_deleted_canary > 0 OR v_deleted_storms > 0 OR v_deleted_regressions > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives, % canary results, % storms, % regressions',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive, v_deleted_canary, v_deleted_storms, v_deleted_regressions;
     END IF;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate, archive, canary, and storm data based on retention periods';
+COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate, archive, canary, storm, and regression data based on retention periods';
 
 
 -- Collects table-level statistics from pg_stat_user_tables
@@ -5690,6 +5735,9 @@ BEGIN
         PERFORM cron.unschedule('flight_recorder_storm')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
+        PERFORM cron.unschedule('flight_recorder_regression')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_regression');
+        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('enabled', 'false', now())
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
@@ -5698,6 +5746,9 @@ BEGIN
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('storm_detection_enabled', 'false', now())
+        ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
+        INSERT INTO flight_recorder.config (key, value, updated_at)
+        VALUES ('regression_detection_enabled', 'false', now())
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
         RETURN format('Flight Recorder collection stopped. Unscheduled %s cron jobs. Use flight_recorder.enable() to restart.', v_unscheduled);
     EXCEPTION
@@ -6647,6 +6698,645 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.reopen_storm(BIGINT) IS 'Reopen a previously resolved storm if it was resolved incorrectly.';
+
+-- =============================================================================
+-- PERFORMANCE REGRESSION DETECTION
+-- =============================================================================
+
+-- Diagnose probable causes for a query's performance regression
+-- Analyzes pg_stat_statements and snapshots for indicators
+CREATE OR REPLACE FUNCTION flight_recorder._diagnose_regression_causes(
+    p_queryid BIGINT
+)
+RETURNS TEXT[]
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_causes TEXT[] := ARRAY[]::TEXT[];
+    v_stats RECORD;
+    v_recent_snapshot RECORD;
+BEGIN
+    -- Get current stats from pg_stat_statements
+    BEGIN
+        SELECT
+            temp_blks_written,
+            shared_blks_hit,
+            shared_blks_read,
+            rows
+        INTO v_stats
+        FROM pg_stat_statements
+        WHERE queryid = p_queryid
+        LIMIT 1;
+    EXCEPTION
+        WHEN undefined_table THEN
+            v_stats := NULL;
+    END;
+
+    IF v_stats IS NOT NULL THEN
+        -- Check for temp file spills
+        IF COALESCE(v_stats.temp_blks_written, 0) > 0 THEN
+            v_causes := array_append(v_causes, 'Query is spilling to disk (temp files) - consider increasing work_mem');
+        END IF;
+
+        -- Check cache hit ratio
+        IF v_stats.shared_blks_hit IS NOT NULL AND v_stats.shared_blks_read IS NOT NULL THEN
+            IF v_stats.shared_blks_hit + v_stats.shared_blks_read > 0 THEN
+                IF v_stats.shared_blks_hit::numeric / (v_stats.shared_blks_hit + v_stats.shared_blks_read) < 0.9 THEN
+                    v_causes := array_append(v_causes, 'Low cache hit ratio - check shared_buffers or index usage');
+                END IF;
+            END IF;
+        END IF;
+    END IF;
+
+    -- Check for recent checkpoint activity
+    SELECT
+        checkpoint_time,
+        ckpt_write_time,
+        ckpt_sync_time
+    INTO v_recent_snapshot
+    FROM flight_recorder.snapshots
+    WHERE captured_at >= now() - interval '1 hour'
+    ORDER BY captured_at DESC
+    LIMIT 1;
+
+    IF v_recent_snapshot IS NOT NULL THEN
+        IF v_recent_snapshot.checkpoint_time >= now() - interval '5 minutes' THEN
+            v_causes := array_append(v_causes, 'Recent checkpoint activity may be affecting I/O');
+        END IF;
+    END IF;
+
+    -- Default causes if nothing specific found
+    IF array_length(v_causes, 1) IS NULL THEN
+        v_causes := array_append(v_causes, 'Statistics may be out of date - consider ANALYZE on involved tables');
+        v_causes := array_append(v_causes, 'Query plan may have changed - check with EXPLAIN');
+    END IF;
+
+    RETURN v_causes;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._diagnose_regression_causes(BIGINT) IS 'Internal: Analyze a query to suggest probable causes for performance regression.';
+
+-- Detects performance regressions by comparing recent query execution times to baseline
+-- Returns queries with significant slowdown classified by severity
+CREATE OR REPLACE FUNCTION flight_recorder.detect_regressions(
+    p_lookback INTERVAL DEFAULT NULL,
+    p_threshold_pct NUMERIC DEFAULT NULL
+)
+RETURNS TABLE(
+    queryid BIGINT,
+    query_fingerprint TEXT,
+    severity TEXT,
+    baseline_avg_ms NUMERIC,
+    current_avg_ms NUMERIC,
+    change_pct NUMERIC,
+    probable_causes TEXT[]
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_lookback INTERVAL;
+    v_threshold_pct NUMERIC;
+    v_baseline_days INTEGER;
+    v_low_max NUMERIC;
+    v_medium_max NUMERIC;
+    v_high_max NUMERIC;
+BEGIN
+    -- Get configuration with defaults
+    v_lookback := COALESCE(
+        p_lookback,
+        flight_recorder._get_config('regression_lookback_interval', '1 hour')::interval
+    );
+    v_threshold_pct := COALESCE(
+        p_threshold_pct,
+        flight_recorder._get_config('regression_threshold_pct', '50.0')::numeric
+    );
+    v_baseline_days := COALESCE(
+        flight_recorder._get_config('regression_baseline_days', '7')::integer,
+        7
+    );
+
+    -- Get severity thresholds (percentage-based)
+    v_low_max := flight_recorder._get_config('regression_severity_low_max', '200.0')::numeric;
+    v_medium_max := flight_recorder._get_config('regression_severity_medium_max', '500.0')::numeric;
+    v_high_max := flight_recorder._get_config('regression_severity_high_max', '1000.0')::numeric;
+
+    RETURN QUERY
+    WITH recent_stats AS (
+        -- Recent query execution times from statement_snapshots
+        SELECT
+            ss.queryid,
+            left(ss.query_preview, 100) AS query_preview,
+            AVG(ss.mean_exec_time) AS avg_mean_time,
+            STDDEV(ss.mean_exec_time) AS stddev_mean_time,
+            COUNT(*) AS sample_count
+        FROM flight_recorder.statement_snapshots ss
+        JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+        WHERE s.captured_at >= now() - v_lookback
+          AND ss.mean_exec_time IS NOT NULL
+          AND ss.mean_exec_time > 0
+        GROUP BY ss.queryid, left(ss.query_preview, 100)
+    ),
+    baseline_stats AS (
+        -- Baseline query times (same hour of day over baseline period, excluding recent)
+        SELECT
+            ss.queryid,
+            AVG(ss.mean_exec_time) AS avg_mean_time,
+            STDDEV(ss.mean_exec_time) AS stddev_mean_time,
+            COUNT(DISTINCT date_trunc('day', s.captured_at)) AS days_sampled
+        FROM flight_recorder.statement_snapshots ss
+        JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+        WHERE s.captured_at >= now() - (v_baseline_days || ' days')::interval
+          AND s.captured_at < now() - v_lookback
+          AND ss.mean_exec_time IS NOT NULL
+          AND ss.mean_exec_time > 0
+        GROUP BY ss.queryid
+        HAVING COUNT(DISTINCT date_trunc('day', s.captured_at)) >= 2  -- Need at least 2 days of baseline
+    ),
+    regressions AS (
+        SELECT
+            r.queryid,
+            r.query_preview AS query_fingerprint,
+            b.avg_mean_time::numeric AS baseline_avg_ms,
+            r.avg_mean_time::numeric AS current_avg_ms,
+            ROUND(((r.avg_mean_time - b.avg_mean_time) / NULLIF(b.avg_mean_time, 0))::numeric * 100, 2) AS change_pct,
+            -- Z-score calculation for statistical significance
+            CASE
+                WHEN COALESCE(b.stddev_mean_time, 0) > 0
+                THEN (r.avg_mean_time - b.avg_mean_time) / b.stddev_mean_time
+                ELSE 0
+            END AS z_score
+        FROM recent_stats r
+        JOIN baseline_stats b ON b.queryid = r.queryid
+        WHERE r.avg_mean_time > b.avg_mean_time * (1 + v_threshold_pct / 100)
+          AND r.sample_count >= 2  -- Need multiple samples to be confident
+    )
+    SELECT
+        reg.queryid,
+        reg.query_fingerprint,
+        CASE
+            WHEN reg.change_pct > v_high_max THEN 'CRITICAL'
+            WHEN reg.change_pct > v_medium_max THEN 'HIGH'
+            WHEN reg.change_pct > v_low_max THEN 'MEDIUM'
+            ELSE 'LOW'
+        END AS severity,
+        ROUND(reg.baseline_avg_ms, 2) AS baseline_avg_ms,
+        ROUND(reg.current_avg_ms, 2) AS current_avg_ms,
+        reg.change_pct,
+        flight_recorder._diagnose_regression_causes(reg.queryid) AS probable_causes
+    FROM regressions reg
+    WHERE reg.z_score > 2 OR reg.change_pct > v_medium_max  -- Statistical filter or significant change
+    ORDER BY
+        CASE
+            WHEN reg.change_pct > v_high_max THEN 1
+            WHEN reg.change_pct > v_medium_max THEN 2
+            WHEN reg.change_pct > v_low_max THEN 3
+            ELSE 4
+        END,
+        reg.change_pct DESC;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.detect_regressions(INTERVAL, NUMERIC) IS 'Detect performance regressions by comparing recent query execution times to baseline. Classifies severity based on percentage change (LOW <200%, MEDIUM <500%, HIGH <1000%, CRITICAL >1000%).';
+
+-- Sends a pg_notify alert for regression events
+-- Called internally when regressions are detected or resolved
+CREATE OR REPLACE FUNCTION flight_recorder._notify_regression(
+    p_action TEXT,           -- 'detected' or 'resolved'
+    p_regression_id BIGINT,
+    p_queryid BIGINT,
+    p_severity TEXT DEFAULT NULL,
+    p_baseline_avg_ms NUMERIC DEFAULT NULL,
+    p_current_avg_ms NUMERIC DEFAULT NULL,
+    p_change_pct NUMERIC DEFAULT NULL,
+    p_resolution_notes TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_channel TEXT;
+    v_payload JSONB;
+BEGIN
+    -- Check if notifications are enabled
+    v_enabled := COALESCE(
+        flight_recorder._get_config('regression_notify_enabled', 'true')::boolean,
+        true
+    );
+
+    IF NOT v_enabled THEN
+        RETURN;
+    END IF;
+
+    -- Get channel name
+    v_channel := COALESCE(
+        flight_recorder._get_config('regression_notify_channel', 'flight_recorder_regressions'),
+        'flight_recorder_regressions'
+    );
+
+    -- Build payload
+    v_payload := jsonb_build_object(
+        'action', p_action,
+        'regression_id', p_regression_id,
+        'queryid', p_queryid,
+        'severity', p_severity,
+        'timestamp', now()
+    );
+
+    -- Add optional fields based on action
+    IF p_action = 'detected' THEN
+        v_payload := v_payload || jsonb_build_object(
+            'baseline_avg_ms', p_baseline_avg_ms,
+            'current_avg_ms', p_current_avg_ms,
+            'change_pct', p_change_pct
+        );
+    ELSIF p_action = 'resolved' THEN
+        v_payload := v_payload || jsonb_build_object(
+            'resolution_notes', p_resolution_notes
+        );
+    END IF;
+
+    -- Send notification
+    PERFORM pg_notify(v_channel, v_payload::text);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder._notify_regression(TEXT, BIGINT, BIGINT, TEXT, NUMERIC, NUMERIC, NUMERIC, TEXT) IS 'Internal: Send pg_notify alert for regression events. Configure via regression_notify_enabled and regression_notify_channel settings.';
+
+-- Auto-detect regressions and log new ones to query_regressions table
+-- Also auto-resolves regressions when performance returns to normal (with anti-flapping protection)
+-- Called by pg_cron when regression detection is enabled
+CREATE OR REPLACE FUNCTION flight_recorder.auto_detect_regressions()
+RETURNS INTEGER
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_min_duration INTERVAL;
+    v_regression RECORD;
+    v_active_regression RECORD;
+    v_current_regressions BIGINT[];
+    v_new_count INTEGER := 0;
+    v_resolved_count INTEGER := 0;
+    v_skipped_count INTEGER := 0;
+    v_correlation JSONB;
+BEGIN
+    -- Check if regression detection is enabled
+    v_enabled := COALESCE(
+        flight_recorder._get_config('regression_detection_enabled', 'false')::boolean,
+        false
+    );
+
+    IF NOT v_enabled THEN
+        RETURN 0;
+    END IF;
+
+    -- Get minimum duration before auto-resolution (anti-flapping)
+    v_min_duration := COALESCE(
+        (flight_recorder._get_config('regression_min_duration_minutes', '30') || ' minutes')::interval,
+        '30 minutes'::interval
+    );
+
+    -- Get current regression queryids for comparison
+    SELECT array_agg(queryid) INTO v_current_regressions
+    FROM flight_recorder.detect_regressions();
+
+    -- Auto-resolve active regressions that are no longer regressed (with minimum duration check)
+    FOR v_active_regression IN
+        SELECT qr.id, qr.queryid, qr.severity, qr.detected_at
+        FROM flight_recorder.query_regressions qr
+        WHERE qr.resolved_at IS NULL
+    LOOP
+        -- If this queryid is not in current regressions, consider auto-resolving
+        IF v_current_regressions IS NULL OR NOT (v_active_regression.queryid = ANY(v_current_regressions)) THEN
+            -- Check minimum duration (anti-flapping protection)
+            IF v_active_regression.detected_at <= now() - v_min_duration THEN
+                UPDATE flight_recorder.query_regressions
+                SET resolved_at = now(),
+                    resolution_notes = 'Auto-resolved: performance returned to normal'
+                WHERE id = v_active_regression.id;
+
+                v_resolved_count := v_resolved_count + 1;
+
+                -- Send notification
+                PERFORM flight_recorder._notify_regression(
+                    'resolved',
+                    v_active_regression.id,
+                    v_active_regression.queryid,
+                    v_active_regression.severity,
+                    p_resolution_notes := 'Auto-resolved: performance returned to normal'
+                );
+
+                RAISE NOTICE 'pg-flight-recorder: Regression auto-resolved for queryid % (performance normalized)',
+                    v_active_regression.queryid;
+            ELSE
+                v_skipped_count := v_skipped_count + 1;
+            END IF;
+        END IF;
+    END LOOP;
+
+    -- Compute correlation data once for all new regressions
+    v_correlation := flight_recorder._compute_storm_correlation();
+
+    -- Detect and insert new regressions (avoid duplicates for same queryid in last hour)
+    FOR v_regression IN SELECT * FROM flight_recorder.detect_regressions() LOOP
+        -- Only insert if no unresolved regression exists for this queryid
+        IF NOT EXISTS (
+            SELECT 1 FROM flight_recorder.query_regressions
+            WHERE query_regressions.queryid = v_regression.queryid
+              AND resolved_at IS NULL
+              AND detected_at > now() - interval '1 hour'
+        ) THEN
+            INSERT INTO flight_recorder.query_regressions (
+                queryid, query_fingerprint, severity,
+                baseline_avg_ms, current_avg_ms, change_pct,
+                probable_causes, correlation
+            ) VALUES (
+                v_regression.queryid, v_regression.query_fingerprint, v_regression.severity,
+                v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct,
+                v_regression.probable_causes, v_correlation
+            )
+            RETURNING id INTO v_active_regression;
+
+            v_new_count := v_new_count + 1;
+
+            -- Send notification
+            PERFORM flight_recorder._notify_regression(
+                'detected',
+                v_active_regression.id,
+                v_regression.queryid,
+                v_regression.severity,
+                v_regression.baseline_avg_ms,
+                v_regression.current_avg_ms,
+                v_regression.change_pct
+            );
+
+            RAISE NOTICE 'pg-flight-recorder: Regression detected - % for queryid % (%.2f ms -> %.2f ms, +%.1f%%)',
+                v_regression.severity, v_regression.queryid,
+                v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct;
+        END IF;
+    END LOOP;
+
+    IF v_new_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Detected % new performance regression(s)', v_new_count;
+    END IF;
+
+    IF v_resolved_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Auto-resolved % regression(s)', v_resolved_count;
+    END IF;
+
+    IF v_skipped_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: % regression(s) not yet eligible for auto-resolution (min duration: %)',
+            v_skipped_count, v_min_duration;
+    END IF;
+
+    RETURN v_new_count;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.auto_detect_regressions() IS 'Auto-detect performance regressions and log to query_regressions table. Auto-resolves regressions when performance normalizes, with anti-flapping protection. Sends pg_notify alerts when enabled. Called by pg_cron.';
+
+-- Returns current regression status for monitoring
+-- Shows active (unresolved) regressions and recent resolved regressions
+CREATE OR REPLACE FUNCTION flight_recorder.regression_status(
+    p_lookback INTERVAL DEFAULT '24 hours'
+)
+RETURNS TABLE(
+    regression_id BIGINT,
+    detected_at TIMESTAMPTZ,
+    queryid BIGINT,
+    query_fingerprint TEXT,
+    severity TEXT,
+    baseline_avg_ms NUMERIC,
+    current_avg_ms NUMERIC,
+    change_pct NUMERIC,
+    correlation JSONB,
+    status TEXT,
+    duration INTERVAL
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        qr.id AS regression_id,
+        qr.detected_at,
+        qr.queryid,
+        qr.query_fingerprint,
+        qr.severity,
+        qr.baseline_avg_ms,
+        qr.current_avg_ms,
+        qr.change_pct,
+        qr.correlation,
+        CASE
+            WHEN qr.resolved_at IS NULL THEN 'ACTIVE'
+            ELSE 'RESOLVED'
+        END AS status,
+        COALESCE(qr.resolved_at, now()) - qr.detected_at AS duration
+    FROM flight_recorder.query_regressions qr
+    WHERE qr.detected_at >= now() - p_lookback
+       OR qr.resolved_at IS NULL
+    ORDER BY
+        CASE WHEN qr.resolved_at IS NULL THEN 0 ELSE 1 END,
+        CASE qr.severity
+            WHEN 'CRITICAL' THEN 1
+            WHEN 'HIGH' THEN 2
+            WHEN 'MEDIUM' THEN 3
+            WHEN 'LOW' THEN 4
+            ELSE 5
+        END,
+        qr.detected_at DESC;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.regression_status(INTERVAL) IS 'Show current regression status including active and recently resolved regressions with severity and correlation data.';
+
+-- Enables regression detection and schedules periodic detection via pg_cron
+CREATE OR REPLACE FUNCTION flight_recorder.enable_regression_detection()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_interval INTEGER;
+    v_cron_expression TEXT;
+BEGIN
+    -- Enable regression detection feature
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('regression_detection_enabled', 'true', now())
+    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
+
+    -- Get configured interval
+    v_interval := COALESCE(
+        flight_recorder._get_config('regression_detection_interval_minutes', '60')::integer,
+        60
+    );
+
+    -- Build cron expression
+    v_cron_expression := format('*/%s * * * *', v_interval);
+
+    -- Schedule the regression detection job
+    BEGIN
+        PERFORM cron.unschedule('flight_recorder_regression')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_regression');
+
+        PERFORM cron.schedule('flight_recorder_regression', v_cron_expression, 'SELECT flight_recorder.auto_detect_regressions()');
+
+        RETURN format('Regression detection enabled. Scheduled to run every %s minutes. Use regression_status() to check results.', v_interval);
+    EXCEPTION
+        WHEN undefined_table THEN
+            RETURN 'pg_cron extension not found. Regression detection enabled but not scheduled. Run detect_regressions() manually.';
+        WHEN undefined_function THEN
+            RETURN 'pg_cron extension not found. Regression detection enabled but not scheduled. Run detect_regressions() manually.';
+    END;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.enable_regression_detection() IS 'Enable regression detection and schedule periodic detection via pg_cron.';
+
+-- Disables regression detection and unschedules the cron job
+CREATE OR REPLACE FUNCTION flight_recorder.disable_regression_detection()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- Disable regression detection feature
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('regression_detection_enabled', 'false', now())
+    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
+
+    -- Unschedule the regression detection job
+    BEGIN
+        PERFORM cron.unschedule('flight_recorder_regression')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_regression');
+
+        RETURN 'Regression detection disabled and unscheduled.';
+    EXCEPTION
+        WHEN undefined_table THEN
+            RETURN 'Regression detection disabled.';
+        WHEN undefined_function THEN
+            RETURN 'Regression detection disabled.';
+    END;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.disable_regression_detection() IS 'Disable regression detection and unschedule the cron job.';
+
+-- Resolves a single regression by ID, marking it as resolved with optional notes
+CREATE OR REPLACE FUNCTION flight_recorder.resolve_regression(
+    p_regression_id BIGINT,
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_regression RECORD;
+BEGIN
+    -- Check if regression exists
+    SELECT id, severity, queryid, resolved_at
+    INTO v_regression
+    FROM flight_recorder.query_regressions
+    WHERE id = p_regression_id;
+
+    IF NOT FOUND THEN
+        RETURN format('Regression %s not found', p_regression_id);
+    END IF;
+
+    IF v_regression.resolved_at IS NOT NULL THEN
+        RETURN format('Regression %s already resolved at %s', p_regression_id, v_regression.resolved_at);
+    END IF;
+
+    -- Mark as resolved
+    UPDATE flight_recorder.query_regressions
+    SET resolved_at = now(),
+        resolution_notes = p_notes
+    WHERE id = p_regression_id;
+
+    -- Send notification
+    PERFORM flight_recorder._notify_regression(
+        'resolved',
+        p_regression_id,
+        v_regression.queryid,
+        v_regression.severity,
+        p_resolution_notes := p_notes
+    );
+
+    RETURN format('Regression %s (queryid %s) resolved', p_regression_id, v_regression.queryid);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.resolve_regression(BIGINT, TEXT) IS 'Mark a regression as resolved with optional notes explaining the resolution.';
+
+-- Resolves all active regressions for a specific queryid
+CREATE OR REPLACE FUNCTION flight_recorder.resolve_regressions_by_queryid(
+    p_queryid BIGINT,
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    UPDATE flight_recorder.query_regressions
+    SET resolved_at = now(),
+        resolution_notes = p_notes
+    WHERE queryid = p_queryid
+      AND resolved_at IS NULL;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+
+    IF v_count = 0 THEN
+        RETURN format('No active regressions found for queryid %s', p_queryid);
+    END IF;
+
+    RETURN format('Resolved %s regression(s) for queryid %s', v_count, p_queryid);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.resolve_regressions_by_queryid(BIGINT, TEXT) IS 'Mark all active regressions for a queryid as resolved with optional notes.';
+
+-- Resolves all active regressions at once (bulk resolution)
+CREATE OR REPLACE FUNCTION flight_recorder.resolve_all_regressions(
+    p_notes TEXT DEFAULT 'Bulk resolution'
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count INTEGER;
+BEGIN
+    UPDATE flight_recorder.query_regressions
+    SET resolved_at = now(),
+        resolution_notes = p_notes
+    WHERE resolved_at IS NULL;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+
+    IF v_count = 0 THEN
+        RETURN 'No active regressions to resolve';
+    END IF;
+
+    RETURN format('Resolved %s regression(s)', v_count);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.resolve_all_regressions(TEXT) IS 'Mark all active regressions as resolved. Use for bulk resolution after incident review.';
+
+-- Reopens a previously resolved regression (in case of incorrect resolution)
+CREATE OR REPLACE FUNCTION flight_recorder.reopen_regression(
+    p_regression_id BIGINT
+)
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_regression RECORD;
+BEGIN
+    -- Check if regression exists
+    SELECT id, severity, queryid, resolved_at
+    INTO v_regression
+    FROM flight_recorder.query_regressions
+    WHERE id = p_regression_id;
+
+    IF NOT FOUND THEN
+        RETURN format('Regression %s not found', p_regression_id);
+    END IF;
+
+    IF v_regression.resolved_at IS NULL THEN
+        RETURN format('Regression %s is already active (not resolved)', p_regression_id);
+    END IF;
+
+    -- Reopen the regression
+    UPDATE flight_recorder.query_regressions
+    SET resolved_at = NULL,
+        resolution_notes = NULL
+    WHERE id = p_regression_id;
+
+    RETURN format('Regression %s (queryid %s) reopened', p_regression_id, v_regression.queryid);
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.reopen_regression(BIGINT) IS 'Reopen a previously resolved regression if it was resolved incorrectly.';
 
 -- Configure autovacuum on ring buffer tables
 -- Ring buffers use pre-allocated rows with UPDATE-only pattern, achieving high HOT update ratios.
@@ -8993,6 +9683,123 @@ CROSS JOIN storm_prone_queries sq
 CROSS JOIN oldest_active o;
 COMMENT ON VIEW flight_recorder.storm_dashboard IS
 'At-a-glance query storm monitoring dashboard. Shows active storms by type and severity, resolution metrics, storm-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
+
+-- Regression detection dashboard view
+-- Provides at-a-glance summary of performance regression status
+CREATE OR REPLACE VIEW flight_recorder.regression_dashboard AS
+WITH
+regression_config AS (
+    SELECT
+        COALESCE(
+            (SELECT value::boolean FROM flight_recorder.config WHERE key = 'regression_detection_enabled'),
+            false
+        ) AS detection_enabled
+),
+active_regressions AS (
+    SELECT
+        count(*) AS active_count,
+        count(*) FILTER (WHERE severity = 'LOW') AS low_severity,
+        count(*) FILTER (WHERE severity = 'MEDIUM') AS medium_severity,
+        count(*) FILTER (WHERE severity = 'HIGH') AS high_severity,
+        count(*) FILTER (WHERE severity = 'CRITICAL') AS critical_severity
+    FROM flight_recorder.query_regressions
+    WHERE resolved_at IS NULL
+),
+recent_regressions AS (
+    SELECT
+        count(*) AS total_24h,
+        count(*) FILTER (WHERE resolved_at IS NOT NULL) AS resolved_24h
+    FROM flight_recorder.query_regressions
+    WHERE detected_at >= now() - interval '24 hours'
+),
+resolution_stats AS (
+    SELECT
+        count(*) AS total_resolved,
+        EXTRACT(EPOCH FROM avg(resolved_at - detected_at)) / 60 AS avg_resolution_minutes,
+        EXTRACT(EPOCH FROM min(resolved_at - detected_at)) / 60 AS min_resolution_minutes,
+        EXTRACT(EPOCH FROM max(resolved_at - detected_at)) / 60 AS max_resolution_minutes
+    FROM flight_recorder.query_regressions
+    WHERE resolved_at IS NOT NULL
+      AND detected_at >= now() - interval '7 days'
+),
+regression_prone_queries AS (
+    SELECT
+        array_agg(
+            json_build_object(
+                'queryid', queryid,
+                'fingerprint', left(query_fingerprint, 50),
+                'regression_count', regression_count,
+                'max_change_pct', max_change_pct
+            )
+            ORDER BY regression_count DESC, max_change_pct DESC
+        ) FILTER (WHERE rn <= 5) AS top_queries
+    FROM (
+        SELECT
+            queryid,
+            query_fingerprint,
+            count(*) AS regression_count,
+            max(change_pct) AS max_change_pct,
+            row_number() OVER (ORDER BY count(*) DESC, max(change_pct) DESC) AS rn
+        FROM flight_recorder.query_regressions
+        WHERE detected_at >= now() - interval '7 days'
+        GROUP BY queryid, query_fingerprint
+    ) ranked
+),
+oldest_active AS (
+    SELECT
+        min(detected_at) AS oldest_regression_at,
+        EXTRACT(EPOCH FROM (now() - min(detected_at))) / 3600 AS oldest_regression_hours
+    FROM flight_recorder.query_regressions
+    WHERE resolved_at IS NULL
+)
+SELECT
+    cfg.detection_enabled,
+    a.active_count,
+    a.low_severity AS active_low_severity,
+    a.medium_severity AS active_medium_severity,
+    a.high_severity AS active_high_severity,
+    a.critical_severity AS active_critical_severity,
+    r.total_24h AS regressions_last_24h,
+    r.resolved_24h AS resolved_last_24h,
+    CASE
+        WHEN r.total_24h > 0
+        THEN round((r.resolved_24h::numeric / r.total_24h) * 100, 1)
+        ELSE NULL
+    END AS resolution_rate_pct,
+    round(rs.avg_resolution_minutes::numeric, 1) AS avg_resolution_minutes,
+    round(rs.min_resolution_minutes::numeric, 1) AS min_resolution_minutes,
+    round(rs.max_resolution_minutes::numeric, 1) AS max_resolution_minutes,
+    o.oldest_regression_at,
+    round(o.oldest_regression_hours::numeric, 1) AS oldest_regression_hours,
+    rq.top_queries AS regression_prone_queries,
+    CASE
+        WHEN NOT cfg.detection_enabled THEN 'disabled'
+        WHEN a.active_count = 0 THEN 'healthy'
+        WHEN a.critical_severity > 0 THEN 'critical'
+        WHEN a.high_severity > 0 OR a.active_count >= 5 THEN 'warning'
+        WHEN a.medium_severity > 0 OR a.active_count >= 2 THEN 'attention'
+        ELSE 'healthy'
+    END AS overall_status,
+    CASE
+        WHEN NOT cfg.detection_enabled THEN
+            'Regression detection is disabled. Use enable_regression_detection() to enable.'
+        WHEN a.active_count = 0 THEN
+            'No active regressions. Query performance is stable.'
+        WHEN a.critical_severity > 0 THEN
+            format('CRITICAL: %s critical severity regression(s). Immediate investigation required.', a.critical_severity)
+        WHEN a.high_severity > 0 THEN
+            format('WARNING: %s high severity regression(s). Review with regression_status() for details.', a.high_severity)
+        ELSE
+            format('%s active regression(s). Review with regression_status() and resolve with resolve_regression().', a.active_count)
+    END AS recommendation
+FROM regression_config cfg
+CROSS JOIN active_regressions a
+CROSS JOIN recent_regressions r
+CROSS JOIN resolution_stats rs
+CROSS JOIN regression_prone_queries rq
+CROSS JOIN oldest_active o;
+COMMENT ON VIEW flight_recorder.regression_dashboard IS
+'At-a-glance performance regression monitoring dashboard. Shows active regressions by severity, resolution metrics, regression-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
 
 
 -- =============================================================================
