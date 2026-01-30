@@ -21,14 +21,14 @@ This document captures creative ideas for enhancing flight_recorder beyond basic
 
 ## Table of Contents
 
-1. [Performance Forecasting / Predictive Alerts](#1-performance-forecasting--predictive-alerts) ✅ **DONE**
-2. [Query Fingerprinting & Storm Detection](#2-query-fingerprinting--storm-detection) ✅ **DONE**
+1. [Performance Forecasting / Predictive Alerts](#1-performance-forecasting--predictive-alerts--implemented) ✅ **DONE**
+2. [Query Fingerprinting & Storm Detection](#2-query-fingerprinting--storm-detection--implemented) ✅ **DONE**
 3. [Time-Travel Debugging](#3-time-travel-debugging-with-second-level-precision) ✅ **DONE**
-4. [Blast Radius Analysis](#4-blast-radius-analysis) ✅ **DONE**
-5. [Continuous Benchmarking / Canary Queries](#5-continuous-benchmarking--canary-queries) ✅ **DONE**
+4. [Blast Radius Analysis](#4-blast-radius-analysis--implemented) ✅ **DONE**
+5. [Continuous Benchmarking / Canary Queries](#5-continuous-benchmarking--canary-queries--implemented) ✅ **DONE**
 6. [Fleet-Wide Analysis](#6-fleet-wide-analysis--is-this-normal)
 7. [Automatic Regression Detection](#7-automatic-performance-regression-detection) ✅ **DONE**
-8. [Visual Performance Timeline](#8-visual-performance-timeline-ascii-art) ✅ **DONE**
+8. [Visual Performance Timeline](#8-visual-performance-timeline-ascii-art--implemented) ✅ **DONE**
 
 ---
 
