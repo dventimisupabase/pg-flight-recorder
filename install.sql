@@ -491,6 +491,39 @@ CREATE INDEX IF NOT EXISTS db_role_config_snapshots_param_idx
 COMMENT ON TABLE flight_recorder.db_role_config_snapshots IS 'Database and role-level configuration overrides (ALTER DATABASE/ROLE SET) for change tracking';
 
 
+-- Canary query definitions for synthetic performance monitoring
+-- Pre-defined queries run periodically to detect silent performance degradation
+CREATE TABLE IF NOT EXISTS flight_recorder.canaries (
+    id                  SERIAL PRIMARY KEY,
+    name                TEXT NOT NULL UNIQUE,
+    description         TEXT,
+    query_text          TEXT NOT NULL,
+    expected_time_ms    NUMERIC,
+    threshold_warning   NUMERIC DEFAULT 1.5,
+    threshold_critical  NUMERIC DEFAULT 2.0,
+    enabled             BOOLEAN DEFAULT true,
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+COMMENT ON TABLE flight_recorder.canaries IS 'Canary query definitions for synthetic performance monitoring. Pre-defined queries detect silent degradation.';
+
+-- Canary query execution results
+-- Stores timing and optional EXPLAIN output for baseline comparison
+CREATE TABLE IF NOT EXISTS flight_recorder.canary_results (
+    id              BIGSERIAL PRIMARY KEY,
+    canary_id       INTEGER REFERENCES flight_recorder.canaries(id) ON DELETE CASCADE,
+    executed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    duration_ms     NUMERIC NOT NULL,
+    plan            JSONB,
+    error_message   TEXT,
+    success         BOOLEAN DEFAULT true
+);
+CREATE INDEX IF NOT EXISTS canary_results_canary_id_executed_at_idx
+    ON flight_recorder.canary_results(canary_id, executed_at);
+CREATE INDEX IF NOT EXISTS canary_results_executed_at_idx
+    ON flight_recorder.canary_results(executed_at);
+COMMENT ON TABLE flight_recorder.canary_results IS 'Canary query execution results for performance baseline comparison';
+
+
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
 CREATE OR REPLACE FUNCTION flight_recorder._pretty_bytes(bytes BIGINT)
 RETURNS TEXT
@@ -521,7 +554,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.7'),
+    ('schema_version', '2.9'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -595,7 +628,11 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('index_stats_enabled', 'true'),
     ('config_snapshots_enabled', 'true'),
     ('db_role_config_snapshots_enabled', 'true'),
-    ('ring_buffer_slots', '120')
+    ('ring_buffer_slots', '120'),
+    ('canary_enabled', 'false'),
+    ('canary_interval_minutes', '15'),
+    ('canary_capture_plans', 'false'),
+    ('retention_canary_days', '7')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -2124,19 +2161,21 @@ COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'Raw archives: Arc
 
 
 -- Removes aged aggregate and archived sample data based on configured retention periods
--- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, and all *_samples_archive tables
+-- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, canary_results, and all *_samples_archive tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
 RETURNS VOID
 LANGUAGE plpgsql AS $$
 DECLARE
     v_aggregate_retention interval;
     v_archive_retention interval;
+    v_canary_retention interval;
     v_deleted_waits INTEGER;
     v_deleted_locks INTEGER;
     v_deleted_queries INTEGER;
     v_deleted_activity_archive INTEGER;
     v_deleted_lock_archive INTEGER;
     v_deleted_wait_archive INTEGER;
+    v_deleted_canary INTEGER;
 BEGIN
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
@@ -2144,6 +2183,10 @@ BEGIN
     );
     v_archive_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'archive_retention_days')::interval,
+        '7 days'::interval
+    );
+    v_canary_retention := COALESCE(
+        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_canary_days')::interval,
         '7 days'::interval
     );
     DELETE FROM flight_recorder.wait_event_aggregates
@@ -2164,14 +2207,18 @@ BEGIN
     DELETE FROM flight_recorder.wait_samples_archive
     WHERE captured_at < now() - v_archive_retention;
     GET DIAGNOSTICS v_deleted_wait_archive = ROW_COUNT;
+    DELETE FROM flight_recorder.canary_results
+    WHERE executed_at < now() - v_canary_retention;
+    GET DIAGNOSTICS v_deleted_canary = ROW_COUNT;
     IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 OR
-       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives',
-            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive;
+       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 OR
+       v_deleted_canary > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives, % canary results',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive, v_deleted_canary;
     END IF;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate and archive data based on retention period';
+COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate, archive, and canary data based on retention periods';
 
 
 -- Collects table-level statistics from pg_stat_user_tables
@@ -5590,8 +5637,14 @@ BEGIN
         PERFORM cron.unschedule('flight_recorder_archive')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_archive');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
+        PERFORM cron.unschedule('flight_recorder_canary')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
+        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('enabled', 'false', now())
+        ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
+        INSERT INTO flight_recorder.config (key, value, updated_at)
+        VALUES ('canary_enabled', 'false', now())
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
         RETURN format('Flight Recorder collection stopped. Unscheduled %s cron jobs. Use flight_recorder.enable() to restart.', v_unscheduled);
     EXCEPTION
@@ -5602,6 +5655,249 @@ BEGIN
     END;
 END;
 $$;
+
+-- Executes all enabled canary queries and records timing results
+-- Optionally captures EXPLAIN output based on canary_capture_plans config
+CREATE OR REPLACE FUNCTION flight_recorder.run_canaries()
+RETURNS TABLE(
+    canary_name TEXT,
+    duration_ms NUMERIC,
+    success BOOLEAN,
+    error_message TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_capture_plans BOOLEAN;
+    v_canary RECORD;
+    v_start_time TIMESTAMPTZ;
+    v_duration_ms NUMERIC;
+    v_plan JSONB;
+    v_error TEXT;
+    v_success BOOLEAN;
+BEGIN
+    v_enabled := COALESCE(
+        flight_recorder._get_config('canary_enabled', 'false')::boolean,
+        false
+    );
+
+    IF NOT v_enabled THEN
+        RETURN;
+    END IF;
+
+    v_capture_plans := COALESCE(
+        flight_recorder._get_config('canary_capture_plans', 'false')::boolean,
+        false
+    );
+
+    FOR v_canary IN
+        SELECT c.id, c.name, c.query_text
+        FROM flight_recorder.canaries c
+        WHERE c.enabled = true
+        ORDER BY c.id
+    LOOP
+        v_start_time := clock_timestamp();
+        v_plan := NULL;
+        v_error := NULL;
+        v_success := true;
+
+        BEGIN
+            -- Capture plan if enabled
+            IF v_capture_plans THEN
+                EXECUTE format('EXPLAIN (FORMAT JSON) %s', v_canary.query_text) INTO v_plan;
+            END IF;
+
+            -- Execute the canary query
+            EXECUTE v_canary.query_text;
+
+            v_duration_ms := EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) * 1000;
+
+        EXCEPTION WHEN OTHERS THEN
+            v_duration_ms := EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) * 1000;
+            v_error := SQLERRM;
+            v_success := false;
+        END;
+
+        -- Record the result
+        INSERT INTO flight_recorder.canary_results (canary_id, executed_at, duration_ms, plan, error_message, success)
+        VALUES (v_canary.id, v_start_time, v_duration_ms, v_plan, v_error, v_success);
+
+        -- Return the result
+        canary_name := v_canary.name;
+        duration_ms := v_duration_ms;
+        success := v_success;
+        error_message := v_error;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.run_canaries() IS 'Execute all enabled canary queries and record results. Returns execution summary.';
+
+-- Returns canary status by comparing current performance to baseline
+-- Baseline: p50 over last 7 days (excluding last day)
+-- Current: p50 over last hour
+-- Status: OK, DEGRADED (50% slower), CRITICAL (100% slower)
+CREATE OR REPLACE FUNCTION flight_recorder.canary_status()
+RETURNS TABLE(
+    canary_name TEXT,
+    description TEXT,
+    baseline_ms NUMERIC,
+    current_ms NUMERIC,
+    change_pct NUMERIC,
+    status TEXT,
+    last_executed TIMESTAMPTZ,
+    last_error TEXT
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_canary RECORD;
+    v_baseline NUMERIC;
+    v_current NUMERIC;
+    v_change_pct NUMERIC;
+    v_status TEXT;
+    v_last_executed TIMESTAMPTZ;
+    v_last_error TEXT;
+    v_threshold_warning NUMERIC;
+    v_threshold_critical NUMERIC;
+BEGIN
+    FOR v_canary IN
+        SELECT c.id, c.name, c.description, c.threshold_warning, c.threshold_critical
+        FROM flight_recorder.canaries c
+        WHERE c.enabled = true
+        ORDER BY c.id
+    LOOP
+        -- Calculate baseline: p50 over last 7 days excluding last day
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.duration_ms)
+        INTO v_baseline
+        FROM flight_recorder.canary_results cr
+        WHERE cr.canary_id = v_canary.id
+          AND cr.success = true
+          AND cr.executed_at >= now() - interval '7 days'
+          AND cr.executed_at < now() - interval '1 day';
+
+        -- Calculate current: p50 over last hour
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.duration_ms)
+        INTO v_current
+        FROM flight_recorder.canary_results cr
+        WHERE cr.canary_id = v_canary.id
+          AND cr.success = true
+          AND cr.executed_at >= now() - interval '1 hour';
+
+        -- Get last execution info
+        SELECT cr.executed_at, cr.error_message
+        INTO v_last_executed, v_last_error
+        FROM flight_recorder.canary_results cr
+        WHERE cr.canary_id = v_canary.id
+        ORDER BY cr.executed_at DESC
+        LIMIT 1;
+
+        -- Calculate change percentage and status
+        IF v_baseline IS NOT NULL AND v_current IS NOT NULL AND v_baseline > 0 THEN
+            v_change_pct := ROUND(((v_current - v_baseline) / v_baseline) * 100, 1);
+
+            v_threshold_warning := COALESCE(v_canary.threshold_warning, 1.5);
+            v_threshold_critical := COALESCE(v_canary.threshold_critical, 2.0);
+
+            IF v_current >= v_baseline * v_threshold_critical THEN
+                v_status := 'CRITICAL';
+            ELSIF v_current >= v_baseline * v_threshold_warning THEN
+                v_status := 'DEGRADED';
+            ELSE
+                v_status := 'OK';
+            END IF;
+        ELSE
+            v_change_pct := NULL;
+            v_status := 'INSUFFICIENT_DATA';
+        END IF;
+
+        -- Return the result
+        canary_name := v_canary.name;
+        description := v_canary.description;
+        baseline_ms := ROUND(v_baseline, 2);
+        current_ms := ROUND(v_current, 2);
+        change_pct := v_change_pct;
+        status := v_status;
+        last_executed := v_last_executed;
+        last_error := v_last_error;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.canary_status() IS 'Returns canary status comparing current performance (last hour p50) to baseline (last 7 days p50, excluding last day). Status: OK, DEGRADED (50%+ slower), CRITICAL (100%+ slower).';
+
+-- Enables canary monitoring and schedules periodic execution via pg_cron
+CREATE OR REPLACE FUNCTION flight_recorder.enable_canaries()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_interval INTEGER;
+    v_cron_expression TEXT;
+BEGIN
+    -- Enable canary feature
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('canary_enabled', 'true', now())
+    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
+
+    -- Get configured interval
+    v_interval := COALESCE(
+        flight_recorder._get_config('canary_interval_minutes', '15')::integer,
+        15
+    );
+
+    -- Build cron expression
+    v_cron_expression := format('*/%s * * * *', v_interval);
+
+    -- Schedule the canary job
+    BEGIN
+        PERFORM cron.unschedule('flight_recorder_canary')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
+
+        PERFORM cron.schedule('flight_recorder_canary', v_cron_expression, 'SELECT * FROM flight_recorder.run_canaries()');
+
+        RETURN format('Canary monitoring enabled. Scheduled to run every %s minutes. Use canary_status() to check results.', v_interval);
+    EXCEPTION
+        WHEN undefined_table THEN
+            RETURN 'pg_cron extension not found. Canary feature enabled but not scheduled. Run run_canaries() manually.';
+        WHEN undefined_function THEN
+            RETURN 'pg_cron extension not found. Canary feature enabled but not scheduled. Run run_canaries() manually.';
+    END;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.enable_canaries() IS 'Enable canary monitoring and schedule periodic execution via pg_cron.';
+
+-- Disables canary monitoring and unschedules the cron job
+CREATE OR REPLACE FUNCTION flight_recorder.disable_canaries()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- Disable canary feature
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('canary_enabled', 'false', now())
+    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
+
+    -- Unschedule the canary job
+    BEGIN
+        PERFORM cron.unschedule('flight_recorder_canary')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
+
+        RETURN 'Canary monitoring disabled and unscheduled.';
+    EXCEPTION
+        WHEN undefined_table THEN
+            RETURN 'Canary monitoring disabled.';
+        WHEN undefined_function THEN
+            RETURN 'Canary monitoring disabled.';
+    END;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.disable_canaries() IS 'Disable canary monitoring and unschedule the cron job.';
+
+-- Insert pre-defined canary queries that use only system catalogs
+INSERT INTO flight_recorder.canaries (name, description, query_text) VALUES
+    ('index_lookup', 'B-tree index lookup on pg_class', 'SELECT oid FROM pg_class WHERE relname = ''pg_class'' LIMIT 1'),
+    ('small_agg', 'Count aggregation on pg_stat_activity', 'SELECT count(*) FROM pg_stat_activity'),
+    ('seq_scan_baseline', 'Sequential scan count on pg_namespace', 'SELECT count(*) FROM pg_namespace'),
+    ('simple_join', 'Join pg_namespace to pg_class', 'SELECT count(*) FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE n.nspname = ''pg_catalog''')
+ON CONFLICT (name) DO NOTHING;
 
 -- Configure autovacuum on ring buffer tables
 -- Ring buffers use pre-allocated rows with UPDATE-only pattern, achieving high HOT update ratios.
@@ -6697,6 +6993,34 @@ BEGIN
                 COALESCE(v_row.change_type, '-') || ' |' || E'\n';
         END LOOP;
         v_result := v_result || E'\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Canary Status Section
+    -- ==========================================================================
+    v_result := v_result || '## Canary Queries' || E'\n\n';
+
+    -- Check if canaries are enabled
+    IF COALESCE(flight_recorder._get_config('canary_enabled', 'false')::boolean, false) THEN
+        SELECT count(*) INTO v_count FROM flight_recorder.canary_status();
+        IF v_count = 0 THEN
+            v_result := v_result || '(no canary data available)' || E'\n\n';
+        ELSE
+            v_result := v_result || '| Canary | Baseline (ms) | Current (ms) | Change | Status | Last Run |' || E'\n';
+            v_result := v_result || '|--------|---------------|--------------|--------|--------|----------|' || E'\n';
+            FOR v_row IN SELECT * FROM flight_recorder.canary_status() LOOP
+                v_result := v_result || '| ' ||
+                    COALESCE(v_row.canary_name, '-') || ' | ' ||
+                    COALESCE(v_row.baseline_ms::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.current_ms::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.change_pct::TEXT || '%', '-') || ' | ' ||
+                    COALESCE(v_row.status, '-') || ' | ' ||
+                    COALESCE(to_char(v_row.last_executed, 'YYYY-MM-DD HH24:MI:SS'), '-') || ' |' || E'\n';
+            END LOOP;
+            v_result := v_result || E'\n';
+        END IF;
+    ELSE
+        v_result := v_result || '(canary monitoring not enabled - use enable_canaries() to enable)' || E'\n\n';
     END IF;
 
     RETURN v_result;
