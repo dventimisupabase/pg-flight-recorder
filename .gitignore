@@ -1,4 +1,8 @@
-
+# GNU Global tag database (generated in CI)
+GPATH
+GRTAGS
+GTAGS
+HTML/
 
 # HubSpot config file
 hubspot.config.yml

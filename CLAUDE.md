@@ -38,6 +38,20 @@ The `./tools/gg` script wraps GNU Global for code navigation:
 
 If multiple definitions exist (common with PostgreSQL function overloading), show all candidates and use `ctx` to disambiguate.
 
+### CI/CD Integration
+
+A GitHub Actions workflow (`.github/workflows/gtags.yml`) regenerates the GTAGS database and HTML on every push to main:
+
+- **HTML Code Browser**: Deployed to GitHub Pages (see repo Settings > Pages for URL)
+- **GTAGS Artifact**: Downloadable from the workflow run for local use
+
+To generate locally (requires `global` and `universal-ctags`):
+
+```bash
+GTAGSLABEL=new-ctags gtags
+htags --suggest --frame --symbol --line-number --other
+```
+
 ## Markdown Formatting
 
 When writing or editing markdown files, follow these rules to pass linting:

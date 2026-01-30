@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   gg def <symbol>          # list definitions
+#   gg ref <symbol>          # list references
+#   gg path <symbol>         # list paths containing symbol
+#   gg grep <pattern>        # literal/regex search over tags DB
+#   gg ctx <file>:<line>     # show context around a location
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  def)  global -x -- "$1" ;;
+  ref)  global -rx -- "$1" ;;
+  path) global -P -- "$1" ;;
+  grep) global -g -- "$1" ;;
+  ctx)
+    loc="$1"
+    file="${loc%:*}"
+    line="${loc##*:}"
+    start=$(( line>20 ? line-20 : 1 ))
+    end=$(( line+20 ))
+    nl -ba "$file" | sed -n "${start},${end}p"
+    ;;
+  *) echo "Usage: gg {def|ref|path|grep|ctx} ..." >&2; exit 2 ;;
+esac

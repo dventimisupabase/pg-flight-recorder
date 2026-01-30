@@ -1,0 +1,82 @@
+name: Generate Code Tags
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Allow only one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build GTAGS and HTML
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install GNU Global and Universal CTags
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y global universal-ctags
+
+      - name: Verify installation
+        run: |
+          echo "GNU Global version:"
+          global --version
+          echo ""
+          echo "Universal CTags version:"
+          ctags --version | head -3
+
+      - name: Generate GTAGS database
+        run: |
+          # Use Universal CTags backend for better SQL support
+          GTAGSLABEL=new-ctags gtags --verbose
+          echo ""
+          echo "Generated files:"
+          ls -lh GPATH GRTAGS GTAGS
+
+      - name: Generate HTML with htags
+        run: |
+          htags --suggest --frame --symbol --line-number --other --title "pg-flight-recorder Code Browser"
+          echo ""
+          echo "HTML output:"
+          ls -lh HTML/
+
+      - name: Upload GTAGS as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtags-database
+          path: |
+            GPATH
+            GRTAGS
+            GTAGS
+          retention-days: 30
+
+      - name: Upload HTML for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: HTML/
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+
+    # Grant GITHUB_TOKEN permissions for Pages deployment
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
