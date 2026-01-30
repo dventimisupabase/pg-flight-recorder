@@ -8,6 +8,21 @@ set -euo pipefail
 #   gg grep <pattern>        # literal/regex search over tags DB
 #   gg ctx <file>:<line>     # show context around a location
 
+# Change to repo root
+cd "$(git rev-parse --show-toplevel)"
+
+# Auto-fetch GTAGS if missing
+if [[ ! -f GTAGS ]]; then
+    echo "GTAGS not found. Fetching from origin/gtags..." >&2
+    git fetch origin gtags --depth=1 2>/dev/null || {
+        echo "Error: Could not fetch gtags branch" >&2
+        echo "Run: ./tools/setup-gtags --docker" >&2
+        exit 1
+    }
+    git checkout origin/gtags -- GPATH GRTAGS GTAGS
+    echo "Done. GTAGS database ready." >&2
+fi
+
 cmd="${1:-}"; shift || true
 
 case "$cmd" in

@@ -15,6 +15,9 @@ jobs:
     name: Build GTAGS and HTML
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -55,6 +58,20 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: HTML/
+
+      - name: Push GTAGS to gtags branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create orphan branch with just GTAGS files
+          git checkout --orphan gtags-temp
+          git reset
+          git add -f GPATH GRTAGS GTAGS
+          git commit -m "Update GTAGS database"
+
+          # Force push to gtags branch
+          git push origin gtags-temp:gtags --force
 
   deploy:
     name: Deploy to GitHub Pages
