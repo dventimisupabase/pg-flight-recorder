@@ -523,6 +523,28 @@ CREATE INDEX IF NOT EXISTS canary_results_executed_at_idx
     ON flight_recorder.canary_results(executed_at);
 COMMENT ON TABLE flight_recorder.canary_results IS 'Canary query execution results for performance baseline comparison';
 
+-- Query storm detection results
+-- Stores detected query storms with classification and resolution tracking
+CREATE TABLE IF NOT EXISTS flight_recorder.query_storms (
+    id                  BIGSERIAL PRIMARY KEY,
+    detected_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    queryid             BIGINT NOT NULL,
+    query_fingerprint   TEXT NOT NULL,
+    storm_type          TEXT NOT NULL,  -- RETRY_STORM, CACHE_MISS, SPIKE, NORMAL
+    recent_count        BIGINT NOT NULL,
+    baseline_count      BIGINT NOT NULL,
+    multiplier          NUMERIC,
+    resolved_at         TIMESTAMPTZ,
+    resolution_notes    TEXT
+);
+CREATE INDEX IF NOT EXISTS query_storms_detected_at_idx
+    ON flight_recorder.query_storms(detected_at);
+CREATE INDEX IF NOT EXISTS query_storms_queryid_idx
+    ON flight_recorder.query_storms(queryid);
+CREATE INDEX IF NOT EXISTS query_storms_storm_type_idx
+    ON flight_recorder.query_storms(storm_type) WHERE resolved_at IS NULL;
+COMMENT ON TABLE flight_recorder.query_storms IS 'Query storm detection results. Tracks query execution spikes classified as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
+
 
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
 CREATE OR REPLACE FUNCTION flight_recorder._pretty_bytes(bytes BIGINT)
@@ -554,7 +576,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.9'),
+    ('schema_version', '2.10'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -632,7 +654,13 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('canary_enabled', 'false'),
     ('canary_interval_minutes', '15'),
     ('canary_capture_plans', 'false'),
-    ('retention_canary_days', '7')
+    ('retention_canary_days', '7'),
+    ('storm_detection_enabled', 'false'),
+    ('storm_threshold_multiplier', '3.0'),
+    ('storm_lookback_interval', '1 hour'),
+    ('storm_baseline_days', '7'),
+    ('storm_detection_interval_minutes', '15'),
+    ('retention_storms_days', '30')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -2161,7 +2189,7 @@ COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'Raw archives: Arc
 
 
 -- Removes aged aggregate and archived sample data based on configured retention periods
--- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, canary_results, and all *_samples_archive tables
+-- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, canary_results, query_storms, and all *_samples_archive tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
 RETURNS VOID
 LANGUAGE plpgsql AS $$
@@ -2169,6 +2197,7 @@ DECLARE
     v_aggregate_retention interval;
     v_archive_retention interval;
     v_canary_retention interval;
+    v_storm_retention interval;
     v_deleted_waits INTEGER;
     v_deleted_locks INTEGER;
     v_deleted_queries INTEGER;
@@ -2176,6 +2205,7 @@ DECLARE
     v_deleted_lock_archive INTEGER;
     v_deleted_wait_archive INTEGER;
     v_deleted_canary INTEGER;
+    v_deleted_storms INTEGER;
 BEGIN
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
@@ -2188,6 +2218,10 @@ BEGIN
     v_canary_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_canary_days')::interval,
         '7 days'::interval
+    );
+    v_storm_retention := COALESCE(
+        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_storms_days')::interval,
+        '30 days'::interval
     );
     DELETE FROM flight_recorder.wait_event_aggregates
     WHERE start_time < now() - v_aggregate_retention;
@@ -2210,15 +2244,18 @@ BEGIN
     DELETE FROM flight_recorder.canary_results
     WHERE executed_at < now() - v_canary_retention;
     GET DIAGNOSTICS v_deleted_canary = ROW_COUNT;
+    DELETE FROM flight_recorder.query_storms
+    WHERE detected_at < now() - v_storm_retention;
+    GET DIAGNOSTICS v_deleted_storms = ROW_COUNT;
     IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 OR
        v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 OR
-       v_deleted_canary > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives, % canary results',
-            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive, v_deleted_canary;
+       v_deleted_canary > 0 OR v_deleted_storms > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives, % canary results, % storms',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive, v_deleted_canary, v_deleted_storms;
     END IF;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate, archive, and canary data based on retention periods';
+COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate, archive, canary, and storm data based on retention periods';
 
 
 -- Collects table-level statistics from pg_stat_user_tables
@@ -5640,11 +5677,17 @@ BEGIN
         PERFORM cron.unschedule('flight_recorder_canary')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
+        PERFORM cron.unschedule('flight_recorder_storm')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
+        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('enabled', 'false', now())
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('canary_enabled', 'false', now())
+        ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
+        INSERT INTO flight_recorder.config (key, value, updated_at)
+        VALUES ('storm_detection_enabled', 'false', now())
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
         RETURN format('Flight Recorder collection stopped. Unscheduled %s cron jobs. Use flight_recorder.enable() to restart.', v_unscheduled);
     EXCEPTION
@@ -5898,6 +5941,260 @@ INSERT INTO flight_recorder.canaries (name, description, query_text) VALUES
     ('seq_scan_baseline', 'Sequential scan count on pg_namespace', 'SELECT count(*) FROM pg_namespace'),
     ('simple_join', 'Join pg_namespace to pg_class', 'SELECT count(*) FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE n.nspname = ''pg_catalog''')
 ON CONFLICT (name) DO NOTHING;
+
+-- Detects query storms by comparing recent query execution counts to baseline
+-- Returns queries with execution spikes classified by type
+CREATE OR REPLACE FUNCTION flight_recorder.detect_query_storms(
+    p_lookback INTERVAL DEFAULT NULL,
+    p_threshold_multiplier NUMERIC DEFAULT NULL
+)
+RETURNS TABLE(
+    queryid BIGINT,
+    query_fingerprint TEXT,
+    storm_type TEXT,
+    recent_count BIGINT,
+    baseline_count BIGINT,
+    multiplier NUMERIC
+)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_lookback INTERVAL;
+    v_threshold NUMERIC;
+    v_baseline_days INTEGER;
+BEGIN
+    -- Get configuration with defaults
+    v_lookback := COALESCE(
+        p_lookback,
+        flight_recorder._get_config('storm_lookback_interval', '1 hour')::interval
+    );
+    v_threshold := COALESCE(
+        p_threshold_multiplier,
+        flight_recorder._get_config('storm_threshold_multiplier', '3.0')::numeric
+    );
+    v_baseline_days := COALESCE(
+        flight_recorder._get_config('storm_baseline_days', '7')::integer,
+        7
+    );
+
+    RETURN QUERY
+    WITH recent_stats AS (
+        -- Recent query counts from statement_snapshots
+        SELECT
+            ss.queryid,
+            left(ss.query_preview, 100) AS query_preview,
+            SUM(ss.calls) AS total_calls
+        FROM flight_recorder.statement_snapshots ss
+        JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+        WHERE s.captured_at >= now() - v_lookback
+        GROUP BY ss.queryid, left(ss.query_preview, 100)
+    ),
+    baseline_stats AS (
+        -- Baseline query counts (same hour of day over baseline period, excluding recent)
+        SELECT
+            ss.queryid,
+            AVG(ss.calls) AS avg_calls,
+            COUNT(DISTINCT date_trunc('day', s.captured_at)) AS days_sampled
+        FROM flight_recorder.statement_snapshots ss
+        JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
+        WHERE s.captured_at >= now() - (v_baseline_days || ' days')::interval
+          AND s.captured_at < now() - v_lookback
+        GROUP BY ss.queryid
+        HAVING COUNT(DISTINCT date_trunc('day', s.captured_at)) >= 2  -- Need at least 2 days of baseline
+    )
+    SELECT
+        r.queryid,
+        r.query_preview AS query_fingerprint,
+        CASE
+            WHEN r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%'
+                THEN 'RETRY_STORM'
+            WHEN r.total_calls > COALESCE(b.avg_calls, 0) * 10
+                THEN 'CACHE_MISS'
+            WHEN r.total_calls > COALESCE(b.avg_calls, 1) * v_threshold
+                THEN 'SPIKE'
+            ELSE 'NORMAL'
+        END AS storm_type,
+        r.total_calls::BIGINT AS recent_count,
+        COALESCE(b.avg_calls, 0)::BIGINT AS baseline_count,
+        CASE
+            WHEN COALESCE(b.avg_calls, 0) > 0
+            THEN ROUND(r.total_calls::numeric / b.avg_calls, 2)
+            ELSE NULL
+        END AS multiplier
+    FROM recent_stats r
+    LEFT JOIN baseline_stats b ON b.queryid = r.queryid
+    WHERE r.total_calls > COALESCE(b.avg_calls, 1) * v_threshold
+       OR (r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%')
+    ORDER BY
+        CASE
+            WHEN r.query_preview ILIKE '%RETRY%' OR r.query_preview ILIKE '%FOR UPDATE%' THEN 1
+            WHEN r.total_calls > COALESCE(b.avg_calls, 0) * 10 THEN 2
+            ELSE 3
+        END,
+        r.total_calls DESC;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL.';
+
+-- Auto-detect storms and log new ones to query_storms table
+-- Called by pg_cron when storm detection is enabled
+CREATE OR REPLACE FUNCTION flight_recorder.auto_detect_storms()
+RETURNS INTEGER
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_enabled BOOLEAN;
+    v_storm RECORD;
+    v_count INTEGER := 0;
+BEGIN
+    -- Check if storm detection is enabled
+    v_enabled := COALESCE(
+        flight_recorder._get_config('storm_detection_enabled', 'false')::boolean,
+        false
+    );
+
+    IF NOT v_enabled THEN
+        RETURN 0;
+    END IF;
+
+    -- Detect storms and insert new ones (avoid duplicates for same queryid in last hour)
+    FOR v_storm IN SELECT * FROM flight_recorder.detect_query_storms() WHERE storm_type != 'NORMAL' LOOP
+        -- Only insert if no unresolved storm exists for this queryid
+        IF NOT EXISTS (
+            SELECT 1 FROM flight_recorder.query_storms
+            WHERE query_storms.queryid = v_storm.queryid
+              AND resolved_at IS NULL
+              AND detected_at > now() - interval '1 hour'
+        ) THEN
+            INSERT INTO flight_recorder.query_storms (
+                queryid, query_fingerprint, storm_type, recent_count, baseline_count, multiplier
+            ) VALUES (
+                v_storm.queryid, v_storm.query_fingerprint, v_storm.storm_type,
+                v_storm.recent_count, v_storm.baseline_count, v_storm.multiplier
+            );
+            v_count := v_count + 1;
+
+            RAISE NOTICE 'pg-flight-recorder: Storm detected - % for queryid % (% vs baseline %)',
+                v_storm.storm_type, v_storm.queryid, v_storm.recent_count, v_storm.baseline_count;
+        END IF;
+    END LOOP;
+
+    IF v_count > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Detected % new query storm(s)', v_count;
+    END IF;
+
+    RETURN v_count;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Called by pg_cron.';
+
+-- Returns current storm status for monitoring
+-- Shows active (unresolved) storms and recent resolved storms
+CREATE OR REPLACE FUNCTION flight_recorder.storm_status(
+    p_lookback INTERVAL DEFAULT '24 hours'
+)
+RETURNS TABLE(
+    storm_id BIGINT,
+    detected_at TIMESTAMPTZ,
+    queryid BIGINT,
+    query_fingerprint TEXT,
+    storm_type TEXT,
+    recent_count BIGINT,
+    baseline_count BIGINT,
+    multiplier NUMERIC,
+    status TEXT,
+    duration INTERVAL
+)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        qs.id AS storm_id,
+        qs.detected_at,
+        qs.queryid,
+        qs.query_fingerprint,
+        qs.storm_type,
+        qs.recent_count,
+        qs.baseline_count,
+        qs.multiplier,
+        CASE
+            WHEN qs.resolved_at IS NULL THEN 'ACTIVE'
+            ELSE 'RESOLVED'
+        END AS status,
+        COALESCE(qs.resolved_at, now()) - qs.detected_at AS duration
+    FROM flight_recorder.query_storms qs
+    WHERE qs.detected_at >= now() - p_lookback
+       OR qs.resolved_at IS NULL
+    ORDER BY
+        CASE WHEN qs.resolved_at IS NULL THEN 0 ELSE 1 END,
+        qs.detected_at DESC;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.storm_status(INTERVAL) IS 'Show current storm status including active and recently resolved storms.';
+
+-- Enables storm detection and schedules periodic detection via pg_cron
+CREATE OR REPLACE FUNCTION flight_recorder.enable_storm_detection()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_interval INTEGER;
+    v_cron_expression TEXT;
+BEGIN
+    -- Enable storm detection feature
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('storm_detection_enabled', 'true', now())
+    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
+
+    -- Get configured interval
+    v_interval := COALESCE(
+        flight_recorder._get_config('storm_detection_interval_minutes', '15')::integer,
+        15
+    );
+
+    -- Build cron expression
+    v_cron_expression := format('*/%s * * * *', v_interval);
+
+    -- Schedule the storm detection job
+    BEGIN
+        PERFORM cron.unschedule('flight_recorder_storm')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
+
+        PERFORM cron.schedule('flight_recorder_storm', v_cron_expression, 'SELECT flight_recorder.auto_detect_storms()');
+
+        RETURN format('Storm detection enabled. Scheduled to run every %s minutes. Use storm_status() to check results.', v_interval);
+    EXCEPTION
+        WHEN undefined_table THEN
+            RETURN 'pg_cron extension not found. Storm detection enabled but not scheduled. Run detect_query_storms() manually.';
+        WHEN undefined_function THEN
+            RETURN 'pg_cron extension not found. Storm detection enabled but not scheduled. Run detect_query_storms() manually.';
+    END;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.enable_storm_detection() IS 'Enable storm detection and schedule periodic detection via pg_cron.';
+
+-- Disables storm detection and unschedules the cron job
+CREATE OR REPLACE FUNCTION flight_recorder.disable_storm_detection()
+RETURNS TEXT
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- Disable storm detection feature
+    INSERT INTO flight_recorder.config (key, value, updated_at)
+    VALUES ('storm_detection_enabled', 'false', now())
+    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
+
+    -- Unschedule the storm detection job
+    BEGIN
+        PERFORM cron.unschedule('flight_recorder_storm')
+        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
+
+        RETURN 'Storm detection disabled and unscheduled.';
+    EXCEPTION
+        WHEN undefined_table THEN
+            RETURN 'Storm detection disabled.';
+        WHEN undefined_function THEN
+            RETURN 'Storm detection disabled.';
+    END;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.disable_storm_detection() IS 'Disable storm detection and unschedule the cron job.';
 
 -- Configure autovacuum on ring buffer tables
 -- Ring buffers use pre-allocated rows with UPDATE-only pattern, achieving high HOT update ratios.
@@ -7021,6 +7318,35 @@ BEGIN
         END IF;
     ELSE
         v_result := v_result || '(canary monitoring not enabled - use enable_canaries() to enable)' || E'\n\n';
+    END IF;
+
+    -- ==========================================================================
+    -- Query Storms Section
+    -- ==========================================================================
+    v_result := v_result || '## Query Storms' || E'\n\n';
+
+    -- Check if storm detection is enabled
+    IF COALESCE(flight_recorder._get_config('storm_detection_enabled', 'false')::boolean, false) THEN
+        SELECT count(*) INTO v_count FROM flight_recorder.storm_status(p_end_time - p_start_time);
+        IF v_count = 0 THEN
+            v_result := v_result || '(no storms detected)' || E'\n\n';
+        ELSE
+            v_result := v_result || '| Detected | QueryID | Type | Recent | Baseline | Multiplier | Status |' || E'\n';
+            v_result := v_result || '|----------|---------|------|--------|----------|------------|--------|' || E'\n';
+            FOR v_row IN SELECT * FROM flight_recorder.storm_status(p_end_time - p_start_time) LOOP
+                v_result := v_result || '| ' ||
+                    COALESCE(to_char(v_row.detected_at, 'YYYY-MM-DD HH24:MI'), '-') || ' | ' ||
+                    COALESCE(v_row.queryid::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.storm_type, '-') || ' | ' ||
+                    COALESCE(v_row.recent_count::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.baseline_count::TEXT, '-') || ' | ' ||
+                    COALESCE(v_row.multiplier::TEXT || 'x', '-') || ' | ' ||
+                    COALESCE(v_row.status, '-') || ' |' || E'\n';
+            END LOOP;
+            v_result := v_result || E'\n';
+        END IF;
+    ELSE
+        v_result := v_result || '(storm detection not enabled - use enable_storm_detection() to enable)' || E'\n\n';
     END IF;
 
     RETURN v_result;
