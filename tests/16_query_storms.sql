@@ -1,12 +1,12 @@
 -- =============================================================================
 -- pg-flight-recorder pgTAP Tests - Query Storm Detection
 -- =============================================================================
--- Tests: Query storm detection definitions, execution, status, and resolution
--- Test count: 35
+-- Tests: Query storm detection definitions, execution, status, resolution, dashboard
+-- Test count: 38
 -- =============================================================================
 
 BEGIN;
-SELECT plan(35);
+SELECT plan(38);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -241,6 +241,28 @@ SELECT matches(
 
 -- Cleanup test data
 DELETE FROM flight_recorder.query_storms WHERE queryid = 12345;
+
+-- =============================================================================
+-- 8. STORM DASHBOARD VIEW (3 tests)
+-- =============================================================================
+
+SELECT has_view(
+    'flight_recorder', 'storm_dashboard',
+    'storm_dashboard view should exist'
+);
+
+-- Test dashboard executes without error
+SELECT lives_ok(
+    $$SELECT * FROM flight_recorder.storm_dashboard$$,
+    'storm_dashboard view should execute without error'
+);
+
+-- Test dashboard returns expected columns
+SELECT ok(
+    (SELECT active_count IS NOT NULL AND overall_status IS NOT NULL
+     FROM flight_recorder.storm_dashboard),
+    'storm_dashboard should return active_count and overall_status'
+);
 
 -- Disable storm detection after testing (should already be disabled)
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'storm_detection_enabled';

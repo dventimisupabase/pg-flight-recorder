@@ -12,6 +12,7 @@
 --     enable_storm_detection(), disable_storm_detection()
 --   - Add resolve_storm(), resolve_storms_by_queryid(), resolve_all_storms(),
 --     reopen_storm() for storm resolution workflow
+--   - Add storm_dashboard view for at-a-glance monitoring
 --   - Update cleanup_aggregates() to include storm retention
 --   - Update disable() to unschedule storm cron job
 --

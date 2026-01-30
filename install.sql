@@ -8536,6 +8536,120 @@ LEFT JOIN storage_metric s ON true;
 COMMENT ON VIEW flight_recorder.capacity_dashboard IS
 'At-a-glance capacity planning dashboard. Shows current status (healthy/warning/critical) across all resource dimensions: connections, memory, I/O, storage. Includes utilization percentages, composite memory pressure score, and array of critical issues requiring attention. Based on last 24 hours of data. Part of Phase 1 MVP capacity planning enhancements (FR-3.1).';
 
+-- =============================================================================
+-- QUERY STORM DASHBOARD VIEW
+-- =============================================================================
+
+CREATE OR REPLACE VIEW flight_recorder.storm_dashboard AS
+WITH
+storm_config AS (
+    SELECT
+        COALESCE(
+            (SELECT value::boolean FROM flight_recorder.config WHERE key = 'storm_detection_enabled'),
+            false
+        ) AS detection_enabled
+),
+active_storms AS (
+    SELECT
+        count(*) AS active_count,
+        count(*) FILTER (WHERE storm_type = 'RETRY_STORM') AS retry_storms,
+        count(*) FILTER (WHERE storm_type = 'CACHE_MISS') AS cache_miss_storms,
+        count(*) FILTER (WHERE storm_type = 'SPIKE') AS spike_storms
+    FROM flight_recorder.query_storms
+    WHERE resolved_at IS NULL
+),
+recent_storms AS (
+    SELECT
+        count(*) AS total_24h,
+        count(*) FILTER (WHERE resolved_at IS NOT NULL) AS resolved_24h
+    FROM flight_recorder.query_storms
+    WHERE detected_at >= now() - interval '24 hours'
+),
+resolution_stats AS (
+    SELECT
+        count(*) AS total_resolved,
+        EXTRACT(EPOCH FROM avg(resolved_at - detected_at)) / 60 AS avg_resolution_minutes,
+        EXTRACT(EPOCH FROM min(resolved_at - detected_at)) / 60 AS min_resolution_minutes,
+        EXTRACT(EPOCH FROM max(resolved_at - detected_at)) / 60 AS max_resolution_minutes
+    FROM flight_recorder.query_storms
+    WHERE resolved_at IS NOT NULL
+      AND detected_at >= now() - interval '7 days'
+),
+storm_prone_queries AS (
+    SELECT
+        array_agg(
+            json_build_object(
+                'queryid', queryid,
+                'fingerprint', left(query_fingerprint, 50),
+                'storm_count', storm_count
+            )
+            ORDER BY storm_count DESC
+        ) FILTER (WHERE rn <= 5) AS top_queries
+    FROM (
+        SELECT
+            queryid,
+            query_fingerprint,
+            count(*) AS storm_count,
+            row_number() OVER (ORDER BY count(*) DESC) AS rn
+        FROM flight_recorder.query_storms
+        WHERE detected_at >= now() - interval '7 days'
+        GROUP BY queryid, query_fingerprint
+    ) ranked
+),
+oldest_active AS (
+    SELECT
+        min(detected_at) AS oldest_storm_at,
+        EXTRACT(EPOCH FROM (now() - min(detected_at))) / 3600 AS oldest_storm_hours
+    FROM flight_recorder.query_storms
+    WHERE resolved_at IS NULL
+)
+SELECT
+    cfg.detection_enabled,
+    a.active_count,
+    a.retry_storms AS active_retry_storms,
+    a.cache_miss_storms AS active_cache_miss_storms,
+    a.spike_storms AS active_spike_storms,
+    r.total_24h AS storms_last_24h,
+    r.resolved_24h AS resolved_last_24h,
+    CASE
+        WHEN r.total_24h > 0
+        THEN round((r.resolved_24h::numeric / r.total_24h) * 100, 1)
+        ELSE NULL
+    END AS resolution_rate_pct,
+    round(rs.avg_resolution_minutes::numeric, 1) AS avg_resolution_minutes,
+    round(rs.min_resolution_minutes::numeric, 1) AS min_resolution_minutes,
+    round(rs.max_resolution_minutes::numeric, 1) AS max_resolution_minutes,
+    o.oldest_storm_at,
+    round(o.oldest_storm_hours::numeric, 1) AS oldest_storm_hours,
+    sq.top_queries AS storm_prone_queries,
+    CASE
+        WHEN NOT cfg.detection_enabled THEN 'disabled'
+        WHEN a.active_count = 0 THEN 'healthy'
+        WHEN a.active_count >= 5 OR a.retry_storms > 0 THEN 'critical'
+        WHEN a.active_count >= 2 THEN 'warning'
+        ELSE 'attention'
+    END AS overall_status,
+    CASE
+        WHEN NOT cfg.detection_enabled THEN
+            'Storm detection is disabled. Use enable_storm_detection() to enable.'
+        WHEN a.active_count = 0 THEN
+            'No active storms. System operating normally.'
+        WHEN a.retry_storms > 0 THEN
+            format('CRITICAL: %s active retry storm(s) detected. Check for transaction conflicts or lock contention.', a.retry_storms)
+        WHEN a.cache_miss_storms > 0 THEN
+            format('WARNING: %s cache miss storm(s) detected. Check for cold cache or missing indexes.', a.cache_miss_storms)
+        ELSE
+            format('%s active storm(s). Review with storm_status() and resolve with resolve_storm().', a.active_count)
+    END AS recommendation
+FROM storm_config cfg
+CROSS JOIN active_storms a
+CROSS JOIN recent_storms r
+CROSS JOIN resolution_stats rs
+CROSS JOIN storm_prone_queries sq
+CROSS JOIN oldest_active o;
+COMMENT ON VIEW flight_recorder.storm_dashboard IS
+'At-a-glance query storm monitoring dashboard. Shows active storms by type, resolution metrics, storm-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
+
 
 -- =============================================================================
 -- TABLE-LEVEL HOTSPOT TRACKING ANALYSIS FUNCTIONS
