@@ -543,30 +543,105 @@ SELECT * FROM flight_recorder.config;
 
 ### Configuration Reference
 
+#### Core Settings
+
 | Key | Default | Purpose |
 |-----|---------|---------|
+| `schema_version` | 2.16 | Current schema version (read-only) |
+| `mode` | normal | Operating mode: `normal`, `emergency`, or `disabled` |
 | `sample_interval_seconds` | 180 | Ring buffer sample frequency |
 | `ring_buffer_slots` | 120 | Number of ring buffer slots (72-2880) |
+
+#### Statement Collection
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `statements_enabled` | auto | Enable pg_stat_statements: `true`, `false`, or `auto` |
 | `statements_interval_minutes` | 15 | pg_stat_statements collection interval |
 | `statements_top_n` | 20 | Number of top queries to capture |
+| `statements_min_calls` | 1 | Minimum call count to include query |
+| `enable_locks` | true | Collect lock contention data |
+| `enable_progress` | true | Collect pg_stat_progress_* data |
+
+#### Safety & Timeouts
+
+| Key | Default | Purpose |
+|-----|---------|---------|
 | `snapshot_based_collection` | true | Use temp table snapshot (reduces catalog locks) |
-| `adaptive_sampling` | true | Skip collection when system idle |
-| `adaptive_sampling_idle_threshold` | 5 | Skip if < N active connections |
-| `circuit_breaker_threshold_ms` | 1000 | Max collection duration before skip |
-| `circuit_breaker_enabled` | true | Enable circuit breaker |
-| `auto_mode_enabled` | true | Auto-adjust collection mode |
-| `auto_mode_connections_threshold` | 60 | % connections to trigger emergency mode |
+| `lock_timeout_strategy` | fail_fast | Lock strategy: `fail_fast` or `skip_if_locked` |
+| `check_ddl_before_collection` | true | Check for DDL locks before collecting |
+| `check_replica_lag` | true | Skip collection if replica lag is high |
+| `replica_lag_threshold` | 10 seconds | Max replica lag before skipping |
+| `check_checkpoint_backup` | true | Check for checkpoint/backup activity |
+| `check_pss_conflicts` | true | Check for pg_stat_statements conflicts |
+| `statement_timeout_ms` | 1000 | Statement timeout for collection queries |
 | `section_timeout_ms` | 250 | Per-section query timeout |
 | `lock_timeout_ms` | 100 | Max wait for catalog locks |
-| `skip_locks_threshold` | 50 | Skip lock collection if > N blocked |
-| `skip_activity_conn_threshold` | 100 | Skip activity if > N active connections |
+| `work_mem_kb` | 2048 | work_mem for collection queries |
+
+#### Circuit Breaker
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `circuit_breaker_enabled` | true | Enable circuit breaker |
+| `circuit_breaker_threshold_ms` | 1000 | Max collection duration before skip |
+| `circuit_breaker_window_minutes` | 15 | Window for tracking circuit breaker trips |
+
+#### Load Protection
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `adaptive_sampling` | true | Skip collection when system idle |
+| `adaptive_sampling_idle_threshold` | 5 | Skip if < N active connections |
 | `load_shedding_enabled` | true | Skip during high connection load |
 | `load_shedding_active_pct` | 70 | Skip if active connections > N% of max |
 | `load_throttle_enabled` | true | Skip during I/O/transaction pressure |
 | `load_throttle_xact_threshold` | 1000 | Skip if transactions > N/sec |
 | `load_throttle_blk_threshold` | 10000 | Skip if block I/O > N/sec |
+| `skip_locks_threshold` | 50 | Skip lock collection if > N blocked |
+| `skip_activity_conn_threshold` | 100 | Skip activity if > N active connections |
+
+#### Auto Mode
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `auto_mode_enabled` | true | Auto-adjust collection mode |
+| `auto_mode_connections_threshold` | 60 | % connections to trigger emergency mode |
+| `auto_mode_trips_threshold` | 1 | Circuit breaker trips to trigger emergency |
+
+#### Collection Jitter
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `collection_jitter_enabled` | true | Add random delay to prevent thundering herd |
+| `collection_jitter_max_seconds` | 10 | Maximum jitter delay in seconds |
+
+#### Schema Size Limits
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `schema_size_check_enabled` | true | Enable schema size checking |
 | `schema_size_warning_mb` | 5000 | Log warning at this schema size |
 | `schema_size_critical_mb` | 10000 | Auto-disable at this schema size |
+| `schema_size_use_percentage` | true | Use percentage-based limits |
+| `schema_size_percentage` | 5.0 | Max schema size as % of database |
+| `schema_size_min_mb` | 1000 | Minimum threshold for percentage mode |
+| `schema_size_max_mb` | 10000 | Maximum threshold for percentage mode |
+
+#### Health & Monitoring
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `self_monitoring_enabled` | true | Track Flight Recorder's own performance |
+| `health_check_enabled` | true | Enable health check function |
+
+#### Alerts
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `alert_enabled` | false | Enable pg_notify alerts |
+| `alert_circuit_breaker_count` | 5 | Alert after N circuit breaker trips |
+| `alert_schema_size_mb` | 8000 | Alert when schema exceeds this size |
 
 ### Retention Settings
 
@@ -574,11 +649,16 @@ Single authoritative reference for all retention periods:
 
 | Setting | Default | Storage | Purpose |
 |---------|---------|---------|---------|
+| `retention_samples_days` | 7 | Samples | Raw ring buffer samples |
 | `aggregate_retention_days` | 7 | Aggregates | Aggregated summaries |
 | `archive_retention_days` | 7 | Raw Archives | Raw sample archives |
 | `retention_snapshots_days` | 30 | Snapshots | System stat snapshots |
 | `retention_statements_days` | 30 | Snapshots | Query snapshots |
 | `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
+| `retention_canary_days` | 7 | Canary | Canary query results |
+| `retention_storms_days` | 30 | Storms | Query storm history |
+| `retention_regressions_days` | 30 | Regressions | Performance regression history |
+| `snapshot_retention_days_extended` | 90 | Extended | Extended snapshot retention for capacity planning |
 
 Ring buffers self-clean via slot overwrite—no retention setting needed. Size is configurable via `ring_buffer_slots` (see [Ring Buffer Optimization](#ring-buffer-optimization)).
 
@@ -635,8 +715,9 @@ Index tracking captures scan counts, tuple reads/fetches, and index sizes for de
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `config_snapshots_enabled` | true | Enable PostgreSQL config tracking |
+| `db_role_config_snapshots_enabled` | true | Enable database/role config override tracking |
 
-Configuration snapshots capture ~50 relevant PostgreSQL parameters (memory, connections, parallelism, WAL, autovacuum, etc.) to provide context during incident analysis and detect configuration drift.
+Configuration snapshots capture ~50 relevant PostgreSQL parameters (memory, connections, parallelism, WAL, autovacuum, etc.) to provide context during incident analysis and detect configuration drift. Database/role config snapshots track `ALTER DATABASE ... SET` and `ALTER ROLE ... SET` overrides.
 
 ### Threshold Tuning
 
