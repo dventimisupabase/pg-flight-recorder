@@ -1207,7 +1207,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.17'),
+    ('schema_version', '2.18'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -13450,7 +13450,7 @@ BEGIN
             );
 
             FOR v_formatted_row IN EXECUTE v_select_query LOOP
-                v_result := v_result || 'INSERT INTO "' || v_table_name || '" VALUES (' || v_formatted_row || ');' || E'\n';
+                v_result := v_result || 'INSERT OR REPLACE INTO "' || v_table_name || '" VALUES (' || v_formatted_row || ');' || E'\n';
             END LOOP;
         END;
 
@@ -13470,113 +13470,172 @@ BEGIN
     v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_wait_events ON wait_samples_archive(wait_event_type, wait_event);' || E'\n';
     v_result := v_result || E'\n';
 
+    -- Schema reference table (helps AI avoid column name errors)
+    v_result := v_result || '-- Schema reference - query this to see exact column names before writing queries' || E'\n';
+    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _schema (table_name TEXT, column_name TEXT, column_type TEXT, column_position INTEGER, PRIMARY KEY (table_name, column_name));' || E'\n';
+    -- Dynamically populate _schema from the tables we exported
+    FOR v_i IN 1..array_length(v_tables, 1) LOOP
+        v_table_name := v_tables[v_i];
+        FOR v_row IN
+            SELECT column_name, data_type, ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema = 'flight_recorder' AND table_name = v_table_name
+            ORDER BY ordinal_position
+        LOOP
+            v_result := v_result || format(
+                'INSERT OR REPLACE INTO _schema VALUES (%L, %L, %L, %s);',
+                v_table_name,
+                v_row.column_name,
+                v_row.data_type,
+                v_row.ordinal_position
+            ) || E'\n';
+        END LOOP;
+    END LOOP;
+    v_result := v_result || E'\n';
+
     -- Metadata table
     v_result := v_result || '-- Export metadata' || E'\n';
     v_result := v_result || 'CREATE TABLE IF NOT EXISTS _export_metadata (key TEXT PRIMARY KEY, value TEXT);' || E'\n';
-    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''exported_at'', ''' || now()::text || ''');' || E'\n';
-    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''schema_version'', ''' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || ''');' || E'\n';
-    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''source_database'', ''' || current_database() || ''');' || E'\n';
-    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''pg_version'', ''' || version() || ''');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''exported_at'', ''' || now()::text || ''');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''schema_version'', ''' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || ''');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''source_database'', ''' || current_database() || ''');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''pg_version'', ''' || version() || ''');' || E'\n';
     IF p_since IS NOT NULL THEN
-        v_result := v_result || 'INSERT INTO _export_metadata VALUES (''since_filter'', ''' || v_since::text || ''');' || E'\n';
+        v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''since_filter'', ''' || v_since::text || ''');' || E'\n';
     END IF;
     v_result := v_result || E'\n';
 
     -- Analysis guide for AI
     v_result := v_result || '-- Analysis guide for AI-driven exploration' || E'\n';
     v_result := v_result || 'CREATE TABLE IF NOT EXISTS _guide (step INTEGER PRIMARY KEY, phase TEXT, instruction TEXT);' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (1, ''START HERE'', ''Check query_storms and query_regressions tables first - these contain pre-detected anomalies that indicate where problems occurred'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (2, ''LOW-ORDER APPROXIMATION'', ''Query snapshots for high-level system trends: connections_active, wal_bytes, temp_bytes, xact_commit, blks_read. Look for spikes or step changes.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (3, ''IDENTIFY TIME WINDOWS'', ''Find interesting time ranges from anomalies or snapshot trends. Note the timestamps for drilling down.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (4, ''WAIT EVENT ANALYSIS'', ''Query wait_event_aggregates for patterns in the time window. High counts of Lock, IO, or LWLock waits indicate bottlenecks.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (5, ''DRILL INTO DETAIL'', ''Use wait_samples_archive, activity_samples_archive, lock_samples_archive for raw samples in the time window.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (6, ''CORRELATE QUERIES'', ''Join statement_snapshots on time to see which queries were running. High temp_blks or blk_read_time indicate expensive queries.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (7, ''CHECK CONFIGURATION'', ''Query config_snapshots to see if settings changed near anomalies. Also check db_role_config_snapshots for role-level overrides.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _guide VALUES (8, ''TABLE HEALTH'', ''Query table_snapshots for n_dead_tup (bloat), seq_scan vs idx_scan ratios, and vacuum/analyze timestamps.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (0, ''BEFORE CUSTOM QUERIES'', ''Query _schema to see exact column names for any table before writing custom SQL. Example: SELECT column_name, column_type FROM _schema WHERE table_name = ''''wait_event_aggregates'''';'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (1, ''START HERE'', ''Check query_storms and query_regressions tables first - these contain pre-detected anomalies that indicate where problems occurred'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (2, ''LOW-ORDER APPROXIMATION'', ''Query snapshots for high-level system trends: connections_active, wal_bytes, temp_bytes, xact_commit, blks_read. Look for spikes or step changes.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (3, ''IDENTIFY TIME WINDOWS'', ''Find interesting time ranges from anomalies or snapshot trends. Note the timestamps for drilling down.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (4, ''WAIT EVENT ANALYSIS'', ''Query wait_event_aggregates for patterns in the time window. High counts of Lock, IO, or LWLock waits indicate bottlenecks.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (5, ''DRILL INTO DETAIL'', ''Use wait_samples_archive, activity_samples_archive, lock_samples_archive for raw samples in the time window.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (6, ''CORRELATE QUERIES'', ''Join statement_snapshots on time to see which queries were running. High temp_blks or blk_read_time indicate expensive queries.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (7, ''CHECK CONFIGURATION'', ''Query config_snapshots to see if settings changed near anomalies. Also check db_role_config_snapshots for role-level overrides.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (8, ''TABLE HEALTH'', ''Query table_snapshots for n_dead_tup (bloat), seq_scan vs idx_scan ratios, and vacuum/analyze timestamps.'');' || E'\n';
     v_result := v_result || E'\n';
 
     -- Table descriptions for AI context
     v_result := v_result || '-- Table descriptions' || E'\n';
     v_result := v_result || 'CREATE TABLE IF NOT EXISTS _tables (name TEXT PRIMARY KEY, description TEXT, time_column TEXT);' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''snapshots'', ''System-wide metrics every 5 min: WAL, checkpoints, connections, I/O, transactions'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''statement_snapshots'', ''Per-query stats from pg_stat_statements: timing, rows, blocks, temp usage'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''table_snapshots'', ''Per-table stats: seq/idx scans, tuple counts, dead tuples, vacuum times'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''index_snapshots'', ''Per-index stats: scan counts, tuple reads, index size'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''wait_event_aggregates'', ''5-minute summaries of wait events by type. Good for finding patterns.'', ''start_time'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''wait_samples_archive'', ''Raw wait event samples. Full detail for forensic analysis.'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''activity_samples_archive'', ''Raw session activity samples: who was connected, what they were doing'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''lock_samples_archive'', ''Raw lock contention samples: blocked/blocking PIDs, queries, durations'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''query_storms'', ''PRE-DETECTED: Sudden spikes in query execution counts. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''query_regressions'', ''PRE-DETECTED: Queries whose performance degraded vs baseline. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''config_snapshots'', ''PostgreSQL configuration parameter history'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _tables VALUES (''config'', ''Flight recorder internal settings (not PostgreSQL config)'', NULL);' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''snapshots'', ''System-wide metrics every 5 min: WAL, checkpoints, connections, I/O, transactions'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''statement_snapshots'', ''Per-query stats from pg_stat_statements: timing, rows, blocks, temp usage'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''table_snapshots'', ''Per-table stats: seq/idx scans, tuple counts, dead tuples, vacuum times'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''index_snapshots'', ''Per-index stats: scan counts, tuple reads, index size'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''wait_event_aggregates'', ''5-minute summaries of wait events by type. Good for finding patterns.'', ''start_time'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''wait_samples_archive'', ''Raw wait event samples. Full detail for forensic analysis.'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''activity_samples_archive'', ''Raw session activity samples: who was connected, what they were doing'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''lock_samples_archive'', ''Raw lock contention samples: blocked/blocking PIDs, queries, durations'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''query_storms'', ''PRE-DETECTED: Sudden spikes in query execution counts. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''query_regressions'', ''PRE-DETECTED: Queries whose performance degraded vs baseline. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''config_snapshots'', ''PostgreSQL configuration parameter history'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''config'', ''Flight recorder internal settings (not PostgreSQL config)'', NULL);' || E'\n';
+    -- Metadata tables (for AI self-reference)
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_schema'', ''SCHEMA REFERENCE: Lists all columns for each table. Query this before writing custom SQL to avoid column name errors.'', NULL);' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_examples'', ''Ready-to-run query templates organized by tier. Use these instead of writing from scratch.'', NULL);' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_columns'', ''Key column descriptions explaining what each metric means.'', NULL);' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_guide'', ''Step-by-step analysis methodology (Top-Down approach).'', NULL);' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_glossary'', ''PostgreSQL terminology definitions.'', NULL);' || E'\n';
     v_result := v_result || E'\n';
 
     -- Example queries for common analysis patterns
     v_result := v_result || '-- Example queries for common analysis patterns' || E'\n';
     v_result := v_result || 'CREATE TABLE IF NOT EXISTS _examples (category TEXT, name TEXT, description TEXT, sql TEXT, PRIMARY KEY (category, name));' || E'\n';
 
-    -- Tier 1: Quick status checks
-    v_result := v_result || 'INSERT INTO _examples VALUES (''1_quick_status'', ''active_anomalies'', ''Count of unresolved anomalies - start here'', ''SELECT ''''storms'''' as type, COUNT(*) as count FROM query_storms WHERE resolved_at IS NULL UNION ALL SELECT ''''regressions'''', COUNT(*) FROM query_regressions WHERE resolved_at IS NULL;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''1_quick_status'', ''data_range'', ''Time range of available data'', ''SELECT MIN(captured_at) as earliest, MAX(captured_at) as latest, COUNT(*) as snapshots FROM snapshots;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''1_quick_status'', ''recent_activity'', ''Activity level in last hour'', ''SELECT COUNT(*) as samples, MAX(captured_at) as latest FROM snapshots WHERE captured_at > datetime(''''now'''', ''''-1 hour'''');'');' || E'\n';
+    -- Tier 0: Schema reference (use before writing custom queries)
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''list_tables'', ''List all available tables'', ''SELECT name, description FROM _tables ORDER BY name;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''table_columns'', ''List columns for a specific table (replace TABLE_NAME)'', ''SELECT column_name, column_type FROM _schema WHERE table_name = ''''TABLE_NAME'''' ORDER BY column_position;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''find_column'', ''Find which tables have a specific column (replace COLUMN_NAME)'', ''SELECT table_name, column_type FROM _schema WHERE column_name = ''''COLUMN_NAME'''';'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''column_meanings'', ''Get descriptions for key columns in a table (replace TABLE_NAME)'', ''SELECT column_name, meaning FROM _columns WHERE table_name = ''''TABLE_NAME'''';'');' || E'\n';
 
-    -- Tier 2: Summary views
-    v_result := v_result || 'INSERT INTO _examples VALUES (''2_summaries'', ''connection_trend'', ''Connection count over time'', ''SELECT strftime(''''%Y-%m-%d %H:00'''', captured_at) as hour, ROUND(AVG(connections_active), 1) as avg_conn, MAX(connections_active) as max_conn FROM snapshots GROUP BY 1 ORDER BY 1;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''2_summaries'', ''top_wait_events'', ''Most common wait events'', ''SELECT wait_event_type, wait_event, SUM(total_waiters) as total FROM wait_event_aggregates GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 10;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''2_summaries'', ''temp_file_usage'', ''Queries using temp files (memory pressure)'', ''SELECT s.captured_at, SUM(st.temp_blks_written) as temp_blks FROM snapshots s JOIN statement_snapshots st ON st.snapshot_id = s.id GROUP BY 1 HAVING SUM(st.temp_blks_written) > 0 ORDER BY 1;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''2_summaries'', ''checkpoint_frequency'', ''Checkpoint timing and buffer writes'', ''SELECT captured_at, ckpt_timed, ckpt_requested, ckpt_buffers FROM snapshots WHERE ckpt_buffers > 0 ORDER BY captured_at;'');' || E'\n';
+    -- Tier 1: Quick status checks (ALWAYS run these first)
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''active_anomalies'', ''Count of unresolved anomalies - start here'', ''SELECT ''''storms'''' as type, COUNT(*) as count FROM query_storms WHERE resolved_at IS NULL UNION ALL SELECT ''''regressions'''', COUNT(*) FROM query_regressions WHERE resolved_at IS NULL;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''data_range'', ''Time range of available data'', ''SELECT MIN(captured_at) as earliest, MAX(captured_at) as latest, COUNT(*) as snapshots FROM snapshots;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''recent_activity'', ''Activity level in last hour'', ''SELECT COUNT(*) as samples, MAX(captured_at) as latest FROM snapshots WHERE captured_at > datetime(''''now'''', ''''-1 hour'''');'');' || E'\n';
+    -- data_inventory: Critical for knowing what data is available before querying
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''data_inventory'', ''Row counts per table - run this to see what data exists'', ''SELECT ''''snapshots'''' as tbl, COUNT(*) as rows FROM snapshots UNION ALL SELECT ''''wait_samples_archive'''', COUNT(*) FROM wait_samples_archive UNION ALL SELECT ''''wait_event_aggregates'''', COUNT(*) FROM wait_event_aggregates UNION ALL SELECT ''''activity_samples_archive'''', COUNT(*) FROM activity_samples_archive UNION ALL SELECT ''''lock_samples_archive'''', COUNT(*) FROM lock_samples_archive UNION ALL SELECT ''''statement_snapshots'''', COUNT(*) FROM statement_snapshots UNION ALL SELECT ''''table_snapshots'''', COUNT(*) FROM table_snapshots UNION ALL SELECT ''''query_storms'''', COUNT(*) FROM query_storms UNION ALL SELECT ''''query_regressions'''', COUNT(*) FROM query_regressions;'');' || E'\n';
+    -- system_health: Quick baseline metrics
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''system_health'', ''Key health metrics from latest snapshot'', ''SELECT captured_at, connections_active, connections_total, ROUND(100.0 * blks_hit / NULLIF(blks_hit + blks_read, 0), 2) as cache_hit_pct, temp_files, temp_bytes, xact_commit, xact_rollback FROM snapshots ORDER BY captured_at DESC LIMIT 1;'');' || E'\n';
+
+    -- Tier 2: Summary views (drill into specific areas)
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''connection_trend'', ''Connection count over time'', ''SELECT strftime(''''%Y-%m-%d %H:00'''', captured_at) as hour, ROUND(AVG(connections_active), 1) as avg_conn, MAX(connections_active) as max_conn FROM snapshots GROUP BY 1 ORDER BY 1;'');' || E'\n';
+    -- top_wait_events: Uses aggregates (populated by flush job every 5 min)
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''top_wait_events'', ''Most common wait events (from aggregates - may be empty if flush not run yet)'', ''SELECT wait_event_type, wait_event, SUM(total_waiters) as total, ROUND(AVG(avg_waiters), 2) as avg_concurrent FROM wait_event_aggregates GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 10;'');' || E'\n';
+    -- wait_events_from_samples: Fallback when aggregates are empty
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''wait_events_from_samples'', ''Wait events from raw samples (use when aggregates empty)'', ''SELECT backend_type, wait_event_type, wait_event, state, SUM(count) as total_waiters FROM wait_samples_archive GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC LIMIT 15;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''temp_file_usage'', ''Queries using temp files (memory pressure)'', ''SELECT s.captured_at, SUM(st.temp_blks_written) as temp_blks FROM snapshots s JOIN statement_snapshots st ON st.snapshot_id = s.id GROUP BY 1 HAVING SUM(st.temp_blks_written) > 0 ORDER BY 1;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''checkpoint_frequency'', ''Checkpoint timing and buffer writes'', ''SELECT captured_at, ckpt_timed, ckpt_requested, ckpt_buffers FROM snapshots WHERE ckpt_buffers > 0 ORDER BY captured_at;'');' || E'\n';
+    -- cache_hit_ratio: Critical performance indicator
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''cache_hit_ratio'', ''Buffer cache hit ratio over time (should be >95%)'', ''SELECT captured_at, blks_read, blks_hit, ROUND(100.0 * blks_hit / NULLIF(blks_hit + blks_read, 0), 2) as hit_ratio_pct FROM snapshots ORDER BY captured_at;'');' || E'\n';
+    -- wal_activity: Write workload indicator
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''wal_activity'', ''WAL generation over time (write workload)'', ''SELECT captured_at, wal_bytes, wal_bytes - LAG(wal_bytes) OVER (ORDER BY captured_at) as wal_delta FROM snapshots ORDER BY captured_at;'');' || E'\n';
+    -- transaction_rate: Throughput indicator
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''transaction_rate'', ''Transactions per snapshot interval'', ''SELECT captured_at, xact_commit, xact_rollback, xact_commit - LAG(xact_commit) OVER (ORDER BY captured_at) as commits_delta, xact_rollback - LAG(xact_rollback) OVER (ORDER BY captured_at) as rollbacks_delta FROM snapshots ORDER BY captured_at;'');' || E'\n';
 
     -- Tier 3: Drill-down queries
-    v_result := v_result || 'INSERT INTO _examples VALUES (''3_drill_down'', ''lock_chains'', ''Who is blocking whom (replace timestamps)'', ''SELECT captured_at, blocked_user, blocked_query_preview, blocking_user, blocking_query_preview, blocked_duration FROM lock_samples_archive WHERE captured_at BETWEEN ''''2024-01-15 14:00'''' AND ''''2024-01-15 15:00'''' ORDER BY blocked_duration DESC LIMIT 20;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''3_drill_down'', ''slow_queries'', ''Slowest queries by total time'', ''SELECT queryid, query_preview, SUM(total_exec_time) as total_ms, SUM(calls) as calls, ROUND(SUM(total_exec_time)/SUM(calls), 2) as avg_ms FROM statement_snapshots GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 10;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''3_drill_down'', ''table_bloat'', ''Tables with high dead tuple counts'', ''SELECT s.captured_at, t.schemaname, t.relname, t.n_live_tup, t.n_dead_tup, ROUND(100.0 * t.n_dead_tup / NULLIF(t.n_live_tup + t.n_dead_tup, 0), 1) as dead_pct FROM snapshots s JOIN table_snapshots t ON t.snapshot_id = s.id WHERE t.n_dead_tup > 1000 ORDER BY t.n_dead_tup DESC LIMIT 20;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''3_drill_down'', ''index_usage'', ''Unused or underused indexes'', ''SELECT i.schemaname, i.relname, i.indexrelname, SUM(i.idx_scan) as total_scans, MAX(i.index_size_bytes) as size_bytes FROM index_snapshots i GROUP BY 1, 2, 3 HAVING SUM(i.idx_scan) < 10 ORDER BY 5 DESC;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''lock_chains'', ''Who is blocking whom (replace timestamps)'', ''SELECT captured_at, blocked_user, blocked_query_preview, blocking_user, blocking_query_preview, blocked_duration FROM lock_samples_archive WHERE captured_at BETWEEN ''''2024-01-15 14:00'''' AND ''''2024-01-15 15:00'''' ORDER BY blocked_duration DESC LIMIT 20;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''slow_queries'', ''Slowest queries by total time'', ''SELECT queryid, query_preview, SUM(total_exec_time) as total_ms, SUM(calls) as calls, ROUND(SUM(total_exec_time)/SUM(calls), 2) as avg_ms FROM statement_snapshots GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 10;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''table_bloat'', ''Tables with high dead tuple counts'', ''SELECT s.captured_at, t.schemaname, t.relname, t.n_live_tup, t.n_dead_tup, ROUND(100.0 * t.n_dead_tup / NULLIF(t.n_live_tup + t.n_dead_tup, 0), 1) as dead_pct FROM snapshots s JOIN table_snapshots t ON t.snapshot_id = s.id WHERE t.n_dead_tup > 1000 ORDER BY t.n_dead_tup DESC LIMIT 20;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''index_usage'', ''Unused or underused indexes'', ''SELECT i.schemaname, i.relname, i.indexrelname, SUM(i.idx_scan) as total_scans, MAX(i.index_size_bytes) as size_bytes FROM index_snapshots i GROUP BY 1, 2, 3 HAVING SUM(i.idx_scan) < 10 ORDER BY 5 DESC;'');' || E'\n';
 
     -- Correlation queries
-    v_result := v_result || 'INSERT INTO _examples VALUES (''4_correlation'', ''waits_during_storm'', ''Wait events during a query storm (get storm time from query_storms)'', ''SELECT w.captured_at, w.wait_event_type, w.wait_event, w.count FROM wait_samples_archive w WHERE w.captured_at BETWEEN (SELECT detected_at - interval ''''5 minutes'''' FROM query_storms LIMIT 1) AND (SELECT detected_at + interval ''''10 minutes'''' FROM query_storms LIMIT 1) ORDER BY w.captured_at;'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _examples VALUES (''4_correlation'', ''config_changes'', ''Configuration changes over time'', ''SELECT s.captured_at, c.name, c.setting, c.source FROM snapshots s JOIN config_snapshots c ON c.snapshot_id = s.id WHERE c.name IN (''''work_mem'''', ''''shared_buffers'''', ''''max_connections'''', ''''effective_cache_size'''') ORDER BY s.captured_at, c.name;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''4_correlation'', ''waits_during_storm'', ''Wait events during a query storm (get storm time from query_storms)'', ''SELECT w.captured_at, w.wait_event_type, w.wait_event, w.count FROM wait_samples_archive w WHERE w.captured_at BETWEEN (SELECT detected_at - interval ''''5 minutes'''' FROM query_storms LIMIT 1) AND (SELECT detected_at + interval ''''10 minutes'''' FROM query_storms LIMIT 1) ORDER BY w.captured_at;'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''4_correlation'', ''config_changes'', ''Configuration changes over time'', ''SELECT s.captured_at, c.name, c.setting, c.source FROM snapshots s JOIN config_snapshots c ON c.snapshot_id = s.id WHERE c.name IN (''''work_mem'''', ''''shared_buffers'''', ''''max_connections'''', ''''effective_cache_size'''') ORDER BY s.captured_at, c.name;'');' || E'\n';
     v_result := v_result || E'\n';
 
     -- Glossary of key concepts
     v_result := v_result || '-- Glossary of key concepts' || E'\n';
     v_result := v_result || 'CREATE TABLE IF NOT EXISTS _glossary (term TEXT PRIMARY KEY, definition TEXT);' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''wait_event'', ''What a PostgreSQL process is waiting for. Common types: Lock (row/table locks), IO (disk reads/writes), LWLock (internal locks), Client (waiting for client input). High wait counts indicate bottlenecks.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''query_storm'', ''A sudden spike in query execution counts, often caused by retry loops, cache invalidation, or application bugs. Storms can overwhelm the database.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''query_regression'', ''A query whose execution time has increased significantly compared to its historical baseline. Often caused by plan changes, data growth, or missing indexes.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''dead_tuples'', ''Old row versions that are no longer visible to any transaction. High counts indicate bloat - VACUUM removes them. Check n_dead_tup in table_snapshots.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''temp_files'', ''When queries need more memory than work_mem allows, PostgreSQL spills to disk. High temp_bytes in snapshots or temp_blks in statement_snapshots indicates memory pressure.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''checkpoint'', ''Periodic flush of dirty buffers to disk. ckpt_requested (forced) checkpoints indicate WAL pressure. High ckpt_buffers means lots of data being written.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''WAL'', ''Write-Ahead Log - PostgreSQL''''s durability mechanism. High wal_bytes indicates heavy write activity. WAL problems cause replication lag.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''seq_scan'', ''Sequential table scan - reads every row. Fine for small tables, but seq_scan on large tables (check seq_tup_read in table_snapshots) often indicates missing indexes.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''snapshot_id'', ''Links detail tables (statement_snapshots, table_snapshots, etc.) to the parent snapshots table. JOIN on snapshot_id to correlate metrics with timestamps.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _glossary VALUES (''queryid'', ''Hash of the query structure (from pg_stat_statements). Same queryid = same query pattern with different parameters. Use to track query performance over time.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''wait_event'', ''What a PostgreSQL process is waiting for. Common types: Lock (row/table locks), IO (disk reads/writes), LWLock (internal locks), Client (waiting for client input). High wait counts indicate bottlenecks.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''query_storm'', ''A sudden spike in query execution counts, often caused by retry loops, cache invalidation, or application bugs. Storms can overwhelm the database.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''query_regression'', ''A query whose execution time has increased significantly compared to its historical baseline. Often caused by plan changes, data growth, or missing indexes.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''dead_tuples'', ''Old row versions that are no longer visible to any transaction. High counts indicate bloat - VACUUM removes them. Check n_dead_tup in table_snapshots.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''temp_files'', ''When queries need more memory than work_mem allows, PostgreSQL spills to disk. High temp_bytes in snapshots or temp_blks in statement_snapshots indicates memory pressure.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''checkpoint'', ''Periodic flush of dirty buffers to disk. ckpt_requested (forced) checkpoints indicate WAL pressure. High ckpt_buffers means lots of data being written.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''WAL'', ''Write-Ahead Log - PostgreSQL''''s durability mechanism. High wal_bytes indicates heavy write activity. WAL problems cause replication lag.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''seq_scan'', ''Sequential table scan - reads every row. Fine for small tables, but seq_scan on large tables (check seq_tup_read in table_snapshots) often indicates missing indexes.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''snapshot_id'', ''Links detail tables (statement_snapshots, table_snapshots, etc.) to the parent snapshots table. JOIN on snapshot_id to correlate metrics with timestamps.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''queryid'', ''Hash of the query structure (from pg_stat_statements). Same queryid = same query pattern with different parameters. Use to track query performance over time.'');' || E'\n';
     v_result := v_result || E'\n';
 
     -- Key columns reference
     v_result := v_result || '-- Key columns to understand' || E'\n';
     v_result := v_result || 'CREATE TABLE IF NOT EXISTS _columns (table_name TEXT, column_name TEXT, meaning TEXT, PRIMARY KEY (table_name, column_name));' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''connections_active'', ''Currently active connections (running queries)'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''connections_total'', ''Total connections including idle'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''wal_bytes'', ''WAL generated (cumulative). Diff between snapshots = write activity.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''temp_bytes'', ''Temp file usage (cumulative). High values = queries spilling to disk.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''xact_commit'', ''Committed transactions (cumulative). Diff = transaction rate.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''blks_hit'', ''Buffer cache hits (cumulative). Compare to blks_read for cache hit ratio.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''snapshots'', ''blks_read'', ''Disk reads (cumulative). High values = cache misses or large scans.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''statement_snapshots'', ''total_exec_time'', ''Total execution time for this query (ms). Divide by calls for average.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''statement_snapshots'', ''calls'', ''Number of times this query was executed.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''statement_snapshots'', ''rows'', ''Total rows returned by this query.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''statement_snapshots'', ''shared_blks_read'', ''Disk blocks read by this query. High = cache misses.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''statement_snapshots'', ''temp_blks_written'', ''Temp blocks written. Any value > 0 means query exceeded work_mem.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''table_snapshots'', ''n_dead_tup'', ''Dead tuples awaiting vacuum. High values = bloat.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''table_snapshots'', ''seq_scan'', ''Sequential scans on this table. Compare to idx_scan.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''table_snapshots'', ''idx_scan'', ''Index scans on this table. Low ratio to seq_scan may indicate missing indexes.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''wait_event_aggregates'', ''total_waiters'', ''Sum of processes waiting for this event type in the time window.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''wait_event_aggregates'', ''avg_waiters'', ''Average concurrent waiters. High values = sustained contention.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''lock_samples_archive'', ''blocked_duration'', ''How long the blocked process has been waiting for the lock.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''query_storms'', ''multiplier'', ''How many times higher than baseline. 10x = storm is 10x normal rate.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''query_storms'', ''resolved_at'', ''NULL = still active. Set when storm subsides or manually resolved.'');' || E'\n';
-    v_result := v_result || 'INSERT INTO _columns VALUES (''query_regressions'', ''change_pct'', ''Percentage increase in execution time vs baseline. 200 = 3x slower.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''connections_active'', ''Currently active connections (running queries)'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''connections_total'', ''Total connections including idle'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''wal_bytes'', ''WAL generated (cumulative). Diff between snapshots = write activity.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''temp_bytes'', ''Temp file usage (cumulative). High values = queries spilling to disk.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''xact_commit'', ''Committed transactions (cumulative). Diff = transaction rate.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''blks_hit'', ''Buffer cache hits (cumulative). Compare to blks_read for cache hit ratio.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''blks_read'', ''Disk reads (cumulative). High values = cache misses or large scans.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''total_exec_time'', ''Total execution time for this query (ms). Divide by calls for average.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''calls'', ''Number of times this query was executed.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''rows'', ''Total rows returned by this query.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''shared_blks_read'', ''Disk blocks read by this query. High = cache misses.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''temp_blks_written'', ''Temp blocks written. Any value > 0 means query exceeded work_mem.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''table_snapshots'', ''n_dead_tup'', ''Dead tuples awaiting vacuum. High values = bloat.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''table_snapshots'', ''seq_scan'', ''Sequential scans on this table. Compare to idx_scan.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''table_snapshots'', ''idx_scan'', ''Index scans on this table. Low ratio to seq_scan may indicate missing indexes.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''sample_count'', ''Number of samples in this time window where this wait event appeared.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''total_waiters'', ''Sum of processes waiting for this event type in the time window.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''avg_waiters'', ''Average concurrent waiters. High values = sustained contention.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''max_waiters'', ''Maximum concurrent waiters seen in any single sample.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''pct_of_samples'', ''Percentage of samples where this wait event was observed.'');' || E'\n';
+    -- wait_samples_archive columns (raw samples, use when aggregates empty)
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''captured_at'', ''Timestamp when this sample was captured.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''backend_type'', ''Type of backend process (client backend, autovacuum, etc).'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''wait_event_type'', ''Category of wait (Activity, Client, Lock, LWLock, IO, etc).'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''wait_event'', ''Specific wait event name within the type.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''state'', ''Backend state (active, idle, idle in transaction, etc).'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''count'', ''Number of backends in this state at sample time.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''lock_samples_archive'', ''blocked_duration'', ''How long the blocked process has been waiting for the lock.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''query_storms'', ''multiplier'', ''How many times higher than baseline. 10x = storm is 10x normal rate.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''query_storms'', ''resolved_at'', ''NULL = still active. Set when storm subsides or manually resolved.'');' || E'\n';
+    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''query_regressions'', ''change_pct'', ''Percentage increase in execution time vs baseline. 200 = 3x slower.'');' || E'\n';
 
     RETURN v_result;
 END;
