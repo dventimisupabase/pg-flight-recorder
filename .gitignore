@@ -4,3 +4,6 @@ SQL_INDEX.json
 # HubSpot config file
 hubspot.config.yml
 benchmark2/results/*
+
+# Claude Code local settings (user-specific)
+.claude/settings.local.json
