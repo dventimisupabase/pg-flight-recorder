@@ -507,21 +507,31 @@ CREATE TABLE IF NOT EXISTS flight_recorder.canaries (
 COMMENT ON TABLE flight_recorder.canaries IS 'Canary query definitions for synthetic performance monitoring. Pre-defined queries detect silent degradation.';
 
 -- Canary query execution results
--- Stores timing and optional EXPLAIN output for baseline comparison
+-- Stores timing, buffer metrics, and optional EXPLAIN output for baseline comparison
 CREATE TABLE IF NOT EXISTS flight_recorder.canary_results (
-    id              BIGSERIAL PRIMARY KEY,
-    canary_id       INTEGER REFERENCES flight_recorder.canaries(id) ON DELETE CASCADE,
-    executed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    duration_ms     NUMERIC NOT NULL,
-    plan            JSONB,
-    error_message   TEXT,
-    success         BOOLEAN DEFAULT true
+    id                  BIGSERIAL PRIMARY KEY,
+    canary_id           INTEGER REFERENCES flight_recorder.canaries(id) ON DELETE CASCADE,
+    executed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    duration_ms         NUMERIC NOT NULL,
+    plan                JSONB,
+    error_message       TEXT,
+    success             BOOLEAN DEFAULT true,
+    shared_blks_hit     BIGINT,
+    shared_blks_read    BIGINT,
+    temp_blks_read      BIGINT,
+    temp_blks_written   BIGINT,
+    total_buffers       BIGINT
 );
 CREATE INDEX IF NOT EXISTS canary_results_canary_id_executed_at_idx
     ON flight_recorder.canary_results(canary_id, executed_at);
 CREATE INDEX IF NOT EXISTS canary_results_executed_at_idx
     ON flight_recorder.canary_results(executed_at);
-COMMENT ON TABLE flight_recorder.canary_results IS 'Canary query execution results for performance baseline comparison';
+COMMENT ON TABLE flight_recorder.canary_results IS 'Canary query execution results with timing and buffer metrics for performance baseline comparison';
+COMMENT ON COLUMN flight_recorder.canary_results.shared_blks_hit IS 'Shared buffer cache hits during canary execution';
+COMMENT ON COLUMN flight_recorder.canary_results.shared_blks_read IS 'Shared buffer cache misses (disk reads) during canary execution';
+COMMENT ON COLUMN flight_recorder.canary_results.temp_blks_read IS 'Temporary file blocks read during canary execution';
+COMMENT ON COLUMN flight_recorder.canary_results.temp_blks_written IS 'Temporary file blocks written during canary execution';
+COMMENT ON COLUMN flight_recorder.canary_results.total_buffers IS 'Total buffer operations (shared_blks_hit + shared_blks_read + temp_blks_read + temp_blks_written)';
 
 -- Query storm detection results
 -- Stores detected query storms with classification and resolution tracking
@@ -552,18 +562,22 @@ COMMENT ON TABLE flight_recorder.query_storms IS 'Query storm detection results.
 -- Performance regression detection results
 -- Stores detected query performance regressions with classification and resolution tracking
 CREATE TABLE IF NOT EXISTS flight_recorder.query_regressions (
-    id                  BIGSERIAL PRIMARY KEY,
-    detected_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    queryid             BIGINT NOT NULL,
-    query_fingerprint   TEXT NOT NULL,
-    severity            TEXT NOT NULL DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
-    baseline_avg_ms     NUMERIC NOT NULL,
-    current_avg_ms      NUMERIC NOT NULL,
-    change_pct          NUMERIC NOT NULL,
-    correlation         JSONB,  -- Correlated metrics at detection time
-    probable_causes     TEXT[],
-    resolved_at         TIMESTAMPTZ,
-    resolution_notes    TEXT
+    id                      BIGSERIAL PRIMARY KEY,
+    detected_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    queryid                 BIGINT NOT NULL,
+    query_fingerprint       TEXT NOT NULL,
+    severity                TEXT NOT NULL DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
+    baseline_avg_ms         NUMERIC NOT NULL,
+    current_avg_ms          NUMERIC NOT NULL,
+    change_pct              NUMERIC NOT NULL,
+    correlation             JSONB,  -- Correlated metrics at detection time
+    probable_causes         TEXT[],
+    resolved_at             TIMESTAMPTZ,
+    resolution_notes        TEXT,
+    baseline_avg_buffers    NUMERIC,
+    current_avg_buffers     NUMERIC,
+    buffer_change_pct       NUMERIC,
+    detection_metric        TEXT DEFAULT 'buffers'
 );
 CREATE INDEX IF NOT EXISTS query_regressions_detected_at_idx
     ON flight_recorder.query_regressions(detected_at);
@@ -571,7 +585,11 @@ CREATE INDEX IF NOT EXISTS query_regressions_queryid_idx
     ON flight_recorder.query_regressions(queryid);
 CREATE INDEX IF NOT EXISTS query_regressions_severity_idx
     ON flight_recorder.query_regressions(severity) WHERE resolved_at IS NULL;
-COMMENT ON TABLE flight_recorder.query_regressions IS 'Performance regression detection results. Tracks queries whose execution time has increased significantly compared to historical baseline with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
+COMMENT ON TABLE flight_recorder.query_regressions IS 'Performance regression detection results. Tracks queries with significant performance changes using buffer-based metrics (default) or timing with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
+COMMENT ON COLUMN flight_recorder.query_regressions.baseline_avg_buffers IS 'Average total buffer operations during baseline period';
+COMMENT ON COLUMN flight_recorder.query_regressions.current_avg_buffers IS 'Average total buffer operations during recent period';
+COMMENT ON COLUMN flight_recorder.query_regressions.buffer_change_pct IS 'Percentage change in buffer operations (positive = regression)';
+COMMENT ON COLUMN flight_recorder.query_regressions.detection_metric IS 'Metric used for detection: ''buffers'' (default) or ''time''';
 
 
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
@@ -1189,7 +1207,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.16'),
+    ('schema_version', '2.17'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -1300,7 +1318,10 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('forecast_notify_channel', 'flight_recorder_forecasts'),
     ('forecast_disk_capacity_gb', '100'),
     ('forecast_min_samples', '10'),
-    ('forecast_min_confidence', '0.5')
+    ('forecast_min_confidence', '0.5'),
+    ('statements_ranking_metric', 'buffers'),
+    ('regression_detection_metric', 'buffers'),
+    ('canary_comparison_metric', 'buffers')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -3925,7 +3946,11 @@ BEGIN
             FROM pg_stat_statements s
             WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
               AND s.calls >= COALESCE(flight_recorder._get_config('statements_min_calls', '1')::integer, 1)
-            ORDER BY s.total_exec_time DESC
+            ORDER BY CASE
+                WHEN flight_recorder._get_config('statements_ranking_metric', 'buffers') = 'time'
+                THEN s.total_exec_time
+                ELSE s.shared_blks_hit + s.shared_blks_read + s.temp_blks_read + s.temp_blks_written
+            END DESC
             LIMIT COALESCE(flight_recorder._get_config('statements_top_n', '20')::integer, 20);
                     PERFORM flight_recorder._record_section_success(v_stat_id);
                     END IF;
@@ -6670,8 +6695,8 @@ BEGIN
 END;
 $$;
 
--- Executes all enabled canary queries and records timing results
--- Optionally captures EXPLAIN output based on canary_capture_plans config
+-- Executes all enabled canary queries and records timing and buffer metrics
+-- Uses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) to capture precise buffer counts
 CREATE OR REPLACE FUNCTION flight_recorder.run_canaries()
 RETURNS TABLE(
     canary_name TEXT,
@@ -6682,13 +6707,17 @@ RETURNS TABLE(
 LANGUAGE plpgsql AS $$
 DECLARE
     v_enabled BOOLEAN;
-    v_capture_plans BOOLEAN;
     v_canary RECORD;
     v_start_time TIMESTAMPTZ;
     v_duration_ms NUMERIC;
-    v_plan JSONB;
+    v_explain_json JSONB;
     v_error TEXT;
     v_success BOOLEAN;
+    v_shared_blks_hit BIGINT;
+    v_shared_blks_read BIGINT;
+    v_temp_blks_read BIGINT;
+    v_temp_blks_written BIGINT;
+    v_total_buffers BIGINT;
 BEGIN
     v_enabled := COALESCE(
         flight_recorder._get_config('canary_enabled', 'false')::boolean,
@@ -6699,11 +6728,6 @@ BEGIN
         RETURN;
     END IF;
 
-    v_capture_plans := COALESCE(
-        flight_recorder._get_config('canary_capture_plans', 'false')::boolean,
-        false
-    );
-
     FOR v_canary IN
         SELECT c.id, c.name, c.query_text
         FROM flight_recorder.canaries c
@@ -6711,20 +6735,36 @@ BEGIN
         ORDER BY c.id
     LOOP
         v_start_time := clock_timestamp();
-        v_plan := NULL;
+        v_explain_json := NULL;
         v_error := NULL;
         v_success := true;
+        v_shared_blks_hit := 0;
+        v_shared_blks_read := 0;
+        v_temp_blks_read := 0;
+        v_temp_blks_written := 0;
 
         BEGIN
-            -- Capture plan if enabled
-            IF v_capture_plans THEN
-                EXECUTE format('EXPLAIN (FORMAT JSON) %s', v_canary.query_text) INTO v_plan;
-            END IF;
+            -- Execute with EXPLAIN ANALYZE BUFFERS to capture precise metrics
+            EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s', v_canary.query_text)
+            INTO v_explain_json;
 
-            -- Execute the canary query
-            EXECUTE v_canary.query_text;
+            -- Extract timing from EXPLAIN output
+            v_duration_ms := (v_explain_json->0->>'Execution Time')::numeric;
 
-            v_duration_ms := EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) * 1000;
+            -- Extract buffer counts from Planning + Execution
+            -- Planning buffers
+            v_shared_blks_hit := COALESCE((v_explain_json->0->'Planning'->>'Shared Hit Blocks')::bigint, 0);
+            v_shared_blks_read := COALESCE((v_explain_json->0->'Planning'->>'Shared Read Blocks')::bigint, 0);
+            v_temp_blks_read := COALESCE((v_explain_json->0->'Planning'->>'Temp Read Blocks')::bigint, 0);
+            v_temp_blks_written := COALESCE((v_explain_json->0->'Planning'->>'Temp Written Blocks')::bigint, 0);
+
+            -- Execution buffers (at top level of plan)
+            v_shared_blks_hit := v_shared_blks_hit + COALESCE((v_explain_json->0->'Plan'->>'Shared Hit Blocks')::bigint, 0);
+            v_shared_blks_read := v_shared_blks_read + COALESCE((v_explain_json->0->'Plan'->>'Shared Read Blocks')::bigint, 0);
+            v_temp_blks_read := v_temp_blks_read + COALESCE((v_explain_json->0->'Plan'->>'Temp Read Blocks')::bigint, 0);
+            v_temp_blks_written := v_temp_blks_written + COALESCE((v_explain_json->0->'Plan'->>'Temp Written Blocks')::bigint, 0);
+
+            v_total_buffers := v_shared_blks_hit + v_shared_blks_read + v_temp_blks_read + v_temp_blks_written;
 
         EXCEPTION WHEN OTHERS THEN
             v_duration_ms := EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) * 1000;
@@ -6732,9 +6772,17 @@ BEGIN
             v_success := false;
         END;
 
-        -- Record the result
-        INSERT INTO flight_recorder.canary_results (canary_id, executed_at, duration_ms, plan, error_message, success)
-        VALUES (v_canary.id, v_start_time, v_duration_ms, v_plan, v_error, v_success);
+        -- Record the result with buffer metrics
+        INSERT INTO flight_recorder.canary_results (
+            canary_id, executed_at, duration_ms, plan,
+            shared_blks_hit, shared_blks_read, temp_blks_read, temp_blks_written, total_buffers,
+            error_message, success
+        )
+        VALUES (
+            v_canary.id, v_start_time, v_duration_ms, v_explain_json,
+            v_shared_blks_hit, v_shared_blks_read, v_temp_blks_read, v_temp_blks_written, v_total_buffers,
+            v_error, v_success
+        );
 
         -- Return the result
         canary_name := v_canary.name;
@@ -6745,26 +6793,34 @@ BEGIN
     END LOOP;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.run_canaries() IS 'Execute all enabled canary queries and record results. Returns execution summary.';
+COMMENT ON FUNCTION flight_recorder.run_canaries() IS 'Execute all enabled canary queries with EXPLAIN ANALYZE BUFFERS to capture timing and buffer metrics. Returns execution summary.';
 
 -- Returns canary status by comparing current performance to baseline
+-- Uses buffer metrics by default (configurable via canary_comparison_metric)
 -- Baseline: p50 over last 7 days (excluding last day)
 -- Current: p50 over last hour
--- Status: OK, DEGRADED (50% slower), CRITICAL (100% slower)
+-- Status: OK, DEGRADED (50%+ higher), CRITICAL (100%+ higher)
 CREATE OR REPLACE FUNCTION flight_recorder.canary_status()
 RETURNS TABLE(
     canary_name TEXT,
     description TEXT,
     baseline_ms NUMERIC,
     current_ms NUMERIC,
+    baseline_buffers NUMERIC,
+    current_buffers NUMERIC,
     change_pct NUMERIC,
     status TEXT,
+    metric_used TEXT,
     last_executed TIMESTAMPTZ,
     last_error TEXT
 )
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_canary RECORD;
+    v_baseline_ms NUMERIC;
+    v_current_ms NUMERIC;
+    v_baseline_buffers NUMERIC;
+    v_current_buffers NUMERIC;
     v_baseline NUMERIC;
     v_current NUMERIC;
     v_change_pct NUMERIC;
@@ -6773,28 +6829,51 @@ DECLARE
     v_last_error TEXT;
     v_threshold_warning NUMERIC;
     v_threshold_critical NUMERIC;
+    v_metric TEXT;
 BEGIN
+    -- Get comparison metric (default to buffers)
+    v_metric := flight_recorder._get_config('canary_comparison_metric', 'buffers');
+
     FOR v_canary IN
         SELECT c.id, c.name, c.description, c.threshold_warning, c.threshold_critical
         FROM flight_recorder.canaries c
         WHERE c.enabled = true
         ORDER BY c.id
     LOOP
-        -- Calculate baseline: p50 over last 7 days excluding last day
+        -- Calculate baseline timing: p50 over last 7 days excluding last day
         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.duration_ms)
-        INTO v_baseline
+        INTO v_baseline_ms
         FROM flight_recorder.canary_results cr
         WHERE cr.canary_id = v_canary.id
           AND cr.success = true
           AND cr.executed_at >= now() - interval '7 days'
           AND cr.executed_at < now() - interval '1 day';
 
-        -- Calculate current: p50 over last hour
+        -- Calculate current timing: p50 over last hour
         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.duration_ms)
-        INTO v_current
+        INTO v_current_ms
         FROM flight_recorder.canary_results cr
         WHERE cr.canary_id = v_canary.id
           AND cr.success = true
+          AND cr.executed_at >= now() - interval '1 hour';
+
+        -- Calculate baseline buffers: p50 over last 7 days excluding last day
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.total_buffers)
+        INTO v_baseline_buffers
+        FROM flight_recorder.canary_results cr
+        WHERE cr.canary_id = v_canary.id
+          AND cr.success = true
+          AND cr.total_buffers IS NOT NULL
+          AND cr.executed_at >= now() - interval '7 days'
+          AND cr.executed_at < now() - interval '1 day';
+
+        -- Calculate current buffers: p50 over last hour
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.total_buffers)
+        INTO v_current_buffers
+        FROM flight_recorder.canary_results cr
+        WHERE cr.canary_id = v_canary.id
+          AND cr.success = true
+          AND cr.total_buffers IS NOT NULL
           AND cr.executed_at >= now() - interval '1 hour';
 
         -- Get last execution info
@@ -6804,6 +6883,16 @@ BEGIN
         WHERE cr.canary_id = v_canary.id
         ORDER BY cr.executed_at DESC
         LIMIT 1;
+
+        -- Choose metric for comparison (buffers by default, fall back to time if no buffer data)
+        IF v_metric = 'buffers' AND v_baseline_buffers IS NOT NULL AND v_current_buffers IS NOT NULL THEN
+            v_baseline := v_baseline_buffers;
+            v_current := v_current_buffers;
+        ELSE
+            v_baseline := v_baseline_ms;
+            v_current := v_current_ms;
+            v_metric := 'time';  -- Override if using time as fallback
+        END IF;
 
         -- Calculate change percentage and status
         IF v_baseline IS NOT NULL AND v_current IS NOT NULL AND v_baseline > 0 THEN
@@ -6827,17 +6916,20 @@ BEGIN
         -- Return the result
         canary_name := v_canary.name;
         description := v_canary.description;
-        baseline_ms := ROUND(v_baseline, 2);
-        current_ms := ROUND(v_current, 2);
+        baseline_ms := ROUND(v_baseline_ms, 2);
+        current_ms := ROUND(v_current_ms, 2);
+        baseline_buffers := ROUND(v_baseline_buffers, 0);
+        current_buffers := ROUND(v_current_buffers, 0);
         change_pct := v_change_pct;
         status := v_status;
+        metric_used := v_metric;
         last_executed := v_last_executed;
         last_error := v_last_error;
         RETURN NEXT;
     END LOOP;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.canary_status() IS 'Returns canary status comparing current performance (last hour p50) to baseline (last 7 days p50, excluding last day). Status: OK, DEGRADED (50%+ slower), CRITICAL (100%+ slower).';
+COMMENT ON FUNCTION flight_recorder.canary_status() IS 'Returns canary status comparing current performance (last hour p50) to baseline (last 7 days p50, excluding last day). Uses buffer metrics by default (configurable). Status: OK, DEGRADED (50%+ higher), CRITICAL (100%+ higher).';
 
 -- Enables canary monitoring and schedules periodic execution via pg_cron
 CREATE OR REPLACE FUNCTION flight_recorder.enable_canaries()
@@ -7685,8 +7777,9 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder._diagnose_regression_causes(BIGINT) IS 'Internal: Analyze a query to suggest probable causes for performance regression.';
 
--- Detects performance regressions by comparing recent query execution times to baseline
--- Returns queries with significant slowdown classified by severity
+-- Detects performance regressions by comparing recent query metrics to baseline
+-- Uses buffer metrics by default (configurable via regression_detection_metric)
+-- Returns queries with significant regression classified by severity
 CREATE OR REPLACE FUNCTION flight_recorder.detect_regressions(
     p_lookback INTERVAL DEFAULT NULL,
     p_threshold_pct NUMERIC DEFAULT NULL
@@ -7698,6 +7791,10 @@ RETURNS TABLE(
     baseline_avg_ms NUMERIC,
     current_avg_ms NUMERIC,
     change_pct NUMERIC,
+    baseline_avg_buffers NUMERIC,
+    current_avg_buffers NUMERIC,
+    buffer_change_pct NUMERIC,
+    detection_metric TEXT,
     probable_causes TEXT[]
 )
 LANGUAGE plpgsql STABLE AS $$
@@ -7708,6 +7805,7 @@ DECLARE
     v_low_max NUMERIC;
     v_medium_max NUMERIC;
     v_high_max NUMERIC;
+    v_detection_metric TEXT;
 BEGIN
     -- Get configuration with defaults
     v_lookback := COALESCE(
@@ -7728,14 +7826,19 @@ BEGIN
     v_medium_max := flight_recorder._get_config('regression_severity_medium_max', '500.0')::numeric;
     v_high_max := flight_recorder._get_config('regression_severity_high_max', '1000.0')::numeric;
 
+    -- Get detection metric (default to buffers)
+    v_detection_metric := flight_recorder._get_config('regression_detection_metric', 'buffers');
+
     RETURN QUERY
     WITH recent_stats AS (
-        -- Recent query execution times from statement_snapshots
+        -- Recent query metrics from statement_snapshots
         SELECT
             ss.queryid,
             left(ss.query_preview, 100) AS query_preview,
             AVG(ss.mean_exec_time) AS avg_mean_time,
             STDDEV(ss.mean_exec_time) AS stddev_mean_time,
+            AVG(ss.shared_blks_hit + ss.shared_blks_read + ss.temp_blks_read + ss.temp_blks_written) AS avg_total_buffers,
+            STDDEV(ss.shared_blks_hit + ss.shared_blks_read + ss.temp_blks_read + ss.temp_blks_written) AS stddev_total_buffers,
             COUNT(*) AS sample_count
         FROM flight_recorder.statement_snapshots ss
         JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
@@ -7745,11 +7848,13 @@ BEGIN
         GROUP BY ss.queryid, left(ss.query_preview, 100)
     ),
     baseline_stats AS (
-        -- Baseline query times (same hour of day over baseline period, excluding recent)
+        -- Baseline query metrics (over baseline period, excluding recent)
         SELECT
             ss.queryid,
             AVG(ss.mean_exec_time) AS avg_mean_time,
             STDDEV(ss.mean_exec_time) AS stddev_mean_time,
+            AVG(ss.shared_blks_hit + ss.shared_blks_read + ss.temp_blks_read + ss.temp_blks_written) AS avg_total_buffers,
+            STDDEV(ss.shared_blks_hit + ss.shared_blks_read + ss.temp_blks_read + ss.temp_blks_written) AS stddev_total_buffers,
             COUNT(DISTINCT date_trunc('day', s.captured_at)) AS days_sampled
         FROM flight_recorder.statement_snapshots ss
         JOIN flight_recorder.snapshots s ON s.id = ss.snapshot_id
@@ -7764,46 +7869,77 @@ BEGIN
         SELECT
             r.queryid,
             r.query_preview AS query_fingerprint,
+            -- Timing metrics
             b.avg_mean_time::numeric AS baseline_avg_ms,
             r.avg_mean_time::numeric AS current_avg_ms,
-            ROUND(((r.avg_mean_time - b.avg_mean_time) / NULLIF(b.avg_mean_time, 0))::numeric * 100, 2) AS change_pct,
-            -- Z-score calculation for statistical significance
+            ROUND(((r.avg_mean_time - b.avg_mean_time) / NULLIF(b.avg_mean_time, 0))::numeric * 100, 2) AS time_change_pct,
+            -- Buffer metrics
+            b.avg_total_buffers::numeric AS baseline_avg_buffers,
+            r.avg_total_buffers::numeric AS current_avg_buffers,
+            ROUND(((r.avg_total_buffers - b.avg_total_buffers) / NULLIF(b.avg_total_buffers, 0))::numeric * 100, 2) AS buffer_change_pct,
+            -- Z-score calculation for statistical significance (based on detection metric)
             CASE
-                WHEN COALESCE(b.stddev_mean_time, 0) > 0
-                THEN (r.avg_mean_time - b.avg_mean_time) / b.stddev_mean_time
-                ELSE 0
-            END AS z_score
+                WHEN v_detection_metric = 'time' THEN
+                    CASE
+                        WHEN COALESCE(b.stddev_mean_time, 0) > 0
+                        THEN (r.avg_mean_time - b.avg_mean_time) / b.stddev_mean_time
+                        ELSE 0
+                    END
+                ELSE
+                    CASE
+                        WHEN COALESCE(b.stddev_total_buffers, 0) > 0
+                        THEN (r.avg_total_buffers - b.avg_total_buffers) / b.stddev_total_buffers
+                        ELSE 0
+                    END
+            END AS z_score,
+            -- Change percentage based on detection metric
+            CASE
+                WHEN v_detection_metric = 'time' THEN
+                    ROUND(((r.avg_mean_time - b.avg_mean_time) / NULLIF(b.avg_mean_time, 0))::numeric * 100, 2)
+                ELSE
+                    ROUND(((r.avg_total_buffers - b.avg_total_buffers) / NULLIF(b.avg_total_buffers, 0))::numeric * 100, 2)
+            END AS primary_change_pct
         FROM recent_stats r
         JOIN baseline_stats b ON b.queryid = r.queryid
-        WHERE r.avg_mean_time > b.avg_mean_time * (1 + v_threshold_pct / 100)
-          AND r.sample_count >= 2  -- Need multiple samples to be confident
+        WHERE r.sample_count >= 2  -- Need multiple samples to be confident
+          AND CASE
+              WHEN v_detection_metric = 'time' THEN
+                  r.avg_mean_time > b.avg_mean_time * (1 + v_threshold_pct / 100)
+              ELSE
+                  COALESCE(r.avg_total_buffers, 0) > COALESCE(b.avg_total_buffers, 0) * (1 + v_threshold_pct / 100)
+                  AND b.avg_total_buffers IS NOT NULL AND b.avg_total_buffers > 0
+          END
     )
     SELECT
         reg.queryid,
         reg.query_fingerprint,
         CASE
-            WHEN reg.change_pct > v_high_max THEN 'CRITICAL'
-            WHEN reg.change_pct > v_medium_max THEN 'HIGH'
-            WHEN reg.change_pct > v_low_max THEN 'MEDIUM'
+            WHEN reg.primary_change_pct > v_high_max THEN 'CRITICAL'
+            WHEN reg.primary_change_pct > v_medium_max THEN 'HIGH'
+            WHEN reg.primary_change_pct > v_low_max THEN 'MEDIUM'
             ELSE 'LOW'
         END AS severity,
         ROUND(reg.baseline_avg_ms, 2) AS baseline_avg_ms,
         ROUND(reg.current_avg_ms, 2) AS current_avg_ms,
-        reg.change_pct,
+        reg.time_change_pct AS change_pct,
+        ROUND(reg.baseline_avg_buffers, 0) AS baseline_avg_buffers,
+        ROUND(reg.current_avg_buffers, 0) AS current_avg_buffers,
+        reg.buffer_change_pct,
+        v_detection_metric AS detection_metric,
         flight_recorder._diagnose_regression_causes(reg.queryid) AS probable_causes
     FROM regressions reg
-    WHERE reg.z_score > 2 OR reg.change_pct > v_medium_max  -- Statistical filter or significant change
+    WHERE reg.z_score > 2 OR reg.primary_change_pct > v_medium_max  -- Statistical filter or significant change
     ORDER BY
         CASE
-            WHEN reg.change_pct > v_high_max THEN 1
-            WHEN reg.change_pct > v_medium_max THEN 2
-            WHEN reg.change_pct > v_low_max THEN 3
+            WHEN reg.primary_change_pct > v_high_max THEN 1
+            WHEN reg.primary_change_pct > v_medium_max THEN 2
+            WHEN reg.primary_change_pct > v_low_max THEN 3
             ELSE 4
         END,
-        reg.change_pct DESC;
+        reg.primary_change_pct DESC;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.detect_regressions(INTERVAL, NUMERIC) IS 'Detect performance regressions by comparing recent query execution times to baseline. Classifies severity based on percentage change (LOW <200%, MEDIUM <500%, HIGH <1000%, CRITICAL >1000%).';
+COMMENT ON FUNCTION flight_recorder.detect_regressions(INTERVAL, NUMERIC) IS 'Detect performance regressions using buffer metrics (default) or timing. Classifies severity based on percentage change (LOW <200%, MEDIUM <500%, HIGH <1000%, CRITICAL >1000%). Configure via regression_detection_metric.';
 
 -- Sends a pg_notify alert for regression events
 -- Called internally when regressions are detected or resolved
@@ -7954,11 +8090,13 @@ BEGIN
             INSERT INTO flight_recorder.query_regressions (
                 queryid, query_fingerprint, severity,
                 baseline_avg_ms, current_avg_ms, change_pct,
-                probable_causes, correlation
+                baseline_avg_buffers, current_avg_buffers, buffer_change_pct,
+                detection_metric, probable_causes, correlation
             ) VALUES (
                 v_regression.queryid, v_regression.query_fingerprint, v_regression.severity,
                 v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct,
-                v_regression.probable_causes, v_correlation
+                v_regression.baseline_avg_buffers, v_regression.current_avg_buffers, v_regression.buffer_change_pct,
+                v_regression.detection_metric, v_regression.probable_causes, v_correlation
             )
             RETURNING id INTO v_active_regression;
 
@@ -7975,9 +8113,16 @@ BEGIN
                 v_regression.change_pct
             );
 
-            RAISE NOTICE 'pg-flight-recorder: Regression detected - % for queryid % (%.2f ms -> %.2f ms, +%.1f%%)',
-                v_regression.severity, v_regression.queryid,
-                v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct;
+            -- Log with the primary metric used for detection
+            IF v_regression.detection_metric = 'buffers' THEN
+                RAISE NOTICE 'pg-flight-recorder: Regression detected - % for queryid % (% -> % buffers, +%.1f%%)',
+                    v_regression.severity, v_regression.queryid,
+                    v_regression.baseline_avg_buffers, v_regression.current_avg_buffers, v_regression.buffer_change_pct;
+            ELSE
+                RAISE NOTICE 'pg-flight-recorder: Regression detected - % for queryid % (%.2f ms -> %.2f ms, +%.1f%%)',
+                    v_regression.severity, v_regression.queryid,
+                    v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct;
+            END IF;
         END IF;
     END LOOP;
 
@@ -8000,7 +8145,7 @@ $$;
 COMMENT ON FUNCTION flight_recorder.auto_detect_regressions() IS 'Auto-detect performance regressions and log to query_regressions table. Auto-resolves regressions when performance normalizes, with anti-flapping protection. Sends pg_notify alerts when enabled. Called by pg_cron.';
 
 -- Returns current regression status for monitoring
--- Shows active (unresolved) regressions and recent resolved regressions
+-- Shows active (unresolved) regressions and recent resolved regressions with buffer metrics
 CREATE OR REPLACE FUNCTION flight_recorder.regression_status(
     p_lookback INTERVAL DEFAULT '24 hours'
 )
@@ -8013,6 +8158,10 @@ RETURNS TABLE(
     baseline_avg_ms NUMERIC,
     current_avg_ms NUMERIC,
     change_pct NUMERIC,
+    baseline_avg_buffers NUMERIC,
+    current_avg_buffers NUMERIC,
+    buffer_change_pct NUMERIC,
+    detection_metric TEXT,
     correlation JSONB,
     status TEXT,
     duration INTERVAL
@@ -8029,6 +8178,10 @@ BEGIN
         qr.baseline_avg_ms,
         qr.current_avg_ms,
         qr.change_pct,
+        qr.baseline_avg_buffers,
+        qr.current_avg_buffers,
+        qr.buffer_change_pct,
+        qr.detection_metric,
         qr.correlation,
         CASE
             WHEN qr.resolved_at IS NULL THEN 'ACTIVE'
@@ -8050,7 +8203,7 @@ BEGIN
         qr.detected_at DESC;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.regression_status(INTERVAL) IS 'Show current regression status including active and recently resolved regressions with severity and correlation data.';
+COMMENT ON FUNCTION flight_recorder.regression_status(INTERVAL) IS 'Show current regression status including active and recently resolved regressions with timing, buffer metrics, and correlation data.';
 
 -- Enables regression detection and schedules periodic detection via pg_cron
 CREATE OR REPLACE FUNCTION flight_recorder.enable_regression_detection()

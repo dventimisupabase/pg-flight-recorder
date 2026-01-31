@@ -1,12 +1,12 @@
 -- =============================================================================
 -- pg-flight-recorder pgTAP Tests - Canary Queries
 -- =============================================================================
--- Tests: Canary query definitions, execution, and status functions
--- Test count: 25
+-- Tests: Canary query definitions, execution, status functions, and buffer metrics
+-- Test count: 34
 -- =============================================================================
 
 BEGIN;
-SELECT plan(25);
+SELECT plan(34);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -58,7 +58,7 @@ SELECT has_column(
 );
 
 -- =============================================================================
--- 3. COLUMN EXISTENCE - canary_results table (4 tests)
+-- 3. COLUMN EXISTENCE - canary_results table (9 tests)
 -- =============================================================================
 
 SELECT has_column(
@@ -81,8 +81,33 @@ SELECT has_column(
     'canary_results table should have success column'
 );
 
+SELECT has_column(
+    'flight_recorder', 'canary_results', 'shared_blks_hit',
+    'canary_results table should have shared_blks_hit column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'canary_results', 'shared_blks_read',
+    'canary_results table should have shared_blks_read column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'canary_results', 'temp_blks_read',
+    'canary_results table should have temp_blks_read column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'canary_results', 'temp_blks_written',
+    'canary_results table should have temp_blks_written column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'canary_results', 'total_buffers',
+    'canary_results table should have total_buffers column'
+);
+
 -- =============================================================================
--- 4. CONFIG SETTINGS (4 tests)
+-- 4. CONFIG SETTINGS (5 tests)
 -- =============================================================================
 
 SELECT ok(
@@ -103,6 +128,11 @@ SELECT ok(
 SELECT ok(
     EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'retention_canary_days'),
     'retention_canary_days config setting should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'canary_comparison_metric'),
+    'canary_comparison_metric config setting should exist'
 );
 
 -- =============================================================================
@@ -175,6 +205,29 @@ SELECT lives_ok(
 SELECT ok(
     (SELECT count(*) FROM flight_recorder.canary_status()) >= 4,
     'canary_status() should return rows for all enabled canaries'
+);
+
+-- =============================================================================
+-- 9. BUFFER METRICS IN RESULTS (3 tests)
+-- =============================================================================
+
+-- Verify buffer columns are populated after run_canaries()
+SELECT ok(
+    (SELECT count(*) FROM flight_recorder.canary_results WHERE total_buffers IS NOT NULL) >= 4,
+    'run_canaries() should populate total_buffers column'
+);
+
+-- Verify canary_status returns buffer columns
+SELECT ok(
+    (SELECT baseline_buffers IS NULL OR baseline_buffers >= 0
+     FROM flight_recorder.canary_status() LIMIT 1),
+    'canary_status() should return baseline_buffers column'
+);
+
+SELECT ok(
+    (SELECT metric_used IN ('buffers', 'time')
+     FROM flight_recorder.canary_status() LIMIT 1),
+    'canary_status() should return metric_used column with valid value'
 );
 
 -- Disable canaries after testing

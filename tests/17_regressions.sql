@@ -1,12 +1,12 @@
 -- =============================================================================
 -- pg-flight-recorder pgTAP Tests - Performance Regression Detection
 -- =============================================================================
--- Tests: Regression detection definitions, execution, status, resolution, dashboard, notifications, severity
--- Test count: 57
+-- Tests: Regression detection definitions, execution, status, resolution, dashboard, notifications, severity, buffer metrics
+-- Test count: 66
 -- =============================================================================
 
 BEGIN;
-SELECT plan(57);
+SELECT plan(66);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -24,7 +24,7 @@ SELECT has_table(
 );
 
 -- =============================================================================
--- 2. COLUMN EXISTENCE - query_regressions table (12 tests)
+-- 2. COLUMN EXISTENCE - query_regressions table (16 tests)
 -- =============================================================================
 
 SELECT has_column(
@@ -87,8 +87,28 @@ SELECT has_column(
     'query_regressions table should have resolution_notes column'
 );
 
+SELECT has_column(
+    'flight_recorder', 'query_regressions', 'baseline_avg_buffers',
+    'query_regressions table should have baseline_avg_buffers column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'query_regressions', 'current_avg_buffers',
+    'query_regressions table should have current_avg_buffers column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'query_regressions', 'buffer_change_pct',
+    'query_regressions table should have buffer_change_pct column'
+);
+
+SELECT has_column(
+    'flight_recorder', 'query_regressions', 'detection_metric',
+    'query_regressions table should have detection_metric column'
+);
+
 -- =============================================================================
--- 3. CONFIG SETTINGS (12 tests)
+-- 3. CONFIG SETTINGS (14 tests)
 -- =============================================================================
 
 SELECT ok(
@@ -149,6 +169,16 @@ SELECT ok(
 SELECT ok(
     EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'retention_regressions_days'),
     'retention_regressions_days config setting should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'regression_detection_metric'),
+    'regression_detection_metric config setting should exist'
+);
+
+SELECT ok(
+    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'statements_ranking_metric'),
+    'statements_ranking_metric config setting should exist'
 );
 
 -- =============================================================================
@@ -430,6 +460,31 @@ SELECT ok(
 
 -- Cleanup correlation test data
 DELETE FROM flight_recorder.query_regressions WHERE queryid = 88888;
+
+-- =============================================================================
+-- 12. BUFFER METRICS IN DETECT_REGRESSIONS (3 tests)
+-- =============================================================================
+
+-- Test detect_regressions returns buffer metrics columns
+SELECT lives_ok(
+    $$SELECT baseline_avg_buffers, current_avg_buffers, buffer_change_pct, detection_metric
+      FROM flight_recorder.detect_regressions() LIMIT 1$$,
+    'detect_regressions() should return buffer metrics columns'
+);
+
+-- Test regression_status returns buffer metrics columns
+SELECT lives_ok(
+    $$SELECT baseline_avg_buffers, current_avg_buffers, buffer_change_pct, detection_metric
+      FROM flight_recorder.regression_status() LIMIT 1$$,
+    'regression_status() should return buffer metrics columns'
+);
+
+-- Test detection_metric defaults to 'buffers'
+SELECT is(
+    flight_recorder._get_config('regression_detection_metric', 'unknown'),
+    'buffers',
+    'regression_detection_metric should default to buffers'
+);
 
 -- Disable regression detection after testing (should already be disabled)
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'regression_detection_enabled';
