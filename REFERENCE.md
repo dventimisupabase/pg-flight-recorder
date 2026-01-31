@@ -41,6 +41,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 - [Visual Timeline](#visual-timeline)
 - [Testing and Benchmarking](#testing-and-benchmarking)
 - [Code Browser](#code-browser)
+- [SQLite Export](#sqlite-export)
 
 ---
 
@@ -3412,3 +3413,169 @@ For local development, use the `./tools/gg` wrapper:
 ./tools/gg grep take_snapshot    # search file contents
 ./tools/gg ctx install.sql:100   # show context around line
 ```
+
+## SQLite Export
+
+Export flight_recorder data to SQLite for offline analysis, archival, or AI-driven exploration.
+
+### Why SQLite
+
+- **Ubiquitous** - every system has it, AI tools can query it directly
+- **Single file** - easy to share, archive, analyze offline
+- **No setup** - `sqlite3 flight_recorder.db "SELECT ..."`
+- **Good enough** - handles ~500K-1M rows typical of 7-30 day retention
+
+### Usage
+
+The database can export itself to SQLite-compatible SQL. Just pipe to `sqlite3`:
+
+```bash
+# Basic export - one-liner, no dependencies beyond psql and sqlite3
+psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db
+
+# Export only recent data (last 7 days)
+psql -At -c "SELECT flight_recorder.export_sql('7 days')" mydb | sqlite3 flight_recorder.db
+
+# With compression
+psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db && gzip flight_recorder.db
+```
+
+The `export_sql()` function generates SQLite-compatible SQL that includes:
+
+- `CREATE TABLE` statements with proper type mappings
+- `INSERT` statements for all data (wrapped in a transaction for performance)
+- Indexes on common query patterns
+- Export metadata
+- AI methodology guide (`_guide` and `_tables` tables)
+
+### Output Structure
+
+The exported SQLite database contains all flight_recorder tables:
+
+| Table | Description |
+|-------|-------------|
+| `snapshots` | System state snapshots (WAL, checkpoints, connections) |
+| `statement_snapshots` | Query performance from pg_stat_statements |
+| `table_snapshots` | Table statistics and bloat indicators |
+| `index_snapshots` | Index usage statistics |
+| `replication_snapshots` | Replication lag and status |
+| `config_snapshots` | PostgreSQL configuration history |
+| `db_role_config_snapshots` | Role-specific settings |
+| `vacuum_progress_snapshots` | Vacuum operations in progress |
+| `wait_samples_archive` | Wait events (detailed, 7-day retention) |
+| `activity_samples_archive` | Session activity (detailed, 7-day retention) |
+| `lock_samples_archive` | Lock contention (detailed, 7-day retention) |
+| `wait_event_aggregates` | Wait events (5-min summaries) |
+| `activity_aggregates` | Activity (5-min summaries) |
+| `lock_aggregates` | Locks (5-min summaries) |
+| `canaries` | Synthetic query definitions |
+| `canary_results` | Synthetic query results |
+| `query_storms` | Detected query spikes |
+| `query_regressions` | Performance regressions |
+| `config` | Flight recorder settings |
+| `_export_metadata` | Export timestamp, version info |
+| `_guide` | **AI docs** - 8-step analysis methodology |
+| `_tables` | **AI docs** - table descriptions and time columns |
+| `_examples` | **AI docs** - ready-to-run SQL queries by category |
+| `_glossary` | **AI docs** - definitions of key terms |
+| `_columns` | **AI docs** - explanations of important columns |
+
+### AI Analysis Guide
+
+The export includes self-documenting tables that teach AI how to analyze the data:
+
+```sql
+-- Read the methodology first (8-step progressive refinement)
+SELECT * FROM _guide ORDER BY step;
+
+-- Understand each table's purpose
+SELECT * FROM _tables;
+
+-- Get example queries for common analysis patterns
+SELECT * FROM _examples ORDER BY category, name;
+
+-- Look up unfamiliar terms
+SELECT * FROM _glossary WHERE term = 'wait_event';
+
+-- Understand what key columns mean
+SELECT * FROM _columns WHERE table_name = 'snapshots';
+```
+
+| Table | Purpose |
+|-------|---------|
+| `_guide` | 8-step methodology from "START HERE" through correlation analysis |
+| `_tables` | Description and time column for each data table |
+| `_examples` | Ready-to-run SQL queries organized by tier (quick_status → drill_down) |
+| `_glossary` | Definitions of PostgreSQL/monitoring terms (wait_event, query_storm, etc.) |
+| `_columns` | Explanations of important columns in key tables |
+
+The documentation travels with the data - no external references needed.
+
+### Type Mapping
+
+| PostgreSQL | SQLite |
+|------------|--------|
+| INTEGER, BIGINT, SERIAL | INTEGER |
+| TEXT, VARCHAR | TEXT |
+| BOOLEAN | INTEGER (0/1) |
+| TIMESTAMPTZ | TEXT (ISO 8601) |
+| INTERVAL | TEXT |
+| NUMERIC, REAL | REAL |
+| JSONB | TEXT (JSON string) |
+| ARRAY | TEXT (JSON array) |
+
+### Progressive Refinement Workflow
+
+The exported SQLite enables tiered analysis for AI assistants:
+
+**Tier 1: Quick Status**
+
+```sql
+-- How many anomalies?
+SELECT COUNT(*) FROM query_storms WHERE resolved_at IS NULL;
+SELECT COUNT(*) FROM query_regressions WHERE resolved_at IS NULL;
+
+-- Recent activity level?
+SELECT COUNT(*), MAX(captured_at) FROM snapshots
+WHERE captured_at > datetime('now', '-1 hour');
+```
+
+**Tier 2: Summary View**
+
+```sql
+-- Top wait events in last hour
+SELECT wait_event_type, wait_event, SUM(count) as total
+FROM wait_samples_archive
+WHERE captured_at > datetime('now', '-1 hour')
+GROUP BY wait_event_type, wait_event
+ORDER BY total DESC LIMIT 10;
+
+-- Connection trend
+SELECT strftime('%H:%M', captured_at) as time,
+       AVG(connections_active) as avg_conn
+FROM snapshots
+WHERE captured_at > datetime('now', '-4 hours')
+GROUP BY strftime('%H:%M', captured_at);
+```
+
+**Tier 3: Drill Down**
+
+```sql
+-- What queries were running during lock contention?
+SELECT captured_at, blocked_query_preview, blocking_query_preview,
+       blocked_duration, lock_type
+FROM lock_samples_archive
+WHERE captured_at BETWEEN '2024-01-15 14:00' AND '2024-01-15 14:30'
+ORDER BY blocked_duration DESC;
+
+-- Correlate with wait events
+SELECT captured_at, wait_event_type, wait_event, count
+FROM wait_samples_archive
+WHERE captured_at BETWEEN '2024-01-15 14:00' AND '2024-01-15 14:30'
+  AND wait_event_type = 'Lock'
+ORDER BY captured_at;
+```
+
+### Requirements
+
+Just `psql` and `sqlite3` - both are ubiquitous. No Python, no drivers, no dependencies.

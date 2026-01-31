@@ -84,6 +84,28 @@ If you're building monitoring tools today, consider:
 
 **5. Think about the AI as a user.** What would an AI need to diagnose a problem? Probably not a PNG of a graph. Probably structured data with clear semantics and the ability to query arbitrary time ranges.
 
+## Record Comprehensively, Present Hierarchically
+
+A caveat before we get too enthusiastic about "record everything."
+
+AI attention is cheaper than human attention, but it isn't infinite. Context windows have limits. More importantly, signal-to-noise ratio still matters. An AI drowning in irrelevant data can lose the signal just like a human can—it just takes more noise to get there.
+
+This suggests some countervailing principles:
+
+**Low order methods first.** Start with simple aggregates: connection count, query rate, error rate. If these look normal, you may not need to dig deeper. Don't reach for the detailed wait event analysis when the summary shows nothing unusual.
+
+**Top down, not bottom up.** Begin with the summary, not the raw data. "3 anomalies detected in the last hour" is a better starting point than "here are 50,000 rows of telemetry." The detail exists to explain the summary, not replace it.
+
+**Recursive refinement.** Let the investigator—human or AI—pull the thread. "Tell me more about that lock contention at 14:03" fetches relevant detail on demand. The system doesn't dump everything; it responds to questions.
+
+**Progressive reveal.** Structure the data in layers. A `report()` function that surfaces likely-relevant information is more useful than a raw table dump, even if both contain the same underlying data. The layers guide attention toward signal.
+
+The key distinction: *record* comprehensively, but *present* hierarchically.
+
+The flight recorder captures everything, but the crash investigator doesn't read every byte of every channel simultaneously. They start with the summary—loss of altitude at timestamp T—then drill into control inputs, then engine telemetry, then voice recordings. Each layer adds detail to explain what the previous layer surfaced.
+
+For database monitoring, this means the raw data should be queryable, not just dumpable. An AI that can ask "show me wait events between 14:02 and 14:05 for queries touching the orders table" will outperform one that receives the entire wait event history and is told "find the problem." The comprehensive recording enables the precise query; it doesn't replace the need for precision.
+
 ## The Opportunity
 
 The flip side of "bitter" is "opportunity." If general methods win, then the teams that embrace them early get an advantage.
