@@ -1,5 +1,6 @@
 # pg-flight-recorder
 
+[![GitHub release](https://img.shields.io/github/v/release/dventimisupabase/pg-flight-recorder)](https://github.com/dventimisupabase/pg-flight-recorder/releases/latest)
 [![Test Suite](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/test.yml/badge.svg)](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/test.yml)
 [![Lint](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/lint.yml/badge.svg)](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/lint.yml)
 
@@ -46,3 +47,11 @@ psql -f uninstall.sql
 ## More Info
 
 See [REFERENCE.md](REFERENCE.md) for all functions, views, profiles, and configuration options.
+
+### Export to SQLite
+
+Export data for offline analysis or AI-driven exploration:
+
+```bash
+psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db
+```

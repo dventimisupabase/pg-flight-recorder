@@ -1,0 +1,71 @@
+name: Generate SQL Index
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.sql'
+      - 'tools/sql-index'
+      - 'tools/Dockerfile.pglast'
+      - '.github/workflows/sql-index.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build SQL Index
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build pglast-indexer image
+        run: docker build -t pglast-indexer -f tools/Dockerfile.pglast .
+
+      - name: Generate SQL_INDEX.json
+        run: |
+          docker run --rm -v "$(pwd):/src" pglast-indexer > SQL_INDEX.json
+          echo ""
+          echo "Generated SQL_INDEX.json:"
+          ls -lh SQL_INDEX.json
+          echo ""
+          echo "Index summary:"
+          cat SQL_INDEX.json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          tables = sum(len(f['tables']) for f in data)
+          functions = sum(len(f['functions']) for f in data)
+          views = sum(len(f['views']) for f in data)
+          types = sum(len(f['types']) for f in data)
+          columns = sum(len(t['columns']) for f in data for t in f['tables'])
+          print(f'Files: {len(data)}')
+          print(f'Tables: {tables}')
+          print(f'Functions: {functions}')
+          print(f'Views: {views}')
+          print(f'Types: {types}')
+          print(f'Columns: {columns}')
+          "
+
+      - name: Upload SQL index as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-index
+          path: SQL_INDEX.json
+          retention-days: 30
+
+      - name: Push SQL_INDEX.json to sql-index branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create orphan branch with just the index file
+          git checkout --orphan sql-index-temp
+          git reset
+          git add -f SQL_INDEX.json
+          git commit -m "Update SQL_INDEX.json"
+
+          # Force push to sql-index branch
+          git push origin sql-index-temp:sql-index --force

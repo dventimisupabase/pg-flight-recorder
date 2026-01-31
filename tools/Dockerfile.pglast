@@ -1,0 +1,17 @@
+# Dockerfile for pglast SQL indexer
+#
+# Build: docker build -t pglast-indexer -f tools/Dockerfile.pglast .
+# Run:   docker run --rm -v "$(pwd):/src" pglast-indexer
+#
+FROM python:3.12-slim
+
+# Install pglast
+RUN pip install --no-cache-dir pglast>=7.0
+
+WORKDIR /src
+
+# Copy the sql-index script
+COPY tools/sql-index /usr/local/bin/sql-index
+RUN chmod +x /usr/local/bin/sql-index
+
+ENTRYPOINT ["sql-index"]

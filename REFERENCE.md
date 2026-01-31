@@ -29,12 +29,19 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 **Part V: Capacity Planning**
 
 - [Capacity Planning](#capacity-planning)
+- [Performance Forecasting](#performance-forecasting)
 
 **Part VI: Reference Material**
 
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
+- [Canary Queries](#canary-queries)
+- [Query Storm Detection](#query-storm-detection)
+- [Performance Regression Detection](#performance-regression-detection)
+- [Visual Timeline](#visual-timeline)
 - [Testing and Benchmarking](#testing-and-benchmarking)
+- [Code Browser](#code-browser)
+- [SQLite Export](#sqlite-export)
 
 ---
 
@@ -451,6 +458,12 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
+| 2.13 | Visual Timeline: `_sparkline()`, `_bar()`, `timeline()`, `sparkline_metrics()` functions for ASCII-based metric visualization |
+| 2.12 | Performance regression detection: `query_regressions` table, `detect_regressions()`, `regression_status()`, `regression_dashboard` view |
+| 2.11 | Query storm severity levels and correlation data, anti-flapping protection for auto-resolution |
+| 2.10 | Query storm detection: `query_storms` table, `detect_query_storms()`, `storm_status()`, `storm_dashboard` view |
+| 2.9 | Canary queries: `canaries` and `canary_results` tables, `run_canaries()`, `canary_status()` functions |
+| 2.8 | OID exhaustion detection: `max_catalog_oid` and `large_object_count` columns, `OID_EXHAUSTION_RISK` anomaly type, rate calculation functions (`oid_consumption_rate`, `time_to_oid_exhaustion`) |
 | 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
 | 2.5 | Activity session/transaction age (`backend_start`, `xact_start`), vacuum progress monitoring (`pg_stat_progress_vacuum`), WAL archiver status (`pg_stat_archiver`) |
@@ -464,7 +477,7 @@ See `migrations/README.md` for detailed migration documentation.
 
 ## Configuration Profiles
 
-Profiles provide pre-configured settings for common use cases. Start here instead of tuning individual parameters.
+Profiles provide pre-configured settings for common use cases. Each profile sets **77 parameters** with values tuned for its specific use case. Start here instead of tuning individual parameters.
 
 ### Profile Comparison
 
@@ -473,9 +486,72 @@ Profiles provide pre-configured settings for common use cases. Start here instea
 | `default` | 180s | 0.013% | All | Balanced | 30d/7d | 15min/7d |
 | `production_safe` | 300s | 0.008% | Wait/activity | Aggressive | 30d/7d | 30min/14d |
 | `development` | 180s | 0.013% | All | Balanced | 7d/3d | 15min/3d |
-| `troubleshooting` | 60s | 0.04% | All + top 50 | Lenient | 7d/3d | 5min/7d |
+| `troubleshooting` | 60s | 0.04% | All + top 100 | Lenient | 7d/7d | 5min/7d |
 | `minimal_overhead` | 300s | 0.008% | Wait/activity | Very aggressive | 7d/3d | Disabled |
 | `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d | 15min/7d |
+
+### Key Profile Settings
+
+#### Timeouts & Memory
+
+| Profile | section_timeout | statement_timeout | work_mem |
+|---------|-----------------|-------------------|----------|
+| `default` | 250ms | 1000ms | 2MB |
+| `production_safe` | 200ms | 800ms | 1MB |
+| `development` | 250ms | 1000ms | 2MB |
+| `troubleshooting` | 500ms | 2000ms | 4MB |
+| `minimal_overhead` | 100ms | 500ms | 1MB |
+| `high_ddl` | 200ms | 800ms | 2MB |
+
+#### Load Thresholds
+
+| Profile | skip_locks | skip_activity | throttle_xact | throttle_blk |
+|---------|------------|---------------|---------------|--------------|
+| `default` | 50 | 100 | 1000/s | 10000/s |
+| `production_safe` | 30 | 50 | 500/s | 5000/s |
+| `development` | 50 | 100 | 1000/s | 10000/s |
+| `troubleshooting` | 100 | 200 | 2000/s | 20000/s |
+| `minimal_overhead` | 20 | 30 | 300/s | 3000/s |
+| `high_ddl` | 30 | 100 | 1000/s | 10000/s |
+
+#### Statement Collection
+
+| Profile | interval | min_calls | top_n |
+|---------|----------|-----------|-------|
+| `default` | 15min | 1 | 20 |
+| `production_safe` | 30min | 5 | 20 |
+| `development` | 15min | 1 | 20 |
+| `troubleshooting` | 5min | 1 | 50 |
+| `minimal_overhead` | 30min | 10 | 20 |
+| `high_ddl` | 15min | 1 | 20 |
+
+#### Advanced Features
+
+| Profile | Canary | Storm | Regression | Forecast | Jitter | Auto-mode |
+|---------|--------|-------|------------|----------|--------|-----------|
+| `default` | off | off | off | on | on | 60% |
+| `production_safe` | off | off | off | on | on | 50% |
+| `development` | **on** | **on** | **on** | on+alerts | on | 60% |
+| `troubleshooting` | **on** | **on** | **on** | on+alerts | off | disabled |
+| `minimal_overhead` | off | off | off | off | off | 40% |
+| `high_ddl` | off | off | off | on | on | 60% |
+
+#### Troubleshooting-Specific Tuning
+
+The `troubleshooting` profile includes more sensitive detection settings:
+
+| Setting | Default | Troubleshooting |
+|---------|---------|-----------------|
+| `storm_threshold_multiplier` | 3.0x | 2.0x |
+| `storm_baseline_days` | 7 | 3 |
+| `storm_lookback_interval` | 1 hour | 30 minutes |
+| `storm_min_duration_minutes` | 5 | 2 |
+| `regression_threshold_pct` | 50% | 25% |
+| `regression_baseline_days` | 7 | 3 |
+| `regression_lookback_interval` | 1 hour | 30 minutes |
+| `regression_min_duration_minutes` | 30 | 10 |
+| `forecast_lookback_days` | 7 | 3 |
+| `forecast_window_days` | 7 | 3 |
 
 ### Profile Commands
 
@@ -496,17 +572,17 @@ SELECT * FROM flight_recorder.get_current_profile();
 
 ### Choosing a Profile
 
-**`default`** — General-purpose monitoring. Start here.
+**`default`** — General-purpose monitoring. Balanced settings for most workloads. Start here.
 
-**`production_safe`** — Production with strict SLAs. 40% less overhead, aggressive safety thresholds, locks disabled.
+**`production_safe`** — Production with strict SLAs. 40% less overhead through aggressive skipping, faster timeouts, lower memory usage. Locks and progress tracking disabled. Emergency mode triggers earlier (50% connections).
 
-**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention.
+**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention. **Enables canary queries, storm detection, regression detection, and forecast alerts** for full feature testing.
 
-**`troubleshooting`** — Active incidents. High-frequency collection (60s), lenient safety thresholds. **Temporary use only**—switch back after incident.
+**`troubleshooting`** — Active incidents. High-frequency collection (60s), lenient safety thresholds, more memory for complex queries. Disables jitter for consistent timing and auto-mode to prevent emergency throttling. **More sensitive detection thresholds** for storms and regressions. **Temporary use only**—switch back after incident.
 
-**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint, archives disabled.
+**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint with very aggressive skipping, fastest timeouts, archives disabled, forecasting disabled. Emergency mode triggers very early (40% connections).
 
-**`high_ddl`** — Multi-tenant SaaS, frequent schema changes. Pre-checks for DDL locks, fast lock timeout.
+**`high_ddl`** — Multi-tenant SaaS, frequent schema changes. Pre-checks for DDL locks, fast lock timeout, aggressive lock skipping to avoid blocking on DDL operations.
 
 ### Combining Profiles with Overrides
 
@@ -531,30 +607,105 @@ SELECT * FROM flight_recorder.config;
 
 ### Configuration Reference
 
+#### Core Settings
+
 | Key | Default | Purpose |
 |-----|---------|---------|
+| `schema_version` | 2.16 | Current schema version (read-only) |
+| `mode` | normal | Operating mode: `normal`, `emergency`, or `disabled` |
 | `sample_interval_seconds` | 180 | Ring buffer sample frequency |
 | `ring_buffer_slots` | 120 | Number of ring buffer slots (72-2880) |
+
+#### Statement Collection
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `statements_enabled` | auto | Enable pg_stat_statements: `true`, `false`, or `auto` |
 | `statements_interval_minutes` | 15 | pg_stat_statements collection interval |
 | `statements_top_n` | 20 | Number of top queries to capture |
+| `statements_min_calls` | 1 | Minimum call count to include query |
+| `enable_locks` | true | Collect lock contention data |
+| `enable_progress` | true | Collect pg_stat_progress_* data |
+
+#### Safety & Timeouts
+
+| Key | Default | Purpose |
+|-----|---------|---------|
 | `snapshot_based_collection` | true | Use temp table snapshot (reduces catalog locks) |
-| `adaptive_sampling` | true | Skip collection when system idle |
-| `adaptive_sampling_idle_threshold` | 5 | Skip if < N active connections |
-| `circuit_breaker_threshold_ms` | 1000 | Max collection duration before skip |
-| `circuit_breaker_enabled` | true | Enable circuit breaker |
-| `auto_mode_enabled` | true | Auto-adjust collection mode |
-| `auto_mode_connections_threshold` | 60 | % connections to trigger emergency mode |
+| `lock_timeout_strategy` | fail_fast | Lock strategy: `fail_fast` or `skip_if_locked` |
+| `check_ddl_before_collection` | true | Check for DDL locks before collecting |
+| `check_replica_lag` | true | Skip collection if replica lag is high |
+| `replica_lag_threshold` | 10 seconds | Max replica lag before skipping |
+| `check_checkpoint_backup` | true | Check for checkpoint/backup activity |
+| `check_pss_conflicts` | true | Check for pg_stat_statements conflicts |
+| `statement_timeout_ms` | 1000 | Statement timeout for collection queries |
 | `section_timeout_ms` | 250 | Per-section query timeout |
 | `lock_timeout_ms` | 100 | Max wait for catalog locks |
-| `skip_locks_threshold` | 50 | Skip lock collection if > N blocked |
-| `skip_activity_conn_threshold` | 100 | Skip activity if > N active connections |
+| `work_mem_kb` | 2048 | work_mem for collection queries |
+
+#### Circuit Breaker
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `circuit_breaker_enabled` | true | Enable circuit breaker |
+| `circuit_breaker_threshold_ms` | 1000 | Max collection duration before skip |
+| `circuit_breaker_window_minutes` | 15 | Window for tracking circuit breaker trips |
+
+#### Load Protection
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `adaptive_sampling` | true | Skip collection when system idle |
+| `adaptive_sampling_idle_threshold` | 5 | Skip if < N active connections |
 | `load_shedding_enabled` | true | Skip during high connection load |
 | `load_shedding_active_pct` | 70 | Skip if active connections > N% of max |
 | `load_throttle_enabled` | true | Skip during I/O/transaction pressure |
 | `load_throttle_xact_threshold` | 1000 | Skip if transactions > N/sec |
 | `load_throttle_blk_threshold` | 10000 | Skip if block I/O > N/sec |
+| `skip_locks_threshold` | 50 | Skip lock collection if > N blocked |
+| `skip_activity_conn_threshold` | 100 | Skip activity if > N active connections |
+
+#### Auto Mode
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `auto_mode_enabled` | true | Auto-adjust collection mode |
+| `auto_mode_connections_threshold` | 60 | % connections to trigger emergency mode |
+| `auto_mode_trips_threshold` | 1 | Circuit breaker trips to trigger emergency |
+
+#### Collection Jitter
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `collection_jitter_enabled` | true | Add random delay to prevent thundering herd |
+| `collection_jitter_max_seconds` | 10 | Maximum jitter delay in seconds |
+
+#### Schema Size Limits
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `schema_size_check_enabled` | true | Enable schema size checking |
 | `schema_size_warning_mb` | 5000 | Log warning at this schema size |
 | `schema_size_critical_mb` | 10000 | Auto-disable at this schema size |
+| `schema_size_use_percentage` | true | Use percentage-based limits |
+| `schema_size_percentage` | 5.0 | Max schema size as % of database |
+| `schema_size_min_mb` | 1000 | Minimum threshold for percentage mode |
+| `schema_size_max_mb` | 10000 | Maximum threshold for percentage mode |
+
+#### Health & Monitoring
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `self_monitoring_enabled` | true | Track Flight Recorder's own performance |
+| `health_check_enabled` | true | Enable health check function |
+
+#### Alerts
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `alert_enabled` | false | Enable pg_notify alerts |
+| `alert_circuit_breaker_count` | 5 | Alert after N circuit breaker trips |
+| `alert_schema_size_mb` | 8000 | Alert when schema exceeds this size |
 
 ### Retention Settings
 
@@ -562,11 +713,16 @@ Single authoritative reference for all retention periods:
 
 | Setting | Default | Storage | Purpose |
 |---------|---------|---------|---------|
+| `retention_samples_days` | 7 | Samples | Raw ring buffer samples |
 | `aggregate_retention_days` | 7 | Aggregates | Aggregated summaries |
 | `archive_retention_days` | 7 | Raw Archives | Raw sample archives |
 | `retention_snapshots_days` | 30 | Snapshots | System stat snapshots |
 | `retention_statements_days` | 30 | Snapshots | Query snapshots |
 | `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
+| `retention_canary_days` | 7 | Canary | Canary query results |
+| `retention_storms_days` | 30 | Storms | Query storm history |
+| `retention_regressions_days` | 30 | Regressions | Performance regression history |
+| `snapshot_retention_days_extended` | 90 | Extended | Extended snapshot retention for capacity planning |
 
 Ring buffers self-clean via slot overwrite—no retention setting needed. Size is configurable via `ring_buffer_slots` (see [Ring Buffer Optimization](#ring-buffer-optimization)).
 
@@ -623,8 +779,9 @@ Index tracking captures scan counts, tuple reads/fetches, and index sizes for de
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `config_snapshots_enabled` | true | Enable PostgreSQL config tracking |
+| `db_role_config_snapshots_enabled` | true | Enable database/role config override tracking |
 
-Configuration snapshots capture ~50 relevant PostgreSQL parameters (memory, connections, parallelism, WAL, autovacuum, etc.) to provide context during incident analysis and detect configuration drift.
+Configuration snapshots capture ~50 relevant PostgreSQL parameters (memory, connections, parallelism, WAL, autovacuum, etc.) to provide context during incident analysis and detect configuration drift. Database/role config snapshots track `ALTER DATABASE ... SET` and `ALTER ROLE ... SET` overrides.
 
 ### Threshold Tuning
 
@@ -1379,6 +1536,210 @@ ORDER BY utilization_pct;
 
 ---
 
+## Performance Forecasting
+
+Flight Recorder predicts resource depletion using linear regression on historical data. This enables proactive capacity planning by answering: "When will I run out?"
+
+### Overview
+
+Forecasting extends existing capacity planning:
+
+| Feature | Question Answered | Focus |
+|---------|-------------------|-------|
+| `capacity_summary()` | "What's my current utilization?" | Present state, headroom % |
+| `capacity_dashboard` | "What's my overall status?" | At-a-glance with growth rate |
+| `forecast()` | "When will I run out?" | Future depletion time |
+| `forecast_summary()` | "What resources need attention soon?" | Prioritized by urgency |
+
+**Key benefits:**
+
+- Uses existing snapshot data (no new collection overhead)
+- Predicts when resources will be exhausted
+- Provides confidence scores (R²) for predictions
+- Supports pg_notify alerts for critical forecasts
+
+### Using forecast()
+
+Forecast a single metric:
+
+```sql
+-- Forecast database size growth
+SELECT * FROM flight_recorder.forecast('db_size');
+
+-- Custom lookback and forecast windows
+SELECT * FROM flight_recorder.forecast('db_size', '14 days', '30 days');
+
+-- Forecast connections
+SELECT * FROM flight_recorder.forecast('connections', '7 days', '7 days');
+```
+
+**Supported metrics:**
+
+| Metric | Aliases | Depletion Tracked |
+|--------|---------|-------------------|
+| `db_size` | `storage` | Yes (configurable disk capacity) |
+| `connections` | - | Yes (max_connections) |
+| `wal_bytes` | `wal` | No (informational) |
+| `xact_commit` | `transactions` | No (informational) |
+| `temp_bytes` | `temp` | No (informational) |
+
+**Output columns:**
+
+| Column | Purpose |
+|--------|---------|
+| `metric` | Metric name |
+| `current_value` | Current raw value |
+| `current_display` | Human-readable current value |
+| `forecast_value` | Predicted value at end of forecast window |
+| `forecast_display` | Human-readable forecast value |
+| `rate_per_day` | Growth rate (units per day) |
+| `rate_display` | Human-readable growth rate |
+| `confidence` | R² coefficient (0-1, higher is better) |
+| `depleted_at` | Predicted depletion timestamp (if applicable) |
+| `time_to_depletion` | Time until depletion (if applicable) |
+
+### Using forecast_summary()
+
+Multi-metric forecast dashboard:
+
+```sql
+-- All metrics with default windows (7 days lookback, 7 days forecast)
+SELECT * FROM flight_recorder.forecast_summary();
+
+-- Custom windows
+SELECT * FROM flight_recorder.forecast_summary('14 days', '30 days');
+```
+
+**Output columns:**
+
+| Column | Purpose |
+|--------|---------|
+| `metric` | Metric name |
+| `current` | Current value (display format) |
+| `forecast` | Forecast value (display format) |
+| `rate` | Growth rate per day |
+| `confidence` | R² coefficient (0-1) |
+| `depleted_at` | Predicted depletion timestamp |
+| `status` | Status classification |
+| `recommendation` | Actionable advice |
+
+**Status values:**
+
+| Status | Condition |
+|--------|-----------|
+| `critical` | Depletion within 24 hours |
+| `warning` | Depletion within 7 days |
+| `attention` | Depletion within 30 days |
+| `healthy` | No depletion predicted or >30 days |
+| `insufficient_data` | Not enough snapshots for forecast |
+| `flat` | No significant trend detected |
+
+### Config Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `forecast_enabled` | `true` | Enable/disable forecasting |
+| `forecast_lookback_days` | `7` | Default lookback window |
+| `forecast_window_days` | `7` | Default forecast window |
+| `forecast_alert_enabled` | `false` | Enable pg_notify alerts |
+| `forecast_alert_threshold` | `3 days` | Alert when depletion is within this window |
+| `forecast_notify_channel` | `flight_recorder_forecasts` | pg_notify channel name |
+| `forecast_disk_capacity_gb` | `100` | Assumed disk capacity for db_size forecasts |
+| `forecast_min_samples` | `10` | Minimum snapshots required for forecast |
+| `forecast_min_confidence` | `0.5` | Minimum R² for alerts |
+
+### Setting Up Alerts
+
+Enable forecast alerts to receive pg_notify messages when resources are predicted to deplete soon:
+
+```sql
+-- Enable alerts
+UPDATE flight_recorder.config
+SET value = 'true'
+WHERE key = 'forecast_alert_enabled';
+
+-- Configure disk capacity (if different from default)
+UPDATE flight_recorder.config
+SET value = '500'  -- 500 GB
+WHERE key = 'forecast_disk_capacity_gb';
+
+-- Schedule alert checks via pg_cron (every 4 hours)
+SELECT cron.schedule(
+    'forecast-alerts',
+    '0 */4 * * *',
+    'SELECT flight_recorder.check_forecast_alerts()'
+);
+```
+
+**Listen for alerts:**
+
+```sql
+-- In a separate session
+LISTEN flight_recorder_forecasts;
+
+-- Alerts are JSON payloads:
+-- {"type":"forecast_alert","metric":"db_size","current_value":"45 GB","depleted_at":"2026-02-15 10:30:00","confidence":0.92,"status":"warning","timestamp":"2026-01-30 14:00:00"}
+```
+
+### Interpreting Results
+
+**High confidence (R² > 0.8):**
+
+The trend is clear and predictions are reliable. Take action based on status.
+
+**Medium confidence (R² 0.5-0.8):**
+
+Some variability in data. Predictions are directionally correct but timing may vary.
+
+**Low confidence (R² < 0.5):**
+
+Data is noisy or non-linear. Consider using longer lookback windows or investigating anomalies.
+
+### Practical Examples
+
+**Weekly capacity review:**
+
+```sql
+SELECT metric, current, forecast, rate, status, recommendation
+FROM flight_recorder.forecast_summary('14 days', '30 days')
+ORDER BY
+    CASE status
+        WHEN 'critical' THEN 1
+        WHEN 'warning' THEN 2
+        WHEN 'attention' THEN 3
+        ELSE 4
+    END;
+```
+
+**Storage planning:**
+
+```sql
+-- Check when disk will be full
+SELECT
+    current_display AS "Current Size",
+    rate_display AS "Growth Rate",
+    depleted_at AS "Full At",
+    time_to_depletion AS "Time Left",
+    confidence AS "Confidence"
+FROM flight_recorder.forecast('db_size', '30 days', '90 days');
+```
+
+**Connection pool sizing:**
+
+```sql
+SELECT
+    current_display AS "Connections",
+    rate_display AS "Trend",
+    CASE
+        WHEN depleted_at IS NOT NULL THEN
+            format('Will hit limit at %s', depleted_at)
+        ELSE 'No limit reached in forecast window'
+    END AS "Prediction"
+FROM flight_recorder.forecast('connections', '7 days', '30 days');
+```
+
+---
+
 ## Part VI: Reference Material
 
 ## Troubleshooting Guide
@@ -1532,6 +1893,7 @@ SELECT * FROM flight_recorder.compare('...', '...');
 | `LOCK_CONTENTION` | Sessions blocked on locks | Review blocking queries, add indexes |
 | `XID_WRAPAROUND_RISK` | Database XID age approaching limit | Run VACUUM FREEZE, tune autovacuum |
 | `TABLE_XID_WRAPAROUND_RISK` | Table XID age approaching limit | Run VACUUM FREEZE on specific table |
+| `OID_EXHAUSTION_RISK` | OID counter approaching 4.3 billion limit | Review lo_create() usage, pg_dump/pg_restore to reset |
 | `IDLE_IN_TRANSACTION` | Session idle in transaction >5 min | Terminate stale sessions, blocks vacuum |
 | `DEAD_TUPLE_ACCUMULATION` | Table has >10% dead tuples | Run VACUUM, check autovacuum settings |
 | `VACUUM_STARVATION` | Dead tuples growing, no vacuum in 24h | Tune autovacuum thresholds |
@@ -1581,6 +1943,50 @@ SELECT * FROM flight_recorder.anomaly_report(
     '2024-01-15 11:00'
 );
 ```
+
+### OID Exhaustion Detection
+
+Object Identifiers (OIDs) are 32-bit unsigned integers (max ~4.3 billion) used internally by PostgreSQL for system catalog entries and large objects. Unlike XIDs, OIDs are not recycled—they simply exhaust. Recovery requires `pg_dump`/`pg_restore` to reset the counter.
+
+**What consumes OIDs:**
+
+- Large objects created via `lo_create()`
+- System catalog entries (tables, indexes, functions, etc.)
+- Toast tables and indexes
+
+**Thresholds** (based on 4,294,967,295 max):
+
+| Severity | Threshold | Meaning |
+|----------|-----------|---------|
+| `high` | > 75% (~3.22 billion) | Proactive warning |
+| `critical` | > 90% (~3.87 billion) | Urgent action needed |
+
+**Metrics collected:**
+
+- `max_catalog_oid` — Highest OID in pg_class (approximates counter position)
+- `large_object_count` — Count from pg_largeobject_metadata
+
+**Rate calculation functions:**
+
+```sql
+-- OID consumption rate over last hour (OIDs/second)
+SELECT flight_recorder.oid_consumption_rate('1 hour');
+
+-- Estimated time until OID exhaustion
+SELECT flight_recorder.time_to_oid_exhaustion();
+```
+
+**Example output:**
+
+| anomaly_type | severity | description | metric_value | threshold |
+|--------------|----------|-------------|--------------|-----------|
+| OID_EXHAUSTION_RISK | high | Database approaching OID exhaustion | Max catalog OID: 3,500,000,000 (81.5% of 4.3 billion), Large objects: 150,000 | max_catalog_oid > 3,221,225,471 (75% of 4,294,967,295) |
+
+**Remediation:**
+
+1. Identify and clean up unused large objects: `SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE ...`
+2. Review application logic that creates large objects
+3. If OIDs are near exhaustion, plan for `pg_dump`/`pg_restore` to reset the counter
 
 ### Idle-in-Transaction Detection
 
@@ -1650,6 +2056,1236 @@ Detects when replica lag is trending upward (lag is growing over time).
 | `medium` | 30-60 seconds |
 | `high` | 60-300 seconds |
 | `critical` | >300 seconds |
+
+## Canary Queries
+
+Canary queries are synthetic workloads that run periodically to detect silent performance degradation. Unlike passive monitoring that waits for problems to appear in real queries, canary queries proactively test database responsiveness with known, lightweight operations.
+
+### Overview
+
+A "canary query" is a simple, well-understood query that establishes a performance baseline. When canary performance degrades, it indicates systemic issues (I/O problems, CPU contention, memory pressure) before user-facing queries are impacted.
+
+**Use cases:**
+
+- Detect silent degradation before users report slowness
+- Establish performance baselines for capacity planning
+- Validate database health after maintenance or changes
+- Identify infrastructure issues (storage latency, network problems)
+
+### Built-in Canary Queries
+
+Flight Recorder includes four pre-defined canary queries targeting common database operations:
+
+| Name | Description | Query |
+|------|-------------|-------|
+| `index_lookup` | B-tree index lookup on pg_class | `SELECT oid FROM pg_class WHERE relname = 'pg_class' LIMIT 1` |
+| `small_agg` | Count aggregation on pg_stat_activity | `SELECT count(*) FROM pg_stat_activity` |
+| `seq_scan_baseline` | Sequential scan count on pg_namespace | `SELECT count(*) FROM pg_namespace` |
+| `simple_join` | Join pg_namespace to pg_class | `SELECT count(*) FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE n.nspname = 'pg_catalog'` |
+
+These queries use only system catalogs and are safe to run frequently.
+
+### Status Levels
+
+Canary status compares current performance (p50 over last hour) to baseline (p50 over last 7 days, excluding last day):
+
+| Status | Condition | Description |
+|--------|-----------|-------------|
+| `OK` | Current < baseline × warning threshold | Performance within normal range |
+| `DEGRADED` | Current >= baseline × warning threshold | Performance degraded, warrants monitoring |
+| `CRITICAL` | Current >= baseline × critical threshold | Severe degradation, immediate attention needed |
+| `INSUFFICIENT_DATA` | Not enough samples | Need more data to establish baseline |
+
+Default thresholds: warning = 1.5x (50% slower), critical = 2.0x (100% slower). Thresholds are configurable per canary.
+
+### Enabling Canary Monitoring
+
+Canary monitoring is opt-in. Enable it with:
+
+```sql
+SELECT flight_recorder.enable_canaries();
+```
+
+This schedules automatic execution every 15 minutes via pg_cron. To disable:
+
+```sql
+SELECT flight_recorder.disable_canaries();
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `canary_enabled` | `false` | Master enable/disable |
+| `canary_interval_minutes` | `15` | How often to run canary queries |
+| `canary_capture_plans` | `false` | Store EXPLAIN output with results |
+| `retention_canary_days` | `7` | How long to keep canary results |
+
+Adjust configuration:
+
+```sql
+-- Run canaries more frequently
+UPDATE flight_recorder.config
+SET value = '5'
+WHERE key = 'canary_interval_minutes';
+
+-- Enable plan capture for debugging
+UPDATE flight_recorder.config
+SET value = 'true'
+WHERE key = 'canary_capture_plans';
+
+-- Keep results longer
+UPDATE flight_recorder.config
+SET value = '30'
+WHERE key = 'retention_canary_days';
+```
+
+### Manual Execution
+
+Run canaries without enabling automatic scheduling:
+
+```sql
+SELECT * FROM flight_recorder.run_canaries();
+```
+
+Output:
+
+| canary_name | duration_ms | success | error_message |
+|-------------|-------------|---------|---------------|
+| index_lookup | 0.42 | true | |
+| small_agg | 1.23 | true | |
+| seq_scan_baseline | 0.31 | true | |
+| simple_join | 2.15 | true | |
+
+### Monitoring Canary Health
+
+**Status function** (detailed list):
+
+```sql
+SELECT * FROM flight_recorder.canary_status();
+```
+
+Output:
+
+| canary_name | description | baseline_ms | current_ms | change_pct | status | last_executed | last_error |
+|-------------|-------------|-------------|------------|------------|--------|---------------|------------|
+| index_lookup | B-tree index lookup on pg_class | 0.45 | 0.42 | -6.7 | OK | 2024-01-15 10:30:00 | |
+| small_agg | Count aggregation on pg_stat_activity | 1.20 | 2.40 | 100.0 | CRITICAL | 2024-01-15 10:30:00 | |
+
+### Adding Custom Canaries
+
+Add your own canary queries for application-specific monitoring:
+
+```sql
+-- Add a canary for your most critical table
+INSERT INTO flight_recorder.canaries (name, description, query_text, threshold_warning, threshold_critical)
+VALUES (
+    'orders_lookup',
+    'Primary key lookup on orders table',
+    'SELECT id FROM orders WHERE id = 1 LIMIT 1',
+    1.5,  -- Alert at 50% slower
+    2.0   -- Critical at 100% slower
+);
+
+-- Add a canary with expected baseline timing
+INSERT INTO flight_recorder.canaries (name, description, query_text, expected_time_ms)
+VALUES (
+    'inventory_count',
+    'Count active inventory items',
+    'SELECT count(*) FROM inventory WHERE status = ''active''',
+    5.0  -- Expected to run in ~5ms
+);
+```
+
+Disable a canary without deleting it:
+
+```sql
+UPDATE flight_recorder.canaries
+SET enabled = false
+WHERE name = 'orders_lookup';
+```
+
+### Function Reference
+
+| Function | Description |
+|----------|-------------|
+| `enable_canaries()` | Enable and schedule automatic canary execution |
+| `disable_canaries()` | Disable and unschedule canary execution |
+| `run_canaries()` | Execute all enabled canaries immediately |
+| `canary_status()` | Get current status comparing performance to baseline |
+
+### Table Reference
+
+| Object | Type | Description |
+|--------|------|-------------|
+| `canaries` | Table | Canary query definitions |
+| `canary_results` | Table | Execution history with timing and optional plans |
+
+### Quick Start
+
+```sql
+-- 1. Enable canary monitoring
+SELECT flight_recorder.enable_canaries();
+
+-- 2. Wait for some executions, then check status
+SELECT * FROM flight_recorder.canary_status();
+
+-- 3. Add a custom canary for your application
+INSERT INTO flight_recorder.canaries (name, description, query_text)
+VALUES ('my_canary', 'Check critical table', 'SELECT 1 FROM my_table LIMIT 1');
+```
+
+## Query Storm Detection
+
+Query storm detection identifies when queries spike beyond baseline thresholds. Storms are classified by type and can be monitored, resolved manually, or auto-resolved when counts normalize.
+
+### Overview
+
+A "query storm" is a sudden spike in query execution frequency compared to historical baseline. Common causes include:
+
+- **Retry storms**: Application retry logic causing exponential request growth
+- **Cache misses**: Cold cache or invalidation causing repeated database hits
+- **Traffic spikes**: Legitimate load increases beyond normal patterns
+
+### Storm Types
+
+| Type | Classification Criteria | Common Causes |
+|------|------------------------|---------------|
+| `RETRY_STORM` | Query contains RETRY or FOR UPDATE keywords | Application retry loops, lock contention |
+| `CACHE_MISS` | Execution count > 10x baseline | Cache invalidation, cold start, missing indexes |
+| `SPIKE` | Execution count > threshold multiplier (default 3x) | Traffic spike, batch job, query plan regression |
+| `NORMAL` | Within normal range | No action needed |
+
+### Severity Levels
+
+Storms are classified by severity based on how far the query count exceeds the baseline:
+
+| Severity | Multiplier Range | Description |
+|----------|-----------------|-------------|
+| `LOW` | <= 5.0x | Minor spike, may be normal traffic variation |
+| `MEDIUM` | 5.0x - 10.0x | Significant spike, warrants monitoring |
+| `HIGH` | 10.0x - 50.0x | Major spike, likely requires investigation |
+| `CRITICAL` | > 50.0x or RETRY_STORM | Severe spike, immediate attention needed |
+
+Severity thresholds are configurable (see Configuration below).
+
+### Enabling Storm Detection
+
+Storm detection is opt-in. Enable it with:
+
+```sql
+SELECT flight_recorder.enable_storm_detection();
+```
+
+This schedules automatic detection every 15 minutes via pg_cron. To disable:
+
+```sql
+SELECT flight_recorder.disable_storm_detection();
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `storm_detection_enabled` | `false` | Master enable/disable |
+| `storm_threshold_multiplier` | `3.0` | Spike detection threshold (recent/baseline ratio) |
+| `storm_lookback_interval` | `1 hour` | Recent window for comparison |
+| `storm_baseline_days` | `7` | Historical baseline period |
+| `storm_detection_interval_minutes` | `15` | Auto-detection frequency |
+| `storm_min_duration_minutes` | `5` | Minimum storm age before auto-resolution |
+| `storm_notify_enabled` | `true` | Send pg_notify alerts |
+| `storm_notify_channel` | `flight_recorder_storms` | Notification channel name |
+| `storm_severity_low_max` | `5.0` | Maximum multiplier for LOW severity |
+| `storm_severity_medium_max` | `10.0` | Maximum multiplier for MEDIUM severity |
+| `storm_severity_high_max` | `50.0` | Maximum multiplier for HIGH severity |
+| `retention_storms_days` | `30` | How long to keep storm history |
+
+Adjust configuration:
+
+```sql
+-- Increase sensitivity (detect smaller spikes)
+UPDATE flight_recorder.config
+SET value = '2.0'
+WHERE key = 'storm_threshold_multiplier';
+
+-- Longer baseline for more stable detection
+UPDATE flight_recorder.config
+SET value = '14'
+WHERE key = 'storm_baseline_days';
+
+-- Adjust severity thresholds for more sensitive alerting
+UPDATE flight_recorder.config
+SET value = '3.0'
+WHERE key = 'storm_severity_low_max';
+```
+
+### Manual Detection
+
+Detect storms without enabling automatic detection:
+
+```sql
+-- Detect with default settings
+SELECT * FROM flight_recorder.detect_query_storms();
+
+-- Custom lookback and threshold
+SELECT * FROM flight_recorder.detect_query_storms('30 minutes'::interval, 2.0);
+```
+
+Output:
+
+| queryid | query_fingerprint | storm_type | severity | recent_count | baseline_count | multiplier |
+|---------|-------------------|------------|----------|--------------|----------------|------------|
+| 789012 | UPDATE inventory SET... FOR UPDATE | RETRY_STORM | CRITICAL | 8500 | 200 | 42.50 |
+| 123456 | SELECT * FROM orders WHERE... | SPIKE | MEDIUM | 15000 | 2500 | 6.00 |
+
+### Monitoring Storms
+
+**Dashboard view** (at-a-glance summary):
+
+```sql
+SELECT * FROM flight_recorder.storm_dashboard;
+```
+
+Returns: active storm counts by type and severity, resolution rate, average resolution time, storm-prone queries, overall status, and recommendations.
+
+**Status function** (detailed list):
+
+```sql
+-- Active and recent storms
+SELECT * FROM flight_recorder.storm_status();
+
+-- Storms in last 4 hours
+SELECT * FROM flight_recorder.storm_status('4 hours');
+```
+
+**In reports:**
+
+```sql
+SELECT flight_recorder.report('1 hour');
+```
+
+The report includes a Query Storms section when storm detection is enabled.
+
+### Resolving Storms
+
+**Manual resolution:**
+
+```sql
+-- Resolve single storm with notes
+SELECT flight_recorder.resolve_storm(123, 'Fixed by adding index on orders.customer_id');
+
+-- Resolve all storms for a specific query
+SELECT flight_recorder.resolve_storms_by_queryid(456789, 'Query optimized, deployed v2.1');
+
+-- Bulk resolve after incident review
+SELECT flight_recorder.resolve_all_storms('Incident #42 reviewed and closed');
+
+-- Reopen if resolved incorrectly
+SELECT flight_recorder.reopen_storm(123);
+```
+
+**Auto-resolution:**
+
+When `auto_detect_storms()` runs (via pg_cron), it automatically resolves storms whose query counts have returned to normal. Auto-resolution includes anti-flapping protection:
+
+- Storms must be active for at least `storm_min_duration_minutes` (default: 5) before auto-resolution
+- Resolution note: "Auto-resolved: query counts returned to normal"
+
+### Correlation Data
+
+When a storm is detected, pg-flight-recorder captures correlated metrics to help identify root causes. This data is stored in the `correlation` JSONB column of `query_storms`:
+
+```sql
+SELECT severity, correlation FROM flight_recorder.storm_status() WHERE status = 'ACTIVE';
+```
+
+**Correlation structure:**
+
+```json
+{
+  "checkpoint": {
+    "active": true,
+    "ckpt_write_time_ms": 1234,
+    "ckpt_sync_time_ms": 567,
+    "ckpt_buffers": 8192
+  },
+  "locks": {
+    "blocked_count": 5,
+    "max_duration_seconds": 12.5,
+    "lock_types": ["RowExclusiveLock", "AccessShareLock"]
+  },
+  "waits": {
+    "top_events": [
+      {"event": "LWLock:buffer_content", "count": 150},
+      {"event": "IO:DataFileRead", "count": 89}
+    ],
+    "total_waiters": 239
+  },
+  "io": {
+    "temp_bytes_delta": 104857600,
+    "blks_read_delta": 5000,
+    "connections_active": 45,
+    "connections_total": 100
+  }
+}
+```
+
+**Correlation sections:**
+
+| Section | Source | Indicators |
+|---------|--------|------------|
+| `checkpoint` | `snapshots` | Active checkpoint can cause I/O contention |
+| `locks` | `lock_aggregates` | Lock contention may indicate retry storms |
+| `waits` | `wait_event_aggregates` | Wait events show resource bottlenecks |
+| `io` | `snapshots` | Temp file usage, block reads, connection pressure |
+
+Empty sections are omitted when no relevant data is found.
+
+### Real-Time Alerts
+
+Storm detection sends pg_notify alerts when storms are detected or resolved:
+
+```sql
+-- Listen for alerts (in psql or application)
+LISTEN flight_recorder_storms;
+```
+
+**Notification payload (JSON):**
+
+```json
+{
+  "action": "detected",
+  "storm_id": 123,
+  "queryid": 456789,
+  "storm_type": "SPIKE",
+  "severity": "MEDIUM",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "recent_count": 15000,
+  "baseline_count": 2500,
+  "multiplier": 6.0
+}
+```
+
+```json
+{
+  "action": "resolved",
+  "storm_id": 123,
+  "queryid": 456789,
+  "storm_type": "SPIKE",
+  "severity": "MEDIUM",
+  "timestamp": "2024-01-15T11:00:00Z",
+  "resolution_notes": "Auto-resolved: query counts returned to normal"
+}
+```
+
+Disable notifications:
+
+```sql
+UPDATE flight_recorder.config
+SET value = 'false'
+WHERE key = 'storm_notify_enabled';
+```
+
+### Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `enable_storm_detection()` | Enable and schedule automatic detection |
+| `disable_storm_detection()` | Disable and unschedule detection |
+| `detect_query_storms(interval, numeric)` | Manual storm detection (returns severity) |
+| `auto_detect_storms()` | Detect new storms, auto-resolve normalized (called by pg_cron) |
+| `storm_status(interval)` | List active and recent storms (includes severity and correlation) |
+| `resolve_storm(bigint, text)` | Resolve single storm by ID |
+| `resolve_storms_by_queryid(bigint, text)` | Resolve all storms for a queryid |
+| `resolve_all_storms(text)` | Bulk resolve all active storms |
+| `reopen_storm(bigint)` | Reopen a previously resolved storm |
+| `_compute_storm_correlation(interval)` | Internal: gather correlated metrics for storm context |
+
+### Tables and Views
+
+| Object | Type | Purpose |
+|--------|------|---------|
+| `query_storms` | Table | Storm detection history |
+| `storm_dashboard` | View | At-a-glance monitoring summary |
+
+### Example Workflow
+
+```sql
+-- 1. Enable storm detection
+SELECT flight_recorder.enable_storm_detection();
+
+-- 2. Check dashboard periodically
+SELECT * FROM flight_recorder.storm_dashboard;
+
+-- 3. Investigate active storms
+SELECT * FROM flight_recorder.storm_status() WHERE status = 'ACTIVE';
+
+-- 4. Get query details (requires pg_stat_statements)
+SELECT query, calls, mean_exec_time
+FROM pg_stat_statements
+WHERE queryid = 456789;
+
+-- 5. Resolve after fixing
+SELECT flight_recorder.resolve_storm(123, 'Added missing index');
+
+-- 6. Monitor via pg_notify in your application
+-- Application code: LISTEN flight_recorder_storms
+```
+
+## Performance Regression Detection
+
+Performance regression detection identifies queries whose execution time has significantly increased compared to historical baselines. Regressions are classified by severity and can be monitored, resolved manually, or auto-resolved when performance normalizes.
+
+### Overview
+
+A "performance regression" is a significant slowdown in query execution time compared to historical baseline. Unlike storm detection (which tracks execution frequency), regression detection focuses on **execution time** changes. Common causes include:
+
+- **Plan changes**: Query planner choosing a worse execution plan
+- **Statistics staleness**: Out-of-date table statistics leading to suboptimal plans
+- **Data growth**: Table size increases affecting sequential scans
+- **Cache misses**: Data falling out of shared buffers
+- **Resource contention**: Competing workloads affecting I/O
+
+### Severity Levels
+
+Regressions are classified by severity based on percentage change from baseline:
+
+| Severity | Change % | Description |
+|----------|----------|-------------|
+| `LOW` | 50% - 200% | Minor slowdown, may be normal variation |
+| `MEDIUM` | 200% - 500% | Noticeable degradation, warrants monitoring |
+| `HIGH` | 500% - 1000% | Significant regression, investigate |
+| `CRITICAL` | > 1000% | Severe regression, immediate attention needed |
+
+Severity thresholds are configurable (see Configuration below).
+
+### Enabling Regression Detection
+
+Regression detection is opt-in. Enable it with:
+
+```sql
+SELECT flight_recorder.enable_regression_detection();
+```
+
+This schedules automatic detection every 60 minutes via pg_cron. To disable:
+
+```sql
+SELECT flight_recorder.disable_regression_detection();
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `regression_detection_enabled` | `false` | Master enable/disable |
+| `regression_threshold_pct` | `50.0` | Minimum % increase to detect |
+| `regression_lookback_interval` | `1 hour` | Recent window for comparison |
+| `regression_baseline_days` | `7` | Historical baseline period |
+| `regression_detection_interval_minutes` | `60` | Auto-detection frequency |
+| `regression_min_duration_minutes` | `30` | Minimum age before auto-resolution |
+| `regression_notify_enabled` | `true` | Send pg_notify alerts |
+| `regression_notify_channel` | `flight_recorder_regressions` | Notification channel name |
+| `regression_severity_low_max` | `200.0` | Maximum % for LOW severity |
+| `regression_severity_medium_max` | `500.0` | Maximum % for MEDIUM severity |
+| `regression_severity_high_max` | `1000.0` | Maximum % for HIGH severity |
+| `retention_regressions_days` | `30` | How long to keep regression history |
+
+Adjust configuration:
+
+```sql
+-- Increase sensitivity (detect smaller slowdowns)
+UPDATE flight_recorder.config
+SET value = '25.0'
+WHERE key = 'regression_threshold_pct';
+
+-- Check more frequently
+UPDATE flight_recorder.config
+SET value = '30'
+WHERE key = 'regression_detection_interval_minutes';
+
+-- Adjust severity thresholds
+UPDATE flight_recorder.config
+SET value = '300.0'
+WHERE key = 'regression_severity_medium_max';
+```
+
+### Manual Detection
+
+Detect regressions without enabling automatic detection:
+
+```sql
+-- Detect with default settings
+SELECT * FROM flight_recorder.detect_regressions();
+
+-- Custom lookback and threshold
+SELECT * FROM flight_recorder.detect_regressions('2 hours'::interval, 100.0);
+```
+
+Output:
+
+| queryid | query_fingerprint | severity | baseline_avg_ms | current_avg_ms | change_pct | probable_causes |
+|---------|-------------------|----------|-----------------|----------------|------------|-----------------|
+| 789012 | SELECT * FROM orders WHERE... | CRITICAL | 5.23 | 85.67 | 1538.24 | {Statistics may be out of date} |
+| 123456 | UPDATE inventory SET... | MEDIUM | 12.50 | 45.00 | 260.00 | {Low cache hit ratio} |
+
+### Monitoring Regressions
+
+**Dashboard view** (at-a-glance summary):
+
+```sql
+SELECT * FROM flight_recorder.regression_dashboard;
+```
+
+Returns: active regression counts by severity, resolution rate, average resolution time, regression-prone queries, overall status, and recommendations.
+
+**Status function** (detailed list):
+
+```sql
+-- Active and recent regressions
+SELECT * FROM flight_recorder.regression_status();
+
+-- Regressions in last 4 hours
+SELECT * FROM flight_recorder.regression_status('4 hours');
+```
+
+### Resolving Regressions
+
+**Manual resolution:**
+
+```sql
+-- Resolve single regression with notes
+SELECT flight_recorder.resolve_regression(123, 'Fixed by running ANALYZE on orders table');
+
+-- Resolve all regressions for a specific query
+SELECT flight_recorder.resolve_regressions_by_queryid(456789, 'Query optimized, deployed v2.1');
+
+-- Bulk resolve after incident review
+SELECT flight_recorder.resolve_all_regressions('Incident #42 reviewed and closed');
+
+-- Reopen if resolved incorrectly
+SELECT flight_recorder.reopen_regression(123);
+```
+
+**Auto-resolution:**
+
+When `auto_detect_regressions()` runs (via pg_cron), it automatically resolves regressions whose query execution times have returned to normal. Auto-resolution includes anti-flapping protection:
+
+- Regressions must be active for at least `regression_min_duration_minutes` (default: 30) before auto-resolution
+- Resolution note: "Auto-resolved: performance returned to normal"
+
+### Probable Causes
+
+When a regression is detected, pg-flight-recorder analyzes the query to suggest probable causes:
+
+- **Temp file spills**: Query is spilling to disk
+- **Low cache hit ratio**: Data not in shared buffers
+- **Recent checkpoint**: I/O contention from checkpoint activity
+- **Statistics staleness**: Tables may need ANALYZE
+
+### Real-Time Alerts
+
+Regression detection sends pg_notify alerts when regressions are detected or resolved:
+
+```sql
+-- Listen for alerts (in psql or application)
+LISTEN flight_recorder_regressions;
+```
+
+**Notification payload (JSON):**
+
+```json
+{
+  "action": "detected",
+  "regression_id": 123,
+  "queryid": 456789,
+  "severity": "HIGH",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "baseline_avg_ms": 12.5,
+  "current_avg_ms": 87.3,
+  "change_pct": 598.4
+}
+```
+
+```json
+{
+  "action": "resolved",
+  "regression_id": 123,
+  "queryid": 456789,
+  "severity": "HIGH",
+  "timestamp": "2024-01-15T11:00:00Z",
+  "resolution_notes": "Auto-resolved: performance returned to normal"
+}
+```
+
+Disable notifications:
+
+```sql
+UPDATE flight_recorder.config
+SET value = 'false'
+WHERE key = 'regression_notify_enabled';
+```
+
+### Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `enable_regression_detection()` | Enable and schedule automatic detection |
+| `disable_regression_detection()` | Disable and unschedule detection |
+| `detect_regressions(interval, numeric)` | Manual regression detection |
+| `auto_detect_regressions()` | Detect new regressions, auto-resolve normalized (called by pg_cron) |
+| `regression_status(interval)` | List active and recent regressions |
+| `resolve_regression(bigint, text)` | Resolve single regression by ID |
+| `resolve_regressions_by_queryid(bigint, text)` | Resolve all regressions for a queryid |
+| `resolve_all_regressions(text)` | Bulk resolve all active regressions |
+| `reopen_regression(bigint)` | Reopen a previously resolved regression |
+| `_diagnose_regression_causes(bigint)` | Internal: analyze query for probable causes |
+
+### Tables and Views
+
+| Object | Type | Purpose |
+|--------|------|---------|
+| `query_regressions` | Table | Regression detection history |
+| `regression_dashboard` | View | At-a-glance monitoring summary |
+
+### Example Workflow
+
+```sql
+-- 1. Enable regression detection
+SELECT flight_recorder.enable_regression_detection();
+
+-- 2. Check dashboard periodically
+SELECT * FROM flight_recorder.regression_dashboard;
+
+-- 3. Investigate active regressions
+SELECT * FROM flight_recorder.regression_status() WHERE status = 'ACTIVE';
+
+-- 4. Get query details and run EXPLAIN
+SELECT query, mean_exec_time, calls
+FROM pg_stat_statements
+WHERE queryid = 456789;
+
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 123;
+
+-- 5. Fix the issue (e.g., run ANALYZE, add index)
+ANALYZE orders;
+
+-- 6. Resolve after fixing
+SELECT flight_recorder.resolve_regression(123, 'Ran ANALYZE on orders table');
+
+-- 7. Monitor via pg_notify in your application
+-- Application code: LISTEN flight_recorder_regressions
+```
+
+## Time-Travel Debugging
+
+Time-travel debugging enables forensic analysis of "what happened at exactly 10:23:47?" by interpolating between samples and identifying events with exact timestamps.
+
+### Overview
+
+Flight Recorder samples every few minutes. When a customer reports "my query hung at exactly 10:23:47", there's no data for that specific second. Time-travel debugging bridges this gap by:
+
+1. Finding surrounding samples (before/after the timestamp)
+2. Interpolating system metrics between samples
+3. Identifying events with exact timestamps that anchor the timeline
+4. Providing confidence levels based on data proximity
+5. Generating actionable recommendations
+
+### Functions Reference
+
+| Function | Purpose |
+|----------|---------|
+| `_interpolate_metric(before, time_before, after, time_after, target)` | Linear interpolation helper |
+| `what_happened_at(timestamp, context_window)` | Forensic analysis at any timestamp |
+| `incident_timeline(start_time, end_time)` | Unified event timeline for incidents |
+
+### Using what_happened_at()
+
+The main function for point-in-time analysis:
+
+```sql
+-- What was happening at a specific moment?
+SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+```
+
+Returns:
+
+| Column | Description |
+|--------|-------------|
+| `requested_time` | The timestamp you queried |
+| `sample_before` / `sample_after` | Surrounding sample timestamps |
+| `snapshot_before` / `snapshot_after` | Surrounding snapshot timestamps |
+| `est_connections_active` | Interpolated active connections |
+| `est_connections_total` | Interpolated total connections |
+| `est_xact_rate` | Estimated transactions per second |
+| `est_blks_hit_ratio` | Buffer cache hit ratio percentage |
+| `events` | JSONB array of exact-timestamp events |
+| `sessions_active` | Active sessions from nearest sample |
+| `long_running_queries` | Count of queries > 60 seconds |
+| `longest_query_secs` | Duration of longest running query |
+| `lock_contention_detected` | Whether locks were blocking sessions |
+| `blocked_sessions` | Count of blocked sessions |
+| `top_wait_events` | JSONB array of top wait events |
+| `confidence` | high, medium, low, or very_low |
+| `confidence_score` | Numeric confidence (0-1) |
+| `data_quality_notes` | Array of data quality observations |
+| `recommendations` | Array of actionable suggestions |
+
+#### Custom Context Window
+
+By default, the function looks for events within ±5 minutes of the target timestamp:
+
+```sql
+-- Wider context window (10 minutes each direction)
+SELECT * FROM flight_recorder.what_happened_at(
+    '2024-01-15 10:23:47',
+    '10 minutes'::interval
+);
+```
+
+### Using incident_timeline()
+
+Reconstructs a chronological timeline for incident analysis:
+
+```sql
+-- What happened during the incident window?
+SELECT * FROM flight_recorder.incident_timeline(
+    '2024-01-15 10:00:00',
+    '2024-01-15 11:00:00'
+);
+```
+
+Returns events ordered chronologically:
+
+| Column | Description |
+|--------|-------------|
+| `event_time` | When the event occurred |
+| `event_type` | Type of event (see below) |
+| `description` | Human-readable description |
+| `details` | JSONB with event-specific details |
+
+#### Event Types
+
+| Event Type | Source | Description |
+|------------|--------|-------------|
+| `checkpoint` | snapshots | Checkpoint completed |
+| `wal_archived` | snapshots | WAL file archived |
+| `archive_failed` | snapshots | WAL archive failure |
+| `query_started` | activity_samples | Query execution began |
+| `transaction_started` | activity_samples | Transaction began |
+| `connection_opened` | activity_samples | New connection established |
+| `lock_contention` | lock_samples | Session blocked by another |
+| `wait_spike` | wait_aggregates | Significant wait event spike |
+| `snapshot` | snapshots | System state captured |
+
+### Confidence Scoring
+
+Confidence indicates how reliable the interpolated data is:
+
+| Gap Between Samples | Score | Level |
+|---------------------|-------|-------|
+| < 60 seconds | 0.9+ | high |
+| 60-300 seconds | 0.7-0.9 | medium |
+| 300-600 seconds | 0.5-0.7 | low |
+| > 600 seconds | < 0.5 | very_low |
+
+**Bonuses:**
+
+- Exact-timestamp event in window: +0.1
+- Target close to actual sample (<30s): +0.05
+
+### Data Sources for Exact Timestamps
+
+| Source | Timestamp Column | What It Tells Us |
+|--------|------------------|------------------|
+| `snapshots` | `checkpoint_time` | When last checkpoint completed |
+| `snapshots` | `last_archived_time` | When WAL was last archived |
+| `snapshots` | `last_failed_time` | When archiving last failed |
+| `activity_samples_*` | `query_start` | When each query began |
+| `activity_samples_*` | `xact_start` | When each transaction began |
+| `activity_samples_*` | `backend_start` | When each session connected |
+| `activity_samples_*` | `state_change` | When state last changed |
+
+### Example: Incident Investigation
+
+```sql
+-- 1. Start with what_happened_at for the reported time
+SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+
+-- 2. If lock contention detected, check the timeline
+SELECT * FROM flight_recorder.incident_timeline(
+    '2024-01-15 10:20:00',
+    '2024-01-15 10:30:00'
+)
+WHERE event_type IN ('lock_contention', 'query_started');
+
+-- 3. Use the recommendations array for next steps
+SELECT unnest(recommendations) AS recommendation
+FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+```
+
+### Example Output
+
+```sql
+SELECT * FROM flight_recorder.what_happened_at('2024-01-15 10:23:47');
+```
+
+```
+ requested_time      | 2024-01-15 10:23:47+00
+ sample_before       | 2024-01-15 10:21:00+00
+ sample_after        | 2024-01-15 10:24:00+00
+ snapshot_before     | 2024-01-15 10:20:00+00
+ snapshot_after      | 2024-01-15 10:25:00+00
+ est_connections_active | 42
+ est_xact_rate       | 156.3
+ events              | [{"type":"checkpoint","time":"2024-01-15 10:23:15","offset_secs":-32}]
+ sessions_active     | 38
+ long_running_queries | 2
+ lock_contention_detected | true
+ blocked_sessions    | 3
+ confidence          | high
+ confidence_score    | 0.87
+ data_quality_notes  | {"Checkpoint at 10:23:15 provides anchor","Sample gap is 180 seconds"}
+ recommendations     | {"Review checkpoint impact","Investigate 3 blocked sessions"}
+```
+
+## Blast Radius Analysis
+
+Blast radius analysis provides comprehensive impact assessment of database incidents. When something goes wrong, it answers: "What was the collateral damage?"
+
+### Overview
+
+| Function | Purpose |
+|----------|---------|
+| `blast_radius(start_time, end_time)` | Structured impact assessment with metrics |
+| `blast_radius_report(start_time, end_time)` | Human-readable ASCII-formatted report |
+
+### Impact Categories
+
+Blast radius analysis examines multiple impact dimensions:
+
+| Category | Metrics |
+|----------|---------|
+| Lock Impact | Blocked sessions, max/avg duration, lock types |
+| Query Degradation | Queries slowed >50% vs baseline |
+| Connection Impact | Before/during comparison, increase percentage |
+| Application Impact | Affected apps grouped by blocked count |
+| Wait Events | Top waits with percentage increase |
+| Transaction Throughput | TPS before vs during |
+
+### Severity Classification
+
+Overall severity is the highest individual severity across all categories:
+
+| Category | low | medium | high | critical |
+|----------|-----|--------|------|----------|
+| Blocked sessions | 1-5 | 6-20 | 21-50 | >50 |
+| Max block duration | <10s | 10-60s | 1-5min | >5min |
+| Connection increase | <25% | 25-50% | 50-100% | >100% |
+| TPS decrease | <10% | 10-25% | 25-50% | >50% |
+| Degraded queries | 1-3 | 4-10 | 11-25 | >25 |
+
+### Basic Usage
+
+```sql
+-- Get structured blast radius analysis
+SELECT * FROM flight_recorder.blast_radius(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+
+-- Get formatted report for postmortem
+SELECT flight_recorder.blast_radius_report(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+```
+
+### Return Columns
+
+The `blast_radius()` function returns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| incident_start | TIMESTAMPTZ | Start of analysis window |
+| incident_end | TIMESTAMPTZ | End of analysis window |
+| duration_seconds | NUMERIC | Incident duration |
+| blocked_sessions_total | INTEGER | Total unique blocked sessions |
+| blocked_sessions_max_concurrent | INTEGER | Max blocked at once |
+| max_block_duration | INTERVAL | Longest single block |
+| avg_block_duration | INTERVAL | Average block time |
+| lock_types | JSONB | Lock type breakdown |
+| degraded_queries_count | INTEGER | Queries slowed >50% |
+| degraded_queries | JSONB | Details of degraded queries |
+| connections_before | INTEGER | Baseline connections |
+| connections_during_avg | INTEGER | Average during incident |
+| connections_during_max | INTEGER | Peak connections |
+| connection_increase_pct | NUMERIC | Connection growth |
+| affected_applications | JSONB | Apps with blocked sessions |
+| top_wait_events | JSONB | Top waits during incident |
+| tps_before | NUMERIC | Baseline TPS |
+| tps_during | NUMERIC | TPS during incident |
+| tps_change_pct | NUMERIC | TPS change (negative = drop) |
+| severity | TEXT | low/medium/high/critical |
+| impact_summary | TEXT[] | Human-readable impact bullets |
+| recommendations | TEXT[] | Actionable recommendations |
+
+### Example Output
+
+```sql
+SELECT * FROM flight_recorder.blast_radius(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+```
+
+```
+ incident_start          | 2024-01-15 10:23:00
+ incident_end            | 2024-01-15 10:35:00
+ duration_seconds        | 720
+ blocked_sessions_total  | 47
+ blocked_sessions_max    | 23
+ max_block_duration      | 00:08:32
+ avg_block_duration      | 00:02:45
+ lock_types              | [{"type":"relation","count":42},{"type":"tuple","count":5}]
+ degraded_queries_count  | 8
+ degraded_queries        | [{"queryid":123,"query_preview":"SELECT...","baseline_ms":0.4,...}]
+ connections_before      | 42
+ connections_during_avg  | 87
+ connections_during_max  | 98
+ connection_increase_pct | 107
+ affected_applications   | [{"app_name":"web-server","blocked_count":43}]
+ top_wait_events         | [{"wait_type":"Lock","wait_event":"relation","total_count":156}]
+ tps_before              | 1200
+ tps_during              | 340
+ tps_change_pct          | -72
+ severity                | critical
+ impact_summary          | {"47 sessions blocked (max 8m32s)","TPS dropped 72%"}
+ recommendations         | {"Review blocking query","Consider lock_timeout"}
+```
+
+### Report Output
+
+```sql
+SELECT flight_recorder.blast_radius_report(
+    '2024-01-15 10:23:00',
+    '2024-01-15 10:35:00'
+);
+```
+
+```
+══════════════════════════════════════════════════════════════════════
+                    BLAST RADIUS ANALYSIS REPORT
+══════════════════════════════════════════════════════════════════════
+Time Window: 2024-01-15 10:23:00 → 10:35:00 (12 minutes)
+Severity: ██████████ CRITICAL
+
+──────────────────────────────────────────────────────────────────────
+LOCK IMPACT
+──────────────────────────────────────────────────────────────────────
+  Total blocked sessions:     47
+  Max concurrent blocked:     23
+  Longest block duration:     8m 32s
+  Average block duration:     2m 45s
+
+  Lock types:
+    relation     ████████████████████ 42
+    tuple        ███                   5
+
+──────────────────────────────────────────────────────────────────────
+AFFECTED APPLICATIONS
+──────────────────────────────────────────────────────────────────────
+  web-server       ████████████████████ 43 blocked
+  api-service      ██████               12 blocked
+  background-job   ██                    4 blocked
+
+──────────────────────────────────────────────────────────────────────
+QUERY DEGRADATION (8 queries slowed >50%)
+──────────────────────────────────────────────────────────────────────
+  SELECT * FROM users WHERE...     0.4ms → 1.8ms  (+350%)
+  INSERT INTO posts...             0.2ms → 0.6ms  (+180%)
+
+──────────────────────────────────────────────────────────────────────
+RESOURCE IMPACT
+──────────────────────────────────────────────────────────────────────
+  Connections:  42 → 87 avg (98 max)  +107%
+  Throughput:   1200 TPS → 340 TPS    -72%
+
+──────────────────────────────────────────────────────────────────────
+RECOMMENDATIONS
+──────────────────────────────────────────────────────────────────────
+  • Review the blocking query that held locks for 8+ minutes
+  • Consider setting lock_timeout to prevent long waits
+  • Investigate connection pool sizing (reached 98 connections)
+
+══════════════════════════════════════════════════════════════════════
+```
+
+### Use Cases
+
+1. **Incident Postmortem**: Generate comprehensive report for post-incident review
+2. **Impact Assessment**: Quantify collateral damage during outages
+3. **Capacity Planning**: Identify connection pool and throughput limits
+4. **Application Mapping**: Discover which apps were affected by lock contention
+
+## Visual Timeline
+
+Visual timeline functions provide ASCII-based visualization of metrics, enabling quick pattern recognition in terminal-based reports.
+
+### Overview
+
+Visual timeline includes four functions:
+
+| Function | Purpose |
+|----------|---------|
+| `_sparkline(numeric[])` | Compact Unicode sparkline from numeric array |
+| `_bar(value, max)` | Horizontal progress bar |
+| `timeline(metric, duration)` | Full ASCII chart with Y-axis and time labels |
+| `sparkline_metrics(duration)` | Summary table with sparkline trends |
+
+### Sparklines
+
+Sparklines are compact inline charts using Unicode block characters (▁▂▃▄▅▆▇█):
+
+```sql
+-- Basic sparkline from array
+SELECT flight_recorder._sparkline(ARRAY[1,2,4,8,4,2,1,2,4,8]);
+-- Returns: ▁▂▃█▃▂▁▂▃█
+
+-- With custom width (samples if array is larger)
+SELECT flight_recorder._sparkline(ARRAY[1,2,3,4,5,6,7,8,9,10], 5);
+-- Returns: ▁▃▄▆█
+```
+
+**Edge cases handled:**
+
+- NULL array → empty string
+- Empty array → empty string
+- All-NULL values → empty string
+- Constant values → middle-height bars (▄▄▄▄)
+- Mixed NULL values → space character for NULLs
+
+### Progress Bars
+
+Horizontal progress bars show filled/empty portions:
+
+```sql
+-- 75% progress bar
+SELECT flight_recorder._bar(75, 100, 20);
+-- Returns: ███████████████░░░░░
+
+-- 0% and 100%
+SELECT flight_recorder._bar(0, 100, 10);   -- ░░░░░░░░░░
+SELECT flight_recorder._bar(100, 100, 10); -- ██████████
+```
+
+### Timeline Charts
+
+Full ASCII charts with Y-axis labels and time markers:
+
+```sql
+SELECT flight_recorder.timeline('connections', '2 hours');
+```
+
+**Example output:**
+
+```
+connections (last 2 hours)
+    87 ┤          ╭────╮
+    72 ┤    ╭─────╯    ╰──╮
+    58 ┤╭───╯             ╰──
+    43 ┼╯
+       └───────┬───────┬───────
+            14:00   15:00   16:00
+```
+
+**Supported metrics:**
+
+| Alias | Column | Description |
+|-------|--------|-------------|
+| `connections` | `connections_active` | Active database connections |
+| `connections_total` | `connections_total` | Total connections |
+| `wal` | `wal_bytes` | WAL bytes generated |
+| `temp` | `temp_bytes` | Temp file bytes |
+| `commits` | `xact_commit` | Committed transactions |
+| `rollbacks` | `xact_rollback` | Rolled back transactions |
+| `blks_read` | `blks_read` | Blocks read from disk |
+| `blks_hit` | `blks_hit` | Blocks found in cache |
+| `db_size` | `db_size_bytes` | Database size |
+
+**Parameters:**
+
+```sql
+flight_recorder.timeline(
+    p_metric TEXT,             -- Metric name or alias
+    p_duration INTERVAL DEFAULT '4 hours',
+    p_width INTEGER DEFAULT 60,
+    p_height INTEGER DEFAULT 10
+)
+```
+
+### Sparkline Metrics Summary
+
+Get an at-a-glance summary with sparkline trends for key metrics:
+
+```sql
+SELECT * FROM flight_recorder.sparkline_metrics('1 hour');
+```
+
+**Example output:**
+
+```
+     metric      │ current_value │     trend      │ min_value │ max_value
+─────────────────┼───────────────┼────────────────┼───────────┼───────────
+ connections_active │ 87          │ ▁▂▃▅▇█▆▄▃▂    │ 43        │ 87
+ cache_hit_ratio │ 98.2%        │ █████████▇    │ 97.1%     │ 99.0%
+ wal_bytes       │ 1.2 GB       │ ▃▃▃▄▅▇█▅▄▃    │ 0.8 GB    │ 1.5 GB
+ temp_bytes      │ 0 B          │ ▁▁▁▁▁▁▁▁▁▁    │ 0 B       │ 0 B
+ xact_commit     │ 15234        │ ▂▃▄▅▆▇█▇▆▅    │ 12000     │ 18000
+ db_size_bytes   │ 2.5 GB       │ ▁▁▁▁▁▁▁▂▂▂    │ 2.4 GB    │ 2.5 GB
+```
+
+**Metrics included:**
+
+- `connections_active` - Active connections
+- `cache_hit_ratio` - Computed from blks_hit/(blks_hit+blks_read)
+- `wal_bytes` - WAL generated
+- `temp_bytes` - Temp file usage
+- `xact_commit` - Committed transactions
+- `db_size_bytes` - Database size
+
+### Use Cases
+
+**Quick health check:**
+
+```sql
+SELECT * FROM flight_recorder.sparkline_metrics('1 hour');
+```
+
+**Incident investigation:**
+
+```sql
+-- What did connections look like during the incident?
+SELECT flight_recorder.timeline('connections', '4 hours');
+```
+
+**Capacity monitoring:**
+
+```sql
+-- Database growth trend
+SELECT flight_recorder.timeline('db_size', '24 hours');
+```
+
+**Progress bars in reports:**
+
+```sql
+SELECT
+    'Connections' AS resource,
+    connections_active || '/' || connections_max AS usage,
+    flight_recorder._bar(connections_active, connections_max) AS utilization
+FROM flight_recorder.snapshots
+ORDER BY captured_at DESC
+LIMIT 1;
+```
 
 ## Testing and Benchmarking
 
@@ -1747,3 +3383,199 @@ FROM flight_recorder.collection_stats
 WHERE started_at > now() - interval '1 day'
 GROUP BY collection_type;
 ```
+
+## Code Browser
+
+An interactive HTML code browser is available at:
+
+**<https://dventimisupabase.github.io/pg-flight-recorder/>**
+
+Generated using GNU Global with Universal CTags, it provides:
+
+- Symbol definitions and cross-references
+- File browser with syntax highlighting
+- Full-text search across the codebase
+
+The code browser is automatically updated on every push to main.
+
+### Local Code Navigation
+
+For local development, use the `./tools/gg` wrapper:
+
+```bash
+# Set up the GTAGS database (choose one method)
+./tools/setup-gtags              # requires global + universal-ctags
+./tools/setup-gtags --download   # download pre-built from GitHub Actions
+./tools/setup-gtags --docker     # use Docker (no local install needed)
+
+# Navigate code
+./tools/gg def snapshots         # find symbol definition
+./tools/gg grep take_snapshot    # search file contents
+./tools/gg ctx install.sql:100   # show context around line
+```
+
+## SQLite Export
+
+Export flight_recorder data to SQLite for offline analysis, archival, or AI-driven exploration.
+
+### Why SQLite
+
+- **Ubiquitous** - every system has it, AI tools can query it directly
+- **Single file** - easy to share, archive, analyze offline
+- **No setup** - `sqlite3 flight_recorder.db "SELECT ..."`
+- **Good enough** - handles ~500K-1M rows typical of 7-30 day retention
+
+### Usage
+
+The database can export itself to SQLite-compatible SQL. Just pipe to `sqlite3`:
+
+```bash
+# Basic export - one-liner, no dependencies beyond psql and sqlite3
+psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db
+
+# Export only recent data (last 7 days)
+psql -At -c "SELECT flight_recorder.export_sql('7 days')" mydb | sqlite3 flight_recorder.db
+
+# With compression
+psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db && gzip flight_recorder.db
+```
+
+The `export_sql()` function generates SQLite-compatible SQL that includes:
+
+- `CREATE TABLE` statements with proper type mappings
+- `INSERT` statements for all data (wrapped in a transaction for performance)
+- Indexes on common query patterns
+- Export metadata
+- AI methodology guide (`_guide` and `_tables` tables)
+
+### Output Structure
+
+The exported SQLite database contains all flight_recorder tables:
+
+| Table | Description |
+|-------|-------------|
+| `snapshots` | System state snapshots (WAL, checkpoints, connections) |
+| `statement_snapshots` | Query performance from pg_stat_statements |
+| `table_snapshots` | Table statistics and bloat indicators |
+| `index_snapshots` | Index usage statistics |
+| `replication_snapshots` | Replication lag and status |
+| `config_snapshots` | PostgreSQL configuration history |
+| `db_role_config_snapshots` | Role-specific settings |
+| `vacuum_progress_snapshots` | Vacuum operations in progress |
+| `wait_samples_archive` | Wait events (detailed, 7-day retention) |
+| `activity_samples_archive` | Session activity (detailed, 7-day retention) |
+| `lock_samples_archive` | Lock contention (detailed, 7-day retention) |
+| `wait_event_aggregates` | Wait events (5-min summaries) |
+| `activity_aggregates` | Activity (5-min summaries) |
+| `lock_aggregates` | Locks (5-min summaries) |
+| `canaries` | Synthetic query definitions |
+| `canary_results` | Synthetic query results |
+| `query_storms` | Detected query spikes |
+| `query_regressions` | Performance regressions |
+| `config` | Flight recorder settings |
+| `_export_metadata` | Export timestamp, version info |
+| `_guide` | **AI docs** - 8-step analysis methodology |
+| `_tables` | **AI docs** - table descriptions and time columns |
+| `_examples` | **AI docs** - ready-to-run SQL queries by category |
+| `_glossary` | **AI docs** - definitions of key terms |
+| `_columns` | **AI docs** - explanations of important columns |
+
+### AI Analysis Guide
+
+The export includes self-documenting tables that teach AI how to analyze the data:
+
+```sql
+-- Read the methodology first (8-step progressive refinement)
+SELECT * FROM _guide ORDER BY step;
+
+-- Understand each table's purpose
+SELECT * FROM _tables;
+
+-- Get example queries for common analysis patterns
+SELECT * FROM _examples ORDER BY category, name;
+
+-- Look up unfamiliar terms
+SELECT * FROM _glossary WHERE term = 'wait_event';
+
+-- Understand what key columns mean
+SELECT * FROM _columns WHERE table_name = 'snapshots';
+```
+
+| Table | Purpose |
+|-------|---------|
+| `_guide` | 8-step methodology from "START HERE" through correlation analysis |
+| `_tables` | Description and time column for each data table |
+| `_examples` | Ready-to-run SQL queries organized by tier (quick_status → drill_down) |
+| `_glossary` | Definitions of PostgreSQL/monitoring terms (wait_event, query_storm, etc.) |
+| `_columns` | Explanations of important columns in key tables |
+
+The documentation travels with the data - no external references needed.
+
+### Type Mapping
+
+| PostgreSQL | SQLite |
+|------------|--------|
+| INTEGER, BIGINT, SERIAL | INTEGER |
+| TEXT, VARCHAR | TEXT |
+| BOOLEAN | INTEGER (0/1) |
+| TIMESTAMPTZ | TEXT (ISO 8601) |
+| INTERVAL | TEXT |
+| NUMERIC, REAL | REAL |
+| JSONB | TEXT (JSON string) |
+| ARRAY | TEXT (JSON array) |
+
+### Progressive Refinement Workflow
+
+The exported SQLite enables tiered analysis for AI assistants:
+
+**Tier 1: Quick Status**
+
+```sql
+-- How many anomalies?
+SELECT COUNT(*) FROM query_storms WHERE resolved_at IS NULL;
+SELECT COUNT(*) FROM query_regressions WHERE resolved_at IS NULL;
+
+-- Recent activity level?
+SELECT COUNT(*), MAX(captured_at) FROM snapshots
+WHERE captured_at > datetime('now', '-1 hour');
+```
+
+**Tier 2: Summary View**
+
+```sql
+-- Top wait events in last hour
+SELECT wait_event_type, wait_event, SUM(count) as total
+FROM wait_samples_archive
+WHERE captured_at > datetime('now', '-1 hour')
+GROUP BY wait_event_type, wait_event
+ORDER BY total DESC LIMIT 10;
+
+-- Connection trend
+SELECT strftime('%H:%M', captured_at) as time,
+       AVG(connections_active) as avg_conn
+FROM snapshots
+WHERE captured_at > datetime('now', '-4 hours')
+GROUP BY strftime('%H:%M', captured_at);
+```
+
+**Tier 3: Drill Down**
+
+```sql
+-- What queries were running during lock contention?
+SELECT captured_at, blocked_query_preview, blocking_query_preview,
+       blocked_duration, lock_type
+FROM lock_samples_archive
+WHERE captured_at BETWEEN '2024-01-15 14:00' AND '2024-01-15 14:30'
+ORDER BY blocked_duration DESC;
+
+-- Correlate with wait events
+SELECT captured_at, wait_event_type, wait_event, count
+FROM wait_samples_archive
+WHERE captured_at BETWEEN '2024-01-15 14:00' AND '2024-01-15 14:30'
+  AND wait_event_type = 'Lock'
+ORDER BY captured_at;
+```
+
+### Requirements
+
+Just `psql` and `sqlite3` - both are ubiquitous. No Python, no drivers, no dependencies.
