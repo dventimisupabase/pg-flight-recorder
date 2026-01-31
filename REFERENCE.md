@@ -476,7 +476,7 @@ See `migrations/README.md` for detailed migration documentation.
 
 ## Configuration Profiles
 
-Profiles provide pre-configured settings for common use cases. Start here instead of tuning individual parameters.
+Profiles provide pre-configured settings for common use cases. Each profile sets **77 parameters** with values tuned for its specific use case. Start here instead of tuning individual parameters.
 
 ### Profile Comparison
 
@@ -485,9 +485,72 @@ Profiles provide pre-configured settings for common use cases. Start here instea
 | `default` | 180s | 0.013% | All | Balanced | 30d/7d | 15min/7d |
 | `production_safe` | 300s | 0.008% | Wait/activity | Aggressive | 30d/7d | 30min/14d |
 | `development` | 180s | 0.013% | All | Balanced | 7d/3d | 15min/3d |
-| `troubleshooting` | 60s | 0.04% | All + top 50 | Lenient | 7d/3d | 5min/7d |
+| `troubleshooting` | 60s | 0.04% | All + top 100 | Lenient | 7d/7d | 5min/7d |
 | `minimal_overhead` | 300s | 0.008% | Wait/activity | Very aggressive | 7d/3d | Disabled |
 | `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d | 15min/7d |
+
+### Key Profile Settings
+
+#### Timeouts & Memory
+
+| Profile | section_timeout | statement_timeout | work_mem |
+|---------|-----------------|-------------------|----------|
+| `default` | 250ms | 1000ms | 2MB |
+| `production_safe` | 200ms | 800ms | 1MB |
+| `development` | 250ms | 1000ms | 2MB |
+| `troubleshooting` | 500ms | 2000ms | 4MB |
+| `minimal_overhead` | 100ms | 500ms | 1MB |
+| `high_ddl` | 200ms | 800ms | 2MB |
+
+#### Load Thresholds
+
+| Profile | skip_locks | skip_activity | throttle_xact | throttle_blk |
+|---------|------------|---------------|---------------|--------------|
+| `default` | 50 | 100 | 1000/s | 10000/s |
+| `production_safe` | 30 | 50 | 500/s | 5000/s |
+| `development` | 50 | 100 | 1000/s | 10000/s |
+| `troubleshooting` | 100 | 200 | 2000/s | 20000/s |
+| `minimal_overhead` | 20 | 30 | 300/s | 3000/s |
+| `high_ddl` | 30 | 100 | 1000/s | 10000/s |
+
+#### Statement Collection
+
+| Profile | interval | min_calls | top_n |
+|---------|----------|-----------|-------|
+| `default` | 15min | 1 | 20 |
+| `production_safe` | 30min | 5 | 20 |
+| `development` | 15min | 1 | 20 |
+| `troubleshooting` | 5min | 1 | 50 |
+| `minimal_overhead` | 30min | 10 | 20 |
+| `high_ddl` | 15min | 1 | 20 |
+
+#### Advanced Features
+
+| Profile | Canary | Storm | Regression | Forecast | Jitter | Auto-mode |
+|---------|--------|-------|------------|----------|--------|-----------|
+| `default` | off | off | off | on | on | 60% |
+| `production_safe` | off | off | off | on | on | 50% |
+| `development` | **on** | **on** | **on** | on+alerts | on | 60% |
+| `troubleshooting` | **on** | **on** | **on** | on+alerts | off | disabled |
+| `minimal_overhead` | off | off | off | off | off | 40% |
+| `high_ddl` | off | off | off | on | on | 60% |
+
+#### Troubleshooting-Specific Tuning
+
+The `troubleshooting` profile includes more sensitive detection settings:
+
+| Setting | Default | Troubleshooting |
+|---------|---------|-----------------|
+| `storm_threshold_multiplier` | 3.0x | 2.0x |
+| `storm_baseline_days` | 7 | 3 |
+| `storm_lookback_interval` | 1 hour | 30 minutes |
+| `storm_min_duration_minutes` | 5 | 2 |
+| `regression_threshold_pct` | 50% | 25% |
+| `regression_baseline_days` | 7 | 3 |
+| `regression_lookback_interval` | 1 hour | 30 minutes |
+| `regression_min_duration_minutes` | 30 | 10 |
+| `forecast_lookback_days` | 7 | 3 |
+| `forecast_window_days` | 7 | 3 |
 
 ### Profile Commands
 
@@ -508,17 +571,17 @@ SELECT * FROM flight_recorder.get_current_profile();
 
 ### Choosing a Profile
 
-**`default`** — General-purpose monitoring. Start here.
+**`default`** — General-purpose monitoring. Balanced settings for most workloads. Start here.
 
-**`production_safe`** — Production with strict SLAs. 40% less overhead, aggressive safety thresholds, locks disabled.
+**`production_safe`** — Production with strict SLAs. 40% less overhead through aggressive skipping, faster timeouts, lower memory usage. Locks and progress tracking disabled. Emergency mode triggers earlier (50% connections).
 
-**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention.
+**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention. **Enables canary queries, storm detection, regression detection, and forecast alerts** for full feature testing.
 
-**`troubleshooting`** — Active incidents. High-frequency collection (60s), lenient safety thresholds. **Temporary use only**—switch back after incident.
+**`troubleshooting`** — Active incidents. High-frequency collection (60s), lenient safety thresholds, more memory for complex queries. Disables jitter for consistent timing and auto-mode to prevent emergency throttling. **More sensitive detection thresholds** for storms and regressions. **Temporary use only**—switch back after incident.
 
-**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint, archives disabled.
+**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint with very aggressive skipping, fastest timeouts, archives disabled, forecasting disabled. Emergency mode triggers very early (40% connections).
 
-**`high_ddl`** — Multi-tenant SaaS, frequent schema changes. Pre-checks for DDL locks, fast lock timeout.
+**`high_ddl`** — Multi-tenant SaaS, frequent schema changes. Pre-checks for DDL locks, fast lock timeout, aggressive lock skipping to avoid blocking on DDL operations.
 
 ### Combining Profiles with Overrides
 
