@@ -13128,6 +13128,247 @@ COMMENT ON FUNCTION flight_recorder.blast_radius_report IS
 'Human-readable blast radius analysis report with ASCII-art formatting. Suitable for incident postmortems, Slack/email sharing, and documentation. Includes visual severity indicators, bar charts for lock types and affected apps, and actionable recommendations. Use: SELECT flight_recorder.blast_radius_report(''2024-01-15 10:23:00'', ''2024-01-15 10:35:00'');';
 
 
+-- =============================================================================
+-- SQLITE EXPORT FUNCTION
+-- =============================================================================
+
+-- Generates SQLite-compatible SQL dump of flight_recorder data
+-- Usage: psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 out.db
+CREATE OR REPLACE FUNCTION flight_recorder.export_sql(
+    p_since INTERVAL DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_result TEXT := '';
+    v_table_name TEXT;
+    v_col_names TEXT[];
+    v_col_types TEXT[];
+    v_col_def TEXT;
+    v_row RECORD;
+    v_values TEXT[];
+    v_val TEXT;
+    v_i INTEGER;
+    v_since TIMESTAMPTZ;
+    v_time_col TEXT;
+    v_where_clause TEXT;
+    v_tables TEXT[] := ARRAY[
+        'snapshots',
+        'statement_snapshots',
+        'table_snapshots',
+        'index_snapshots',
+        'replication_snapshots',
+        'config_snapshots',
+        'db_role_config_snapshots',
+        'vacuum_progress_snapshots',
+        'wait_samples_archive',
+        'activity_samples_archive',
+        'lock_samples_archive',
+        'wait_event_aggregates',
+        'activity_aggregates',
+        'lock_aggregates',
+        'canaries',
+        'canary_results',
+        'query_storms',
+        'query_regressions',
+        'config'
+    ];
+    v_time_columns TEXT[] := ARRAY[
+        'captured_at',   -- snapshots, statement_snapshots, etc.
+        'captured_at',   -- statement_snapshots
+        'captured_at',   -- table_snapshots (via snapshot)
+        'captured_at',   -- index_snapshots (via snapshot)
+        'captured_at',   -- replication_snapshots (via snapshot)
+        'captured_at',   -- config_snapshots (via snapshot)
+        'captured_at',   -- db_role_config_snapshots (via snapshot)
+        'captured_at',   -- vacuum_progress_snapshots (via snapshot)
+        'captured_at',   -- wait_samples_archive
+        'captured_at',   -- activity_samples_archive
+        'captured_at',   -- lock_samples_archive
+        'start_time',    -- wait_event_aggregates
+        'start_time',    -- activity_aggregates
+        'start_time',    -- lock_aggregates
+        NULL,            -- canaries (no time filter)
+        'executed_at',   -- canary_results
+        'detected_at',   -- query_storms
+        'detected_at',   -- query_regressions
+        NULL             -- config (no time filter)
+    ];
+BEGIN
+    -- Calculate since timestamp
+    IF p_since IS NOT NULL THEN
+        v_since := now() - p_since;
+    END IF;
+
+    -- Header
+    v_result := v_result || '-- flight_recorder SQLite export' || E'\n';
+    v_result := v_result || '-- Generated: ' || now()::text || E'\n';
+    v_result := v_result || '-- Schema version: ' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || E'\n';
+    v_result := v_result || '-- Source: ' || current_database() || E'\n';
+    IF p_since IS NOT NULL THEN
+        v_result := v_result || '-- Since: ' || v_since::text || E'\n';
+    END IF;
+    v_result := v_result || E'\n';
+    v_result := v_result || 'PRAGMA journal_mode=WAL;' || E'\n';
+    v_result := v_result || 'PRAGMA synchronous=NORMAL;' || E'\n';
+    v_result := v_result || E'\n';
+    v_result := v_result || 'BEGIN TRANSACTION;' || E'\n';
+    v_result := v_result || E'\n';
+
+    -- Process each table
+    FOR v_i IN 1..array_length(v_tables, 1) LOOP
+        v_table_name := v_tables[v_i];
+        v_time_col := v_time_columns[v_i];
+
+        -- Get column info
+        SELECT
+            array_agg(column_name ORDER BY ordinal_position),
+            array_agg(data_type ORDER BY ordinal_position)
+        INTO v_col_names, v_col_types
+        FROM information_schema.columns
+        WHERE table_schema = 'flight_recorder'
+          AND table_name = v_table_name;
+
+        IF v_col_names IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        -- Generate CREATE TABLE
+        v_result := v_result || '-- Table: ' || v_table_name || E'\n';
+        v_result := v_result || 'CREATE TABLE IF NOT EXISTS "' || v_table_name || '" (' || E'\n';
+
+        FOR v_i IN 1..array_length(v_col_names, 1) LOOP
+            v_col_def := '  "' || v_col_names[v_i] || '" ';
+            v_col_def := v_col_def || CASE
+                WHEN v_col_types[v_i] IN ('integer', 'bigint', 'smallint', 'oid') THEN 'INTEGER'
+                WHEN v_col_types[v_i] = 'boolean' THEN 'INTEGER'
+                WHEN v_col_types[v_i] IN ('double precision', 'real', 'numeric') THEN 'REAL'
+                ELSE 'TEXT'
+            END;
+            IF v_i < array_length(v_col_names, 1) THEN
+                v_col_def := v_col_def || ',';
+            END IF;
+            v_result := v_result || v_col_def || E'\n';
+        END LOOP;
+
+        v_result := v_result || ');' || E'\n';
+
+        -- Build WHERE clause for time filtering
+        v_where_clause := '';
+        IF v_since IS NOT NULL AND v_time_col IS NOT NULL THEN
+            -- For tables with snapshot_id, join to snapshots
+            IF v_table_name IN ('statement_snapshots', 'table_snapshots', 'index_snapshots',
+                                'replication_snapshots', 'config_snapshots',
+                                'db_role_config_snapshots', 'vacuum_progress_snapshots') THEN
+                v_where_clause := ' WHERE snapshot_id IN (SELECT id FROM flight_recorder.snapshots WHERE captured_at > ''' || v_since::text || ''')';
+            ELSE
+                v_where_clause := ' WHERE ' || v_time_col || ' > ''' || v_since::text || '''';
+            END IF;
+        END IF;
+
+        -- Build SELECT that formats each column for SQLite
+        DECLARE
+            v_select_parts TEXT[] := ARRAY[]::TEXT[];
+            v_select_query TEXT;
+            v_formatted_row TEXT;
+        BEGIN
+            FOR v_i IN 1..array_length(v_col_names, 1) LOOP
+                IF v_col_types[v_i] = 'boolean' THEN
+                    v_select_parts := v_select_parts || format(
+                        'CASE WHEN %I IS NULL THEN ''NULL'' WHEN %I THEN ''1'' ELSE ''0'' END',
+                        v_col_names[v_i], v_col_names[v_i]);
+                ELSIF v_col_types[v_i] IN ('integer', 'bigint', 'smallint', 'oid', 'double precision', 'real', 'numeric') THEN
+                    v_select_parts := v_select_parts || format(
+                        'COALESCE(%I::text, ''NULL'')',
+                        v_col_names[v_i]);
+                ELSE
+                    -- Text types: escape single quotes, wrap in quotes
+                    v_select_parts := v_select_parts || format(
+                        'CASE WHEN %I IS NULL THEN ''NULL'' ELSE '''''''' || replace(%I::text, '''''''', '''''''''''') || '''''''' END',
+                        v_col_names[v_i], v_col_names[v_i]);
+                END IF;
+            END LOOP;
+
+            v_select_query := format(
+                'SELECT %s FROM flight_recorder.%I%s',
+                array_to_string(v_select_parts, ' || '', '' || '),
+                v_table_name,
+                v_where_clause
+            );
+
+            FOR v_formatted_row IN EXECUTE v_select_query LOOP
+                v_result := v_result || 'INSERT INTO "' || v_table_name || '" VALUES (' || v_formatted_row || ');' || E'\n';
+            END LOOP;
+        END;
+
+        v_result := v_result || E'\n';
+    END LOOP;
+
+    v_result := v_result || 'COMMIT;' || E'\n';
+    v_result := v_result || E'\n';
+
+    -- Create indexes
+    v_result := v_result || '-- Indexes for common queries' || E'\n';
+    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_snapshots_captured_at ON snapshots(captured_at);' || E'\n';
+    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_wait_samples_captured_at ON wait_samples_archive(captured_at);' || E'\n';
+    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_activity_samples_captured_at ON activity_samples_archive(captured_at);' || E'\n';
+    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_lock_samples_captured_at ON lock_samples_archive(captured_at);' || E'\n';
+    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_statements_queryid ON statement_snapshots(queryid);' || E'\n';
+    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_wait_events ON wait_samples_archive(wait_event_type, wait_event);' || E'\n';
+    v_result := v_result || E'\n';
+
+    -- Metadata table
+    v_result := v_result || '-- Export metadata' || E'\n';
+    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _export_metadata (key TEXT PRIMARY KEY, value TEXT);' || E'\n';
+    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''exported_at'', ''' || now()::text || ''');' || E'\n';
+    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''schema_version'', ''' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || ''');' || E'\n';
+    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''source_database'', ''' || current_database() || ''');' || E'\n';
+    v_result := v_result || 'INSERT INTO _export_metadata VALUES (''pg_version'', ''' || version() || ''');' || E'\n';
+    IF p_since IS NOT NULL THEN
+        v_result := v_result || 'INSERT INTO _export_metadata VALUES (''since_filter'', ''' || v_since::text || ''');' || E'\n';
+    END IF;
+    v_result := v_result || E'\n';
+
+    -- Analysis guide for AI
+    v_result := v_result || '-- Analysis guide for AI-driven exploration' || E'\n';
+    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _guide (step INTEGER PRIMARY KEY, phase TEXT, instruction TEXT);' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (1, ''START HERE'', ''Check query_storms and query_regressions tables first - these contain pre-detected anomalies that indicate where problems occurred'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (2, ''LOW-ORDER APPROXIMATION'', ''Query snapshots for high-level system trends: connections_active, wal_bytes, temp_bytes, xact_commit, blks_read. Look for spikes or step changes.'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (3, ''IDENTIFY TIME WINDOWS'', ''Find interesting time ranges from anomalies or snapshot trends. Note the timestamps for drilling down.'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (4, ''WAIT EVENT ANALYSIS'', ''Query wait_event_aggregates for patterns in the time window. High counts of Lock, IO, or LWLock waits indicate bottlenecks.'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (5, ''DRILL INTO DETAIL'', ''Use wait_samples_archive, activity_samples_archive, lock_samples_archive for raw samples in the time window.'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (6, ''CORRELATE QUERIES'', ''Join statement_snapshots on time to see which queries were running. High temp_blks or blk_read_time indicate expensive queries.'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (7, ''CHECK CONFIGURATION'', ''Query config_snapshots to see if settings changed near anomalies. Also check db_role_config_snapshots for role-level overrides.'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _guide VALUES (8, ''TABLE HEALTH'', ''Query table_snapshots for n_dead_tup (bloat), seq_scan vs idx_scan ratios, and vacuum/analyze timestamps.'');' || E'\n';
+    v_result := v_result || E'\n';
+
+    -- Table descriptions for AI context
+    v_result := v_result || '-- Table descriptions' || E'\n';
+    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _tables (name TEXT PRIMARY KEY, description TEXT, time_column TEXT);' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''snapshots'', ''System-wide metrics every 5 min: WAL, checkpoints, connections, I/O, transactions'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''statement_snapshots'', ''Per-query stats from pg_stat_statements: timing, rows, blocks, temp usage'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''table_snapshots'', ''Per-table stats: seq/idx scans, tuple counts, dead tuples, vacuum times'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''index_snapshots'', ''Per-index stats: scan counts, tuple reads, index size'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''wait_event_aggregates'', ''5-minute summaries of wait events by type. Good for finding patterns.'', ''start_time'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''wait_samples_archive'', ''Raw wait event samples. Full detail for forensic analysis.'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''activity_samples_archive'', ''Raw session activity samples: who was connected, what they were doing'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''lock_samples_archive'', ''Raw lock contention samples: blocked/blocking PIDs, queries, durations'', ''captured_at'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''query_storms'', ''PRE-DETECTED: Sudden spikes in query execution counts. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''query_regressions'', ''PRE-DETECTED: Queries whose performance degraded vs baseline. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''config_snapshots'', ''PostgreSQL configuration parameter history'', ''via snapshot_id'');' || E'\n';
+    v_result := v_result || 'INSERT INTO _tables VALUES (''config'', ''Flight recorder internal settings (not PostgreSQL config)'', NULL);' || E'\n';
+
+    RETURN v_result;
+END;
+$$;
+COMMENT ON FUNCTION flight_recorder.export_sql IS
+'Generates SQLite-compatible SQL dump of all flight_recorder data.
+Usage: psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 out.db
+       psql -At -c "SELECT flight_recorder.export_sql(''7 days'')" mydb | sqlite3 out.db
+The optional interval parameter filters to recent data only.
+The export includes _guide and _tables metadata to help AI apply progressive refinement methodology.';
+
+
 SELECT flight_recorder.snapshot();
 SELECT flight_recorder.sample();
 DO $$
