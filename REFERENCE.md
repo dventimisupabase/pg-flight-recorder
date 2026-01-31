@@ -35,6 +35,7 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
+- [Canary Queries](#canary-queries)
 - [Query Storm Detection](#query-storm-detection)
 - [Performance Regression Detection](#performance-regression-detection)
 - [Visual Timeline](#visual-timeline)
@@ -1910,6 +1911,184 @@ Detects when replica lag is trending upward (lag is growing over time).
 | `medium` | 30-60 seconds |
 | `high` | 60-300 seconds |
 | `critical` | >300 seconds |
+
+## Canary Queries
+
+Canary queries are synthetic workloads that run periodically to detect silent performance degradation. Unlike passive monitoring that waits for problems to appear in real queries, canary queries proactively test database responsiveness with known, lightweight operations.
+
+### Overview
+
+A "canary query" is a simple, well-understood query that establishes a performance baseline. When canary performance degrades, it indicates systemic issues (I/O problems, CPU contention, memory pressure) before user-facing queries are impacted.
+
+**Use cases:**
+
+- Detect silent degradation before users report slowness
+- Establish performance baselines for capacity planning
+- Validate database health after maintenance or changes
+- Identify infrastructure issues (storage latency, network problems)
+
+### Built-in Canary Queries
+
+Flight Recorder includes four pre-defined canary queries targeting common database operations:
+
+| Name | Description | Query |
+|------|-------------|-------|
+| `index_lookup` | B-tree index lookup on pg_class | `SELECT oid FROM pg_class WHERE relname = 'pg_class' LIMIT 1` |
+| `small_agg` | Count aggregation on pg_stat_activity | `SELECT count(*) FROM pg_stat_activity` |
+| `seq_scan_baseline` | Sequential scan count on pg_namespace | `SELECT count(*) FROM pg_namespace` |
+| `simple_join` | Join pg_namespace to pg_class | `SELECT count(*) FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE n.nspname = 'pg_catalog'` |
+
+These queries use only system catalogs and are safe to run frequently.
+
+### Status Levels
+
+Canary status compares current performance (p50 over last hour) to baseline (p50 over last 7 days, excluding last day):
+
+| Status | Condition | Description |
+|--------|-----------|-------------|
+| `OK` | Current < baseline × warning threshold | Performance within normal range |
+| `DEGRADED` | Current >= baseline × warning threshold | Performance degraded, warrants monitoring |
+| `CRITICAL` | Current >= baseline × critical threshold | Severe degradation, immediate attention needed |
+| `INSUFFICIENT_DATA` | Not enough samples | Need more data to establish baseline |
+
+Default thresholds: warning = 1.5x (50% slower), critical = 2.0x (100% slower). Thresholds are configurable per canary.
+
+### Enabling Canary Monitoring
+
+Canary monitoring is opt-in. Enable it with:
+
+```sql
+SELECT flight_recorder.enable_canaries();
+```
+
+This schedules automatic execution every 15 minutes via pg_cron. To disable:
+
+```sql
+SELECT flight_recorder.disable_canaries();
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `canary_enabled` | `false` | Master enable/disable |
+| `canary_interval_minutes` | `15` | How often to run canary queries |
+| `canary_capture_plans` | `false` | Store EXPLAIN output with results |
+| `retention_canary_days` | `7` | How long to keep canary results |
+
+Adjust configuration:
+
+```sql
+-- Run canaries more frequently
+UPDATE flight_recorder.config
+SET value = '5'
+WHERE key = 'canary_interval_minutes';
+
+-- Enable plan capture for debugging
+UPDATE flight_recorder.config
+SET value = 'true'
+WHERE key = 'canary_capture_plans';
+
+-- Keep results longer
+UPDATE flight_recorder.config
+SET value = '30'
+WHERE key = 'retention_canary_days';
+```
+
+### Manual Execution
+
+Run canaries without enabling automatic scheduling:
+
+```sql
+SELECT * FROM flight_recorder.run_canaries();
+```
+
+Output:
+
+| canary_name | duration_ms | success | error_message |
+|-------------|-------------|---------|---------------|
+| index_lookup | 0.42 | true | |
+| small_agg | 1.23 | true | |
+| seq_scan_baseline | 0.31 | true | |
+| simple_join | 2.15 | true | |
+
+### Monitoring Canary Health
+
+**Status function** (detailed list):
+
+```sql
+SELECT * FROM flight_recorder.canary_status();
+```
+
+Output:
+
+| canary_name | description | baseline_ms | current_ms | change_pct | status | last_executed | last_error |
+|-------------|-------------|-------------|------------|------------|--------|---------------|------------|
+| index_lookup | B-tree index lookup on pg_class | 0.45 | 0.42 | -6.7 | OK | 2024-01-15 10:30:00 | |
+| small_agg | Count aggregation on pg_stat_activity | 1.20 | 2.40 | 100.0 | CRITICAL | 2024-01-15 10:30:00 | |
+
+### Adding Custom Canaries
+
+Add your own canary queries for application-specific monitoring:
+
+```sql
+-- Add a canary for your most critical table
+INSERT INTO flight_recorder.canaries (name, description, query_text, threshold_warning, threshold_critical)
+VALUES (
+    'orders_lookup',
+    'Primary key lookup on orders table',
+    'SELECT id FROM orders WHERE id = 1 LIMIT 1',
+    1.5,  -- Alert at 50% slower
+    2.0   -- Critical at 100% slower
+);
+
+-- Add a canary with expected baseline timing
+INSERT INTO flight_recorder.canaries (name, description, query_text, expected_time_ms)
+VALUES (
+    'inventory_count',
+    'Count active inventory items',
+    'SELECT count(*) FROM inventory WHERE status = ''active''',
+    5.0  -- Expected to run in ~5ms
+);
+```
+
+Disable a canary without deleting it:
+
+```sql
+UPDATE flight_recorder.canaries
+SET enabled = false
+WHERE name = 'orders_lookup';
+```
+
+### Function Reference
+
+| Function | Description |
+|----------|-------------|
+| `enable_canaries()` | Enable and schedule automatic canary execution |
+| `disable_canaries()` | Disable and unschedule canary execution |
+| `run_canaries()` | Execute all enabled canaries immediately |
+| `canary_status()` | Get current status comparing performance to baseline |
+
+### Table Reference
+
+| Object | Type | Description |
+|--------|------|-------------|
+| `canaries` | Table | Canary query definitions |
+| `canary_results` | Table | Execution history with timing and optional plans |
+
+### Quick Start
+
+```sql
+-- 1. Enable canary monitoring
+SELECT flight_recorder.enable_canaries();
+
+-- 2. Wait for some executions, then check status
+SELECT * FROM flight_recorder.canary_status();
+
+-- 3. Add a custom canary for your application
+INSERT INTO flight_recorder.canaries (name, description, query_text)
+VALUES ('my_canary', 'Check critical table', 'SELECT 1 FROM my_table LIMIT 1');
+```
 
 ## Query Storm Detection
 
