@@ -2,11 +2,11 @@
 -- pg-flight-recorder pgTAP Tests - SQLite Export
 -- =============================================================================
 -- Tests: export_sql() function for SQLite export
--- Test count: 15
+-- Test count: 21
 -- =============================================================================
 
 BEGIN;
-SELECT plan(15);
+SELECT plan(21);
 
 -- =============================================================================
 -- 1. FUNCTION EXISTS (2 tests)
@@ -103,6 +103,43 @@ SELECT ok(
 SELECT ok(
     (SELECT flight_recorder.export_sql('1 second'::interval) LIKE '%CREATE TABLE IF NOT EXISTS "snapshots"%'),
     'Export with since filter should still create tables'
+);
+
+-- =============================================================================
+-- 5. IN-DATABASE DOCUMENTATION (6 tests)
+-- =============================================================================
+
+-- Example queries table
+SELECT ok(
+    (SELECT flight_recorder.export_sql() LIKE '%CREATE TABLE IF NOT EXISTS _examples%'),
+    'Export should contain _examples table with query examples'
+);
+
+SELECT ok(
+    (SELECT flight_recorder.export_sql() LIKE '%1_quick_status%'),
+    'Export _examples should contain quick status queries'
+);
+
+SELECT ok(
+    (SELECT flight_recorder.export_sql() LIKE '%3_drill_down%'),
+    'Export _examples should contain drill-down queries'
+);
+
+-- Glossary table
+SELECT ok(
+    (SELECT flight_recorder.export_sql() LIKE '%CREATE TABLE IF NOT EXISTS _glossary%'),
+    'Export should contain _glossary table with term definitions'
+);
+
+SELECT ok(
+    (SELECT flight_recorder.export_sql() LIKE '%wait_event%definition%'),
+    'Export _glossary should define wait_event'
+);
+
+-- Columns reference table
+SELECT ok(
+    (SELECT flight_recorder.export_sql() LIKE '%CREATE TABLE IF NOT EXISTS _columns%'),
+    'Export should contain _columns table with column explanations'
 );
 
 SELECT * FROM finish();

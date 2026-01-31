@@ -3474,22 +3474,42 @@ The exported SQLite database contains all flight_recorder tables:
 | `query_regressions` | Performance regressions |
 | `config` | Flight recorder settings |
 | `_export_metadata` | Export timestamp, version info |
-| `_guide` | **AI methodology guide** - step-by-step analysis instructions |
-| `_tables` | **AI context** - table descriptions and time columns |
+| `_guide` | **AI docs** - 8-step analysis methodology |
+| `_tables` | **AI docs** - table descriptions and time columns |
+| `_examples` | **AI docs** - ready-to-run SQL queries by category |
+| `_glossary` | **AI docs** - definitions of key terms |
+| `_columns` | **AI docs** - explanations of important columns |
 
 ### AI Analysis Guide
 
-The export includes two special tables to help AI assistants apply progressive refinement:
+The export includes self-documenting tables that teach AI how to analyze the data:
 
 ```sql
--- Read the methodology first
+-- Read the methodology first (8-step progressive refinement)
 SELECT * FROM _guide ORDER BY step;
 
 -- Understand each table's purpose
 SELECT * FROM _tables;
+
+-- Get example queries for common analysis patterns
+SELECT * FROM _examples ORDER BY category, name;
+
+-- Look up unfamiliar terms
+SELECT * FROM _glossary WHERE term = 'wait_event';
+
+-- Understand what key columns mean
+SELECT * FROM _columns WHERE table_name = 'snapshots';
 ```
 
-The `_guide` table walks through 8 steps: start with pre-detected anomalies, establish low-order approximations from snapshots, identify time windows, drill into wait events, correlate with queries, and check configuration changes.
+| Table | Purpose |
+|-------|---------|
+| `_guide` | 8-step methodology from "START HERE" through correlation analysis |
+| `_tables` | Description and time column for each data table |
+| `_examples` | Ready-to-run SQL queries organized by tier (quick_status → drill_down) |
+| `_glossary` | Definitions of PostgreSQL/monitoring terms (wait_event, query_storm, etc.) |
+| `_columns` | Explanations of important columns in key tables |
+
+The documentation travels with the data - no external references needed.
 
 ### Type Mapping
 
