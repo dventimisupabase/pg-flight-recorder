@@ -1,0 +1,2536 @@
+[
+  {
+    "file": "install.sql",
+    "tables": [
+      {
+        "name": "flight_recorder.snapshots",
+        "line": 39,
+        "columns": [
+          {
+            "name": "id",
+            "type": "serial",
+            "line": 40
+          },
+          {
+            "name": "captured_at",
+            "type": "timestamptz",
+            "line": 41
+          },
+          {
+            "name": "pg_version",
+            "type": "int4",
+            "line": 42
+          },
+          {
+            "name": "wal_records",
+            "type": "int8",
+            "line": 43
+          },
+          {
+            "name": "wal_fpi",
+            "type": "int8",
+            "line": 44
+          },
+          {
+            "name": "wal_bytes",
+            "type": "int8",
+            "line": 45
+          },
+          {
+            "name": "wal_write_time",
+            "type": "float8",
+            "line": 46
+          },
+          {
+            "name": "wal_sync_time",
+            "type": "float8",
+            "line": 47
+          },
+          {
+            "name": "checkpoint_lsn",
+            "type": "pg_lsn",
+            "line": 48
+          },
+          {
+            "name": "checkpoint_time",
+            "type": "timestamptz",
+            "line": 49
+          },
+          {
+            "name": "ckpt_timed",
+            "type": "int8",
+            "line": 50
+          },
+          {
+            "name": "ckpt_requested",
+            "type": "int8",
+            "line": 51
+          },
+          {
+            "name": "ckpt_write_time",
+            "type": "float8",
+            "line": 52
+          },
+          {
+            "name": "ckpt_sync_time",
+            "type": "float8",
+            "line": 53
+          },
+          {
+            "name": "ckpt_buffers",
+            "type": "int8",
+            "line": 54
+          },
+          {
+            "name": "bgw_buffers_clean",
+            "type": "int8",
+            "line": 55
+          },
+          {
+            "name": "bgw_maxwritten_clean",
+            "type": "int8",
+            "line": 56
+          },
+          {
+            "name": "bgw_buffers_alloc",
+            "type": "int8",
+            "line": 57
+          },
+          {
+            "name": "bgw_buffers_backend",
+            "type": "int8",
+            "line": 58
+          },
+          {
+            "name": "bgw_buffers_backend_fsync",
+            "type": "int8",
+            "line": 59
+          },
+          {
+            "name": "autovacuum_workers",
+            "type": "int4",
+            "line": 60
+          },
+          {
+            "name": "slots_count",
+            "type": "int4",
+            "line": 61
+          },
+          {
+            "name": "slots_max_retained_wal",
+            "type": "int8",
+            "line": 62
+          },
+          {
+            "name": "io_checkpointer_reads",
+            "type": "int8",
+            "line": 63
+          },
+          {
+            "name": "io_checkpointer_read_time",
+            "type": "float8",
+            "line": 64
+          },
+          {
+            "name": "io_checkpointer_writes",
+            "type": "int8",
+            "line": 65
+          },
+          {
+            "name": "io_checkpointer_write_time",
+            "type": "float8",
+            "line": 66
+          },
+          {
+            "name": "io_checkpointer_fsyncs",
+            "type": "int8",
+            "line": 67
+          },
+          {
+            "name": "io_checkpointer_fsync_time",
+            "type": "float8",
+            "line": 68
+          },
+          {
+            "name": "io_autovacuum_reads",
+            "type": "int8",
+            "line": 69
+          },
+          {
+            "name": "io_autovacuum_read_time",
+            "type": "float8",
+            "line": 70
+          },
+          {
+            "name": "io_autovacuum_writes",
+            "type": "int8",
+            "line": 71
+          },
+          {
+            "name": "io_autovacuum_write_time",
+            "type": "float8",
+            "line": 72
+          },
+          {
+            "name": "io_client_reads",
+            "type": "int8",
+            "line": 73
+          },
+          {
+            "name": "io_client_read_time",
+            "type": "float8",
+            "line": 74
+          },
+          {
+            "name": "io_client_writes",
+            "type": "int8",
+            "line": 75
+          },
+          {
+            "name": "io_client_write_time",
+            "type": "float8",
+            "line": 76
+          },
+          {
+            "name": "io_bgwriter_reads",
+            "type": "int8",
+            "line": 77
+          },
+          {
+            "name": "io_bgwriter_read_time",
+            "type": "float8",
+            "line": 78
+          },
+          {
+            "name": "io_bgwriter_writes",
+            "type": "int8",
+            "line": 79
+          },
+          {
+            "name": "io_bgwriter_write_time",
+            "type": "float8",
+            "line": 80
+          },
+          {
+            "name": "temp_files",
+            "type": "int8",
+            "line": 81
+          },
+          {
+            "name": "temp_bytes",
+            "type": "int8",
+            "line": 82
+          },
+          {
+            "name": "xact_commit",
+            "type": "int8",
+            "line": 83
+          },
+          {
+            "name": "xact_rollback",
+            "type": "int8",
+            "line": 84
+          },
+          {
+            "name": "blks_read",
+            "type": "int8",
+            "line": 85
+          },
+          {
+            "name": "blks_hit",
+            "type": "int8",
+            "line": 86
+          },
+          {
+            "name": "connections_active",
+            "type": "int4",
+            "line": 87
+          },
+          {
+            "name": "connections_total",
+            "type": "int4",
+            "line": 88
+          },
+          {
+            "name": "connections_max",
+            "type": "int4",
+            "line": 89
+          },
+          {
+            "name": "db_size_bytes",
+            "type": "int8",
+            "line": 90
+          },
+          {
+            "name": "datfrozenxid_age",
+            "type": "int4",
+            "line": 91
+          },
+          {
+            "name": "archived_count",
+            "type": "int8",
+            "line": 92
+          },
+          {
+            "name": "last_archived_wal",
+            "type": "text",
+            "line": 93
+          },
+          {
+            "name": "last_archived_time",
+            "type": "timestamptz",
+            "line": 94
+          },
+          {
+            "name": "failed_count",
+            "type": "int8",
+            "line": 95
+          },
+          {
+            "name": "last_failed_wal",
+            "type": "text",
+            "line": 96
+          },
+          {
+            "name": "last_failed_time",
+            "type": "timestamptz",
+            "line": 97
+          },
+          {
+            "name": "archiver_stats_reset",
+            "type": "timestamptz",
+            "line": 98
+          },
+          {
+            "name": "confl_tablespace",
+            "type": "int8",
+            "line": 99
+          },
+          {
+            "name": "confl_lock",
+            "type": "int8",
+            "line": 100
+          },
+          {
+            "name": "confl_snapshot",
+            "type": "int8",
+            "line": 101
+          },
+          {
+            "name": "confl_bufferpin",
+            "type": "int8",
+            "line": 102
+          },
+          {
+            "name": "confl_deadlock",
+            "type": "int8",
+            "line": 103
+          },
+          {
+            "name": "confl_active_logicalslot",
+            "type": "int8",
+            "line": 104
+          },
+          {
+            "name": "max_catalog_oid",
+            "type": "int8",
+            "line": 105
+          },
+          {
+            "name": "large_object_count",
+            "type": "int8",
+            "line": 106
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.replication_snapshots",
+        "line": 113,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 114
+          },
+          {
+            "name": "pid",
+            "type": "int4",
+            "line": 115
+          },
+          {
+            "name": "client_addr",
+            "type": "inet",
+            "line": 116
+          },
+          {
+            "name": "application_name",
+            "type": "text",
+            "line": 117
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "line": 118
+          },
+          {
+            "name": "sync_state",
+            "type": "text",
+            "line": 119
+          },
+          {
+            "name": "sent_lsn",
+            "type": "pg_lsn",
+            "line": 120
+          },
+          {
+            "name": "write_lsn",
+            "type": "pg_lsn",
+            "line": 121
+          },
+          {
+            "name": "flush_lsn",
+            "type": "pg_lsn",
+            "line": 122
+          },
+          {
+            "name": "replay_lsn",
+            "type": "pg_lsn",
+            "line": 123
+          },
+          {
+            "name": "write_lag",
+            "type": "interval",
+            "line": 124
+          },
+          {
+            "name": "flush_lag",
+            "type": "interval",
+            "line": 125
+          },
+          {
+            "name": "replay_lag",
+            "type": "interval",
+            "line": 126
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.vacuum_progress_snapshots",
+        "line": 133,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 134
+          },
+          {
+            "name": "pid",
+            "type": "int4",
+            "line": 135
+          },
+          {
+            "name": "datid",
+            "type": "oid",
+            "line": 136
+          },
+          {
+            "name": "datname",
+            "type": "text",
+            "line": 137
+          },
+          {
+            "name": "relid",
+            "type": "oid",
+            "line": 138
+          },
+          {
+            "name": "relname",
+            "type": "text",
+            "line": 139
+          },
+          {
+            "name": "phase",
+            "type": "text",
+            "line": 140
+          },
+          {
+            "name": "heap_blks_total",
+            "type": "int8",
+            "line": 141
+          },
+          {
+            "name": "heap_blks_scanned",
+            "type": "int8",
+            "line": 142
+          },
+          {
+            "name": "heap_blks_vacuumed",
+            "type": "int8",
+            "line": 143
+          },
+          {
+            "name": "index_vacuum_count",
+            "type": "int8",
+            "line": 144
+          },
+          {
+            "name": "max_dead_tuples",
+            "type": "int8",
+            "line": 145
+          },
+          {
+            "name": "num_dead_tuples",
+            "type": "int8",
+            "line": 146
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.statement_snapshots",
+        "line": 154,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 155
+          },
+          {
+            "name": "queryid",
+            "type": "int8",
+            "line": 156
+          },
+          {
+            "name": "userid",
+            "type": "oid",
+            "line": 157
+          },
+          {
+            "name": "dbid",
+            "type": "oid",
+            "line": 158
+          },
+          {
+            "name": "query_preview",
+            "type": "text",
+            "line": 159
+          },
+          {
+            "name": "calls",
+            "type": "int8",
+            "line": 160
+          },
+          {
+            "name": "total_exec_time",
+            "type": "float8",
+            "line": 161
+          },
+          {
+            "name": "min_exec_time",
+            "type": "float8",
+            "line": 162
+          },
+          {
+            "name": "max_exec_time",
+            "type": "float8",
+            "line": 163
+          },
+          {
+            "name": "mean_exec_time",
+            "type": "float8",
+            "line": 164
+          },
+          {
+            "name": "rows",
+            "type": "int8",
+            "line": 165
+          },
+          {
+            "name": "shared_blks_hit",
+            "type": "int8",
+            "line": 166
+          },
+          {
+            "name": "shared_blks_read",
+            "type": "int8",
+            "line": 167
+          },
+          {
+            "name": "shared_blks_dirtied",
+            "type": "int8",
+            "line": 168
+          },
+          {
+            "name": "shared_blks_written",
+            "type": "int8",
+            "line": 169
+          },
+          {
+            "name": "temp_blks_read",
+            "type": "int8",
+            "line": 170
+          },
+          {
+            "name": "temp_blks_written",
+            "type": "int8",
+            "line": 171
+          },
+          {
+            "name": "blk_read_time",
+            "type": "float8",
+            "line": 172
+          },
+          {
+            "name": "blk_write_time",
+            "type": "float8",
+            "line": 173
+          },
+          {
+            "name": "wal_records",
+            "type": "int8",
+            "line": 174
+          },
+          {
+            "name": "wal_bytes",
+            "type": "numeric",
+            "line": 175
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.samples_ring",
+        "line": 180,
+        "columns": [
+          {
+            "name": "slot_id",
+            "type": "int4",
+            "line": 181
+          },
+          {
+            "name": "captured_at",
+            "type": "timestamptz",
+            "line": 182
+          },
+          {
+            "name": "epoch_seconds",
+            "type": "int8",
+            "line": 183
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.wait_samples_ring",
+        "line": 187,
+        "columns": [
+          {
+            "name": "slot_id",
+            "type": "int4",
+            "line": 188
+          },
+          {
+            "name": "row_num",
+            "type": "int4",
+            "line": 189
+          },
+          {
+            "name": "backend_type",
+            "type": "text",
+            "line": 190
+          },
+          {
+            "name": "wait_event_type",
+            "type": "text",
+            "line": 191
+          },
+          {
+            "name": "wait_event",
+            "type": "text",
+            "line": 192
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "line": 193
+          },
+          {
+            "name": "count",
+            "type": "int4",
+            "line": 194
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.activity_samples_ring",
+        "line": 199,
+        "columns": [
+          {
+            "name": "slot_id",
+            "type": "int4",
+            "line": 200
+          },
+          {
+            "name": "row_num",
+            "type": "int4",
+            "line": 201
+          },
+          {
+            "name": "pid",
+            "type": "int4",
+            "line": 202
+          },
+          {
+            "name": "usename",
+            "type": "text",
+            "line": 203
+          },
+          {
+            "name": "application_name",
+            "type": "text",
+            "line": 204
+          },
+          {
+            "name": "client_addr",
+            "type": "inet",
+            "line": 205
+          },
+          {
+            "name": "backend_type",
+            "type": "text",
+            "line": 206
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "line": 207
+          },
+          {
+            "name": "wait_event_type",
+            "type": "text",
+            "line": 208
+          },
+          {
+            "name": "wait_event",
+            "type": "text",
+            "line": 209
+          },
+          {
+            "name": "backend_start",
+            "type": "timestamptz",
+            "line": 210
+          },
+          {
+            "name": "xact_start",
+            "type": "timestamptz",
+            "line": 211
+          },
+          {
+            "name": "query_start",
+            "type": "timestamptz",
+            "line": 212
+          },
+          {
+            "name": "state_change",
+            "type": "timestamptz",
+            "line": 213
+          },
+          {
+            "name": "query_preview",
+            "type": "text",
+            "line": 214
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.lock_samples_ring",
+        "line": 219,
+        "columns": [
+          {
+            "name": "slot_id",
+            "type": "int4",
+            "line": 220
+          },
+          {
+            "name": "row_num",
+            "type": "int4",
+            "line": 221
+          },
+          {
+            "name": "blocked_pid",
+            "type": "int4",
+            "line": 222
+          },
+          {
+            "name": "blocked_user",
+            "type": "text",
+            "line": 223
+          },
+          {
+            "name": "blocked_app",
+            "type": "text",
+            "line": 224
+          },
+          {
+            "name": "blocked_query_preview",
+            "type": "text",
+            "line": 225
+          },
+          {
+            "name": "blocked_duration",
+            "type": "interval",
+            "line": 226
+          },
+          {
+            "name": "blocking_pid",
+            "type": "int4",
+            "line": 227
+          },
+          {
+            "name": "blocking_user",
+            "type": "text",
+            "line": 228
+          },
+          {
+            "name": "blocking_app",
+            "type": "text",
+            "line": 229
+          },
+          {
+            "name": "blocking_query_preview",
+            "type": "text",
+            "line": 230
+          },
+          {
+            "name": "lock_type",
+            "type": "text",
+            "line": 231
+          },
+          {
+            "name": "locked_relation_oid",
+            "type": "oid",
+            "line": 232
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.wait_event_aggregates",
+        "line": 262,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 263
+          },
+          {
+            "name": "start_time",
+            "type": "timestamptz",
+            "line": 264
+          },
+          {
+            "name": "end_time",
+            "type": "timestamptz",
+            "line": 265
+          },
+          {
+            "name": "backend_type",
+            "type": "text",
+            "line": 266
+          },
+          {
+            "name": "wait_event_type",
+            "type": "text",
+            "line": 267
+          },
+          {
+            "name": "wait_event",
+            "type": "text",
+            "line": 268
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "line": 269
+          },
+          {
+            "name": "sample_count",
+            "type": "int4",
+            "line": 270
+          },
+          {
+            "name": "total_waiters",
+            "type": "int8",
+            "line": 271
+          },
+          {
+            "name": "avg_waiters",
+            "type": "numeric",
+            "line": 272
+          },
+          {
+            "name": "max_waiters",
+            "type": "int4",
+            "line": 273
+          },
+          {
+            "name": "pct_of_samples",
+            "type": "numeric",
+            "line": 274
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.lock_aggregates",
+        "line": 286,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 287
+          },
+          {
+            "name": "start_time",
+            "type": "timestamptz",
+            "line": 288
+          },
+          {
+            "name": "end_time",
+            "type": "timestamptz",
+            "line": 289
+          },
+          {
+            "name": "blocked_user",
+            "type": "text",
+            "line": 290
+          },
+          {
+            "name": "blocking_user",
+            "type": "text",
+            "line": 291
+          },
+          {
+            "name": "lock_type",
+            "type": "text",
+            "line": 292
+          },
+          {
+            "name": "locked_relation_oid",
+            "type": "oid",
+            "line": 293
+          },
+          {
+            "name": "occurrence_count",
+            "type": "int4",
+            "line": 294
+          },
+          {
+            "name": "max_duration",
+            "type": "interval",
+            "line": 295
+          },
+          {
+            "name": "avg_duration",
+            "type": "interval",
+            "line": 296
+          },
+          {
+            "name": "sample_query",
+            "type": "text",
+            "line": 297
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.activity_aggregates",
+        "line": 307,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 308
+          },
+          {
+            "name": "start_time",
+            "type": "timestamptz",
+            "line": 309
+          },
+          {
+            "name": "end_time",
+            "type": "timestamptz",
+            "line": 310
+          },
+          {
+            "name": "query_preview",
+            "type": "text",
+            "line": 311
+          },
+          {
+            "name": "occurrence_count",
+            "type": "int4",
+            "line": 312
+          },
+          {
+            "name": "max_duration",
+            "type": "interval",
+            "line": 313
+          },
+          {
+            "name": "avg_duration",
+            "type": "interval",
+            "line": 314
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.activity_samples_archive",
+        "line": 324,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 325
+          },
+          {
+            "name": "sample_id",
+            "type": "int8",
+            "line": 326
+          },
+          {
+            "name": "captured_at",
+            "type": "timestamptz",
+            "line": 327
+          },
+          {
+            "name": "pid",
+            "type": "int4",
+            "line": 328
+          },
+          {
+            "name": "usename",
+            "type": "text",
+            "line": 329
+          },
+          {
+            "name": "application_name",
+            "type": "text",
+            "line": 330
+          },
+          {
+            "name": "client_addr",
+            "type": "inet",
+            "line": 331
+          },
+          {
+            "name": "backend_type",
+            "type": "text",
+            "line": 332
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "line": 333
+          },
+          {
+            "name": "wait_event_type",
+            "type": "text",
+            "line": 334
+          },
+          {
+            "name": "wait_event",
+            "type": "text",
+            "line": 335
+          },
+          {
+            "name": "backend_start",
+            "type": "timestamptz",
+            "line": 336
+          },
+          {
+            "name": "xact_start",
+            "type": "timestamptz",
+            "line": 337
+          },
+          {
+            "name": "query_start",
+            "type": "timestamptz",
+            "line": 338
+          },
+          {
+            "name": "state_change",
+            "type": "timestamptz",
+            "line": 339
+          },
+          {
+            "name": "query_preview",
+            "type": "text",
+            "line": 340
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.lock_samples_archive",
+        "line": 354,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 355
+          },
+          {
+            "name": "sample_id",
+            "type": "int8",
+            "line": 356
+          },
+          {
+            "name": "captured_at",
+            "type": "timestamptz",
+            "line": 357
+          },
+          {
+            "name": "blocked_pid",
+            "type": "int4",
+            "line": 358
+          },
+          {
+            "name": "blocked_user",
+            "type": "text",
+            "line": 359
+          },
+          {
+            "name": "blocked_app",
+            "type": "text",
+            "line": 360
+          },
+          {
+            "name": "blocked_query_preview",
+            "type": "text",
+            "line": 361
+          },
+          {
+            "name": "blocked_duration",
+            "type": "interval",
+            "line": 362
+          },
+          {
+            "name": "blocking_pid",
+            "type": "int4",
+            "line": 363
+          },
+          {
+            "name": "blocking_user",
+            "type": "text",
+            "line": 364
+          },
+          {
+            "name": "blocking_app",
+            "type": "text",
+            "line": 365
+          },
+          {
+            "name": "blocking_query_preview",
+            "type": "text",
+            "line": 366
+          },
+          {
+            "name": "lock_type",
+            "type": "text",
+            "line": 367
+          },
+          {
+            "name": "locked_relation_oid",
+            "type": "oid",
+            "line": 368
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.wait_samples_archive",
+        "line": 384,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 385
+          },
+          {
+            "name": "sample_id",
+            "type": "int8",
+            "line": 386
+          },
+          {
+            "name": "captured_at",
+            "type": "timestamptz",
+            "line": 387
+          },
+          {
+            "name": "backend_type",
+            "type": "text",
+            "line": 388
+          },
+          {
+            "name": "wait_event_type",
+            "type": "text",
+            "line": 389
+          },
+          {
+            "name": "wait_event",
+            "type": "text",
+            "line": 390
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "line": 391
+          },
+          {
+            "name": "count",
+            "type": "int4",
+            "line": 392
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.table_snapshots",
+        "line": 406,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 407
+          },
+          {
+            "name": "schemaname",
+            "type": "text",
+            "line": 408
+          },
+          {
+            "name": "relname",
+            "type": "text",
+            "line": 409
+          },
+          {
+            "name": "relid",
+            "type": "oid",
+            "line": 410
+          },
+          {
+            "name": "seq_scan",
+            "type": "int8",
+            "line": 411
+          },
+          {
+            "name": "seq_tup_read",
+            "type": "int8",
+            "line": 412
+          },
+          {
+            "name": "idx_scan",
+            "type": "int8",
+            "line": 413
+          },
+          {
+            "name": "idx_tup_fetch",
+            "type": "int8",
+            "line": 414
+          },
+          {
+            "name": "n_tup_ins",
+            "type": "int8",
+            "line": 415
+          },
+          {
+            "name": "n_tup_upd",
+            "type": "int8",
+            "line": 416
+          },
+          {
+            "name": "n_tup_del",
+            "type": "int8",
+            "line": 417
+          },
+          {
+            "name": "n_tup_hot_upd",
+            "type": "int8",
+            "line": 418
+          },
+          {
+            "name": "n_live_tup",
+            "type": "int8",
+            "line": 419
+          },
+          {
+            "name": "n_dead_tup",
+            "type": "int8",
+            "line": 420
+          },
+          {
+            "name": "n_mod_since_analyze",
+            "type": "int8",
+            "line": 421
+          },
+          {
+            "name": "vacuum_count",
+            "type": "int8",
+            "line": 422
+          },
+          {
+            "name": "autovacuum_count",
+            "type": "int8",
+            "line": 423
+          },
+          {
+            "name": "analyze_count",
+            "type": "int8",
+            "line": 424
+          },
+          {
+            "name": "autoanalyze_count",
+            "type": "int8",
+            "line": 425
+          },
+          {
+            "name": "last_vacuum",
+            "type": "timestamptz",
+            "line": 426
+          },
+          {
+            "name": "last_autovacuum",
+            "type": "timestamptz",
+            "line": 427
+          },
+          {
+            "name": "last_analyze",
+            "type": "timestamptz",
+            "line": 428
+          },
+          {
+            "name": "last_autoanalyze",
+            "type": "timestamptz",
+            "line": 429
+          },
+          {
+            "name": "relfrozenxid_age",
+            "type": "int4",
+            "line": 430
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.index_snapshots",
+        "line": 441,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 442
+          },
+          {
+            "name": "schemaname",
+            "type": "text",
+            "line": 443
+          },
+          {
+            "name": "relname",
+            "type": "text",
+            "line": 444
+          },
+          {
+            "name": "indexrelname",
+            "type": "text",
+            "line": 445
+          },
+          {
+            "name": "relid",
+            "type": "oid",
+            "line": 446
+          },
+          {
+            "name": "indexrelid",
+            "type": "oid",
+            "line": 447
+          },
+          {
+            "name": "idx_scan",
+            "type": "int8",
+            "line": 448
+          },
+          {
+            "name": "idx_tup_read",
+            "type": "int8",
+            "line": 449
+          },
+          {
+            "name": "idx_tup_fetch",
+            "type": "int8",
+            "line": 450
+          },
+          {
+            "name": "index_size_bytes",
+            "type": "int8",
+            "line": 451
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.config_snapshots",
+        "line": 464,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 465
+          },
+          {
+            "name": "name",
+            "type": "text",
+            "line": 466
+          },
+          {
+            "name": "setting",
+            "type": "text",
+            "line": 467
+          },
+          {
+            "name": "unit",
+            "type": "text",
+            "line": 468
+          },
+          {
+            "name": "source",
+            "type": "text",
+            "line": 469
+          },
+          {
+            "name": "sourcefile",
+            "type": "text",
+            "line": 470
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.db_role_config_snapshots",
+        "line": 481,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 482
+          },
+          {
+            "name": "database_name",
+            "type": "text",
+            "line": 483
+          },
+          {
+            "name": "role_name",
+            "type": "text",
+            "line": 484
+          },
+          {
+            "name": "parameter_name",
+            "type": "text",
+            "line": 485
+          },
+          {
+            "name": "parameter_value",
+            "type": "text",
+            "line": 486
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.config",
+        "line": 574,
+        "columns": [
+          {
+            "name": "key",
+            "type": "text",
+            "line": 575
+          },
+          {
+            "name": "value",
+            "type": "text",
+            "line": 576
+          },
+          {
+            "name": "updated_at",
+            "type": "timestamptz",
+            "line": 577
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.collection_stats",
+        "line": 825,
+        "columns": [
+          {
+            "name": "id",
+            "type": "serial",
+            "line": 826
+          },
+          {
+            "name": "collection_type",
+            "type": "text",
+            "line": 827
+          },
+          {
+            "name": "started_at",
+            "type": "timestamptz",
+            "line": 828
+          },
+          {
+            "name": "completed_at",
+            "type": "timestamptz",
+            "line": 829
+          },
+          {
+            "name": "duration_ms",
+            "type": "int4",
+            "line": 830
+          },
+          {
+            "name": "success",
+            "type": "bool",
+            "line": 831
+          },
+          {
+            "name": "error_message",
+            "type": "text",
+            "line": 832
+          },
+          {
+            "name": "skipped",
+            "type": "bool",
+            "line": 833
+          },
+          {
+            "name": "skipped_reason",
+            "type": "text",
+            "line": 834
+          },
+          {
+            "name": "sections_total",
+            "type": "int4",
+            "line": 835
+          },
+          {
+            "name": "sections_succeeded",
+            "type": "int4",
+            "line": 836
+          }
+        ]
+      }
+    ],
+    "functions": [
+      {
+        "name": "flight_recorder._pretty_bytes",
+        "line": 495,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder._interpolate_metric",
+        "line": 512,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder._pg_version",
+        "line": 565,
+        "returns": "int4"
+      },
+      {
+        "name": "flight_recorder._profile_settings",
+        "line": 582,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder._check_circuit_breaker",
+        "line": 843,
+        "returns": "bool"
+      },
+      {
+        "name": "flight_recorder._record_collection_start",
+        "line": 888,
+        "returns": "int4"
+      },
+      {
+        "name": "flight_recorder._record_collection_end",
+        "line": 901,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._record_collection_skip",
+        "line": 917,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._record_section_success",
+        "line": 930,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._get_config",
+        "line": 940,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder._get_ring_buffer_slots",
+        "line": 951,
+        "returns": "int4"
+      },
+      {
+        "name": "flight_recorder._set_section_timeout",
+        "line": 961,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._check_and_adjust_mode",
+        "line": 977,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.validate_config",
+        "line": 1061,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.validate_ring_configuration",
+        "line": 1166,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder._has_pg_stat_statements",
+        "line": 1270,
+        "returns": "bool"
+      },
+      {
+        "name": "flight_recorder._check_statements_health",
+        "line": 1280,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder._check_schema_size",
+        "line": 1332,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder._check_catalog_ddl_locks",
+        "line": 1514,
+        "returns": "bool"
+      },
+      {
+        "name": "flight_recorder._should_skip_collection",
+        "line": 1545,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.sample",
+        "line": 1614,
+        "returns": "timestamptz"
+      },
+      {
+        "name": "flight_recorder.flush_ring_to_aggregates",
+        "line": 2130,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder.archive_ring_samples",
+        "line": 2215,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder.cleanup_aggregates",
+        "line": 2353,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._collect_table_stats",
+        "line": 2404,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._collect_index_stats",
+        "line": 2566,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._collect_config_snapshot",
+        "line": 2603,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder._collect_db_role_config_snapshot",
+        "line": 2732,
+        "returns": "void"
+      },
+      {
+        "name": "flight_recorder.snapshot",
+        "line": 2825,
+        "returns": "timestamptz"
+      },
+      {
+        "name": "flight_recorder.compare",
+        "line": 3586,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder._get_ring_retention_interval",
+        "line": 3694,
+        "returns": "interval"
+      },
+      {
+        "name": "flight_recorder.recent_waits_current",
+        "line": 3783,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.recent_activity_current",
+        "line": 3808,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.recent_locks_current",
+        "line": 3843,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.wait_summary",
+        "line": 3953,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.statement_compare",
+        "line": 3995,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.activity_at",
+        "line": 4109,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.dead_tuple_growth_rate",
+        "line": 4226,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.modification_rate",
+        "line": 4278,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.hot_update_ratio",
+        "line": 4332,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.time_to_budget_exhaustion",
+        "line": 4361,
+        "returns": "interval"
+      },
+      {
+        "name": "flight_recorder.oid_consumption_rate",
+        "line": 4410,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.time_to_oid_exhaustion",
+        "line": 4456,
+        "returns": "interval"
+      },
+      {
+        "name": "flight_recorder.anomaly_report",
+        "line": 4503,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.summary_report",
+        "line": 4870,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.set_mode",
+        "line": 4989,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.get_mode",
+        "line": 5061,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.list_profiles",
+        "line": 5084,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.get_optimization_profiles",
+        "line": 5124,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.apply_optimization_profile",
+        "line": 5165,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.explain_profile",
+        "line": 5246,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.apply_profile",
+        "line": 5274,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.get_current_profile",
+        "line": 5328,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.cleanup",
+        "line": 5381,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.ring_buffer_health",
+        "line": 5453,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.disable",
+        "line": 5508,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.detect_query_storms",
+        "line": 5545,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder._diagnose_regression_causes",
+        "line": 5670,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.detect_regressions",
+        "line": 5743,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.configure_ring_autovacuum",
+        "line": 5910,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.rebuild_ring_buffers",
+        "line": 5936,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.enable",
+        "line": 6023,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.health_check",
+        "line": 6182,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.performance_report",
+        "line": 6366,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.check_alerts",
+        "line": 6518,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.report",
+        "line": 6608,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.report",
+        "line": 6608,
+        "returns": "text"
+      },
+      {
+        "name": "flight_recorder.export_for_upgrade",
+        "line": 7019,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.config_recommendations",
+        "line": 7102,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.preflight_check",
+        "line": 7171,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.preflight_check_with_summary",
+        "line": 7292,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.quarterly_review",
+        "line": 7336,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.quarterly_review_with_summary",
+        "line": 7539,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.capacity_summary",
+        "line": 7574,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.table_compare",
+        "line": 8074,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.table_hotspots",
+        "line": 8171,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.unused_indexes",
+        "line": 8268,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.index_efficiency",
+        "line": 8327,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.config_changes",
+        "line": 8395,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.config_at",
+        "line": 8442,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.config_health_check",
+        "line": 8468,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.db_role_config_at",
+        "line": 8548,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.db_role_config_changes",
+        "line": 8587,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.db_role_config_summary",
+        "line": 8642,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.what_happened_at",
+        "line": 8694,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.incident_timeline",
+        "line": 9134,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.blast_radius",
+        "line": 9338,
+        "returns": "record"
+      },
+      {
+        "name": "flight_recorder.blast_radius_report",
+        "line": 9842,
+        "returns": "text"
+      }
+    ],
+    "views": [
+      {
+        "name": "flight_recorder.deltas",
+        "line": 3535
+      },
+      {
+        "name": "flight_recorder.recent_waits",
+        "line": 3703
+      },
+      {
+        "name": "flight_recorder.recent_activity",
+        "line": 3716
+      },
+      {
+        "name": "flight_recorder.recent_locks",
+        "line": 3739
+      },
+      {
+        "name": "flight_recorder.recent_idle_in_transaction",
+        "line": 3761
+      },
+      {
+        "name": "flight_recorder.recent_replication",
+        "line": 3878
+      },
+      {
+        "name": "flight_recorder.recent_vacuum_progress",
+        "line": 3901
+      },
+      {
+        "name": "flight_recorder.archiver_status",
+        "line": 3929
+      },
+      {
+        "name": "flight_recorder.capacity_dashboard",
+        "line": 7942
+      }
+    ],
+    "types": []
+  },
+  {
+    "file": "migrations/2.11_to_2.12.sql",
+    "tables": [
+      {
+        "name": "flight_recorder.query_regressions",
+        "line": 59,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 60
+          },
+          {
+            "name": "detected_at",
+            "type": "timestamptz",
+            "line": 61
+          },
+          {
+            "name": "queryid",
+            "type": "int8",
+            "line": 62
+          },
+          {
+            "name": "query_fingerprint",
+            "type": "text",
+            "line": 63
+          },
+          {
+            "name": "severity",
+            "type": "text",
+            "line": 64
+          },
+          {
+            "name": "baseline_avg_ms",
+            "type": "numeric",
+            "line": 65
+          },
+          {
+            "name": "current_avg_ms",
+            "type": "numeric",
+            "line": 66
+          },
+          {
+            "name": "change_pct",
+            "type": "numeric",
+            "line": 67
+          },
+          {
+            "name": "correlation",
+            "type": "jsonb",
+            "line": 68
+          },
+          {
+            "name": "probable_causes",
+            "type": "text",
+            "line": 69
+          },
+          {
+            "name": "resolved_at",
+            "type": "timestamptz",
+            "line": 70
+          },
+          {
+            "name": "resolution_notes",
+            "type": "text",
+            "line": 71
+          }
+        ]
+      }
+    ],
+    "functions": [],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "migrations/2.4_to_2.5.sql",
+    "tables": [
+      {
+        "name": "flight_recorder.vacuum_progress_snapshots",
+        "line": 76,
+        "columns": [
+          {
+            "name": "snapshot_id",
+            "type": "int4",
+            "line": 77
+          },
+          {
+            "name": "pid",
+            "type": "int4",
+            "line": 78
+          },
+          {
+            "name": "datid",
+            "type": "oid",
+            "line": 79
+          },
+          {
+            "name": "datname",
+            "type": "text",
+            "line": 80
+          },
+          {
+            "name": "relid",
+            "type": "oid",
+            "line": 81
+          },
+          {
+            "name": "relname",
+            "type": "text",
+            "line": 82
+          },
+          {
+            "name": "phase",
+            "type": "text",
+            "line": 83
+          },
+          {
+            "name": "heap_blks_total",
+            "type": "int8",
+            "line": 84
+          },
+          {
+            "name": "heap_blks_scanned",
+            "type": "int8",
+            "line": 85
+          },
+          {
+            "name": "heap_blks_vacuumed",
+            "type": "int8",
+            "line": 86
+          },
+          {
+            "name": "index_vacuum_count",
+            "type": "int8",
+            "line": 87
+          },
+          {
+            "name": "max_dead_tuples",
+            "type": "int8",
+            "line": 88
+          },
+          {
+            "name": "num_dead_tuples",
+            "type": "int8",
+            "line": 89
+          }
+        ]
+      }
+    ],
+    "functions": [],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "migrations/2.6_to_2.7.sql",
+    "tables": [],
+    "functions": [
+      {
+        "name": "flight_recorder.dead_tuple_growth_rate",
+        "line": 67,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.modification_rate",
+        "line": 115,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.hot_update_ratio",
+        "line": 164,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.time_to_budget_exhaustion",
+        "line": 191,
+        "returns": "interval"
+      }
+    ],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "migrations/2.7_to_2.8.sql",
+    "tables": [],
+    "functions": [
+      {
+        "name": "flight_recorder.oid_consumption_rate",
+        "line": 58,
+        "returns": "numeric"
+      },
+      {
+        "name": "flight_recorder.time_to_oid_exhaustion",
+        "line": 103,
+        "returns": "interval"
+      }
+    ],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "migrations/2.8_to_2.9.sql",
+    "tables": [
+      {
+        "name": "flight_recorder.canaries",
+        "line": 51,
+        "columns": [
+          {
+            "name": "id",
+            "type": "serial",
+            "line": 52
+          },
+          {
+            "name": "name",
+            "type": "text",
+            "line": 53
+          },
+          {
+            "name": "description",
+            "type": "text",
+            "line": 54
+          },
+          {
+            "name": "query_text",
+            "type": "text",
+            "line": 55
+          },
+          {
+            "name": "expected_time_ms",
+            "type": "numeric",
+            "line": 56
+          },
+          {
+            "name": "threshold_warning",
+            "type": "numeric",
+            "line": 57
+          },
+          {
+            "name": "threshold_critical",
+            "type": "numeric",
+            "line": 58
+          },
+          {
+            "name": "enabled",
+            "type": "bool",
+            "line": 59
+          },
+          {
+            "name": "created_at",
+            "type": "timestamptz",
+            "line": 60
+          }
+        ]
+      },
+      {
+        "name": "flight_recorder.canary_results",
+        "line": 65,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 66
+          },
+          {
+            "name": "canary_id",
+            "type": "int4",
+            "line": 67
+          },
+          {
+            "name": "executed_at",
+            "type": "timestamptz",
+            "line": 68
+          },
+          {
+            "name": "duration_ms",
+            "type": "numeric",
+            "line": 69
+          },
+          {
+            "name": "plan",
+            "type": "jsonb",
+            "line": 70
+          },
+          {
+            "name": "error_message",
+            "type": "text",
+            "line": 71
+          },
+          {
+            "name": "success",
+            "type": "bool",
+            "line": 72
+          }
+        ]
+      }
+    ],
+    "functions": [],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "migrations/2.9_to_2.10.sql",
+    "tables": [
+      {
+        "name": "flight_recorder.query_storms",
+        "line": 56,
+        "columns": [
+          {
+            "name": "id",
+            "type": "bigserial",
+            "line": 57
+          },
+          {
+            "name": "detected_at",
+            "type": "timestamptz",
+            "line": 58
+          },
+          {
+            "name": "queryid",
+            "type": "int8",
+            "line": 59
+          },
+          {
+            "name": "query_fingerprint",
+            "type": "text",
+            "line": 60
+          },
+          {
+            "name": "storm_type",
+            "type": "text",
+            "line": 61
+          },
+          {
+            "name": "recent_count",
+            "type": "int8",
+            "line": 62
+          },
+          {
+            "name": "baseline_count",
+            "type": "int8",
+            "line": 63
+          },
+          {
+            "name": "multiplier",
+            "type": "numeric",
+            "line": 64
+          },
+          {
+            "name": "resolved_at",
+            "type": "timestamptz",
+            "line": 65
+          },
+          {
+            "name": "resolution_notes",
+            "type": "text",
+            "line": 66
+          }
+        ]
+      }
+    ],
+    "functions": [],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "tests/07_pathology_generators.sql",
+    "tables": [
+      {
+        "name": "test_lock_contention",
+        "line": 31,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 32
+          },
+          {
+            "name": "value",
+            "type": "int4",
+            "line": 33
+          }
+        ]
+      },
+      {
+        "name": "test_memory_pressure",
+        "line": 112,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 113
+          },
+          {
+            "name": "data",
+            "type": "text",
+            "line": 114
+          }
+        ]
+      },
+      {
+        "name": "test_cpu_intensive",
+        "line": 237,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 238
+          },
+          {
+            "name": "value",
+            "type": "numeric",
+            "line": 239
+          }
+        ]
+      },
+      {
+        "name": "test_slow_realtime",
+        "line": 318,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 319
+          },
+          {
+            "name": "data",
+            "type": "text",
+            "line": 320
+          }
+        ]
+      },
+      {
+        "name": "test_slow_queries",
+        "line": 387,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 388
+          },
+          {
+            "name": "category",
+            "type": "int4",
+            "line": 389
+          },
+          {
+            "name": "data",
+            "type": "text",
+            "line": 390
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp",
+            "line": 391
+          }
+        ]
+      },
+      {
+        "name": "test_historical",
+        "line": 625,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 626
+          },
+          {
+            "name": "data",
+            "type": "text",
+            "line": 627
+          }
+        ]
+      },
+      {
+        "name": "test_disk_io",
+        "line": 708,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 709
+          },
+          {
+            "name": "padding",
+            "type": "text",
+            "line": 710
+          }
+        ]
+      }
+    ],
+    "functions": [],
+    "views": [],
+    "types": []
+  },
+  {
+    "file": "tests/08_pathology_value_checks.sql",
+    "tables": [
+      {
+        "name": "vc_memory_test",
+        "line": 22,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 22
+          },
+          {
+            "name": "data",
+            "type": "text",
+            "line": 22
+          }
+        ]
+      },
+      {
+        "name": "vc_cpu_test",
+        "line": 88,
+        "columns": [
+          {
+            "name": "id",
+            "type": "int4",
+            "line": 88
+          },
+          {
+            "name": "value",
+            "type": "numeric",
+            "line": 88
+          }
+        ]
+      }
+    ],
+    "functions": [],
+    "views": [],
+    "types": []
+  }
+]
