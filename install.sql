@@ -576,40 +576,202 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     value       TEXT NOT NULL,
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
+
+-- Single source of truth for profile settings
+-- Profiles define behavioral presets for different environments
+CREATE OR REPLACE FUNCTION flight_recorder._profile_settings()
+RETURNS TABLE(
+    profile     TEXT,
+    key         TEXT,
+    value       TEXT,
+    description TEXT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM (VALUES
+        ('default', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+        ('default', 'adaptive_sampling', 'true', 'Skip collection when system idle'),
+        ('default', 'load_shedding_enabled', 'true', 'Skip during high load (>70% connections)'),
+        ('default', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('default', 'circuit_breaker_enabled', 'true', 'Auto-skip if collections run slow'),
+        ('default', 'enable_locks', 'true', 'Collect lock contention data'),
+        ('default', 'enable_progress', 'true', 'Collect operation progress'),
+        ('default', 'snapshot_based_collection', 'true', 'Use snapshot-based collection (67% fewer locks)'),
+        ('default', 'retention_snapshots_days', '30', 'Keep 30 days of snapshot data'),
+        ('default', 'aggregate_retention_days', '7', 'Keep 7 days of aggregate data'),
+        ('default', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('default', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('default', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('default', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('default', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
+        ('default', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
+        ('default', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
+        ('default', 'section_timeout_ms', '250', 'Per-section timeout 250ms'),
+        ('default', 'statement_timeout_ms', '1000', 'Statement timeout 1 second'),
+        ('default', 'work_mem_kb', '2048', 'work_mem 2MB for collection queries'),
+        ('default', 'skip_locks_threshold', '50', 'Skip lock collection if > 50 blocked'),
+        ('default', 'skip_activity_conn_threshold', '100', 'Skip activity if > 100 active'),
+        ('default', 'load_throttle_xact_threshold', '1000', 'Skip if > 1000 xact/sec'),
+        ('default', 'load_throttle_blk_threshold', '10000', 'Skip if > 10000 blk/sec'),
+        ('default', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
+        ('default', 'statements_min_calls', '1', 'Include queries with >= 1 call'),
+        ('default', 'table_stats_top_n', '50', 'Track top 50 tables'),
+        ('default', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
+        ('default', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('default', 'auto_mode_connections_threshold', '60', 'Emergency mode at 60% connections'),
+        ('production_safe', 'sample_interval_seconds', '300', 'Sample every 5 minutes (40% less overhead)'),
+        ('production_safe', 'adaptive_sampling', 'true', 'Skip when idle'),
+        ('production_safe', 'load_shedding_enabled', 'true', 'Skip during high load'),
+        ('production_safe', 'load_shedding_active_pct', '60', 'More aggressive load shedding (60% vs 70%)'),
+        ('production_safe', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('production_safe', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+        ('production_safe', 'circuit_breaker_threshold_ms', '800', 'Stricter circuit breaker (800ms vs 1000ms)'),
+        ('production_safe', 'enable_locks', 'false', 'Disable lock collection (reduce overhead)'),
+        ('production_safe', 'enable_progress', 'false', 'Disable progress tracking'),
+        ('production_safe', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('production_safe', 'lock_timeout_ms', '50', 'Faster lock timeout (50ms vs 100ms)'),
+        ('production_safe', 'retention_snapshots_days', '30', 'Keep 30 days'),
+        ('production_safe', 'aggregate_retention_days', '7', 'Keep 7 days'),
+        ('production_safe', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('production_safe', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('production_safe', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('production_safe', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('production_safe', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
+        ('production_safe', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
+        ('production_safe', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
+        ('production_safe', 'section_timeout_ms', '200', 'Faster per-section timeout'),
+        ('production_safe', 'statement_timeout_ms', '800', 'Faster statement timeout'),
+        ('production_safe', 'work_mem_kb', '1024', 'Lower work_mem to reduce overhead'),
+        ('production_safe', 'skip_locks_threshold', '30', 'More aggressive lock skip'),
+        ('production_safe', 'skip_activity_conn_threshold', '50', 'More aggressive activity skip'),
+        ('production_safe', 'load_throttle_xact_threshold', '500', 'Lower xact threshold'),
+        ('production_safe', 'load_throttle_blk_threshold', '5000', 'Lower I/O threshold'),
+        ('production_safe', 'statements_interval_minutes', '30', 'Less frequent statement collection'),
+        ('production_safe', 'statements_min_calls', '5', 'Only queries with >= 5 calls'),
+        ('production_safe', 'table_stats_top_n', '30', 'Track fewer tables'),
+        ('production_safe', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
+        ('production_safe', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('production_safe', 'auto_mode_connections_threshold', '50', 'Earlier emergency mode'),
+        ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+        ('development', 'adaptive_sampling', 'false', 'Always collect (never skip when idle)'),
+        ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
+        ('development', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('development', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+        ('development', 'enable_locks', 'true', 'Collect lock data'),
+        ('development', 'enable_progress', 'true', 'Collect progress data'),
+        ('development', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('development', 'retention_snapshots_days', '7', 'Keep 7 days (less than production)'),
+        ('development', 'aggregate_retention_days', '3', 'Keep 3 days'),
+        ('development', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('development', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('development', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('development', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('development', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
+        ('development', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
+        ('development', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
+        ('development', 'section_timeout_ms', '250', 'Standard per-section timeout'),
+        ('development', 'statement_timeout_ms', '1000', 'Standard statement timeout'),
+        ('development', 'work_mem_kb', '2048', 'Standard work_mem'),
+        ('development', 'skip_locks_threshold', '50', 'Standard lock skip threshold'),
+        ('development', 'skip_activity_conn_threshold', '100', 'Standard activity skip threshold'),
+        ('development', 'load_throttle_xact_threshold', '1000', 'Standard xact threshold'),
+        ('development', 'load_throttle_blk_threshold', '10000', 'Standard I/O threshold'),
+        ('development', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
+        ('development', 'statements_min_calls', '1', 'Include all queries'),
+        ('development', 'table_stats_top_n', '50', 'Track top 50 tables'),
+        ('development', 'collection_jitter_enabled', 'true', 'Add jitter'),
+        ('development', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('development', 'auto_mode_connections_threshold', '60', 'Standard emergency threshold'),
+        ('troubleshooting', 'sample_interval_seconds', '60', 'Sample every minute (detailed data)'),
+        ('troubleshooting', 'adaptive_sampling', 'false', 'Never skip - always collect'),
+        ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
+        ('troubleshooting', 'load_throttle_enabled', 'false', 'Collect even during I/O pressure'),
+        ('troubleshooting', 'circuit_breaker_enabled', 'true', 'Keep circuit breaker enabled'),
+        ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold - 2 seconds'),
+        ('troubleshooting', 'enable_locks', 'true', 'Collect all lock data'),
+        ('troubleshooting', 'enable_progress', 'true', 'Collect all progress data'),
+        ('troubleshooting', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('troubleshooting', 'statements_top_n', '50', 'Collect top 50 queries (vs 20)'),
+        ('troubleshooting', 'retention_snapshots_days', '7', 'Keep 7 days'),
+        ('troubleshooting', 'aggregate_retention_days', '3', 'Keep 3 days'),
+        ('troubleshooting', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('troubleshooting', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('troubleshooting', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('troubleshooting', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('troubleshooting', 'storm_threshold_multiplier', '2.0', 'More sensitive (2x vs 3x baseline)'),
+        ('troubleshooting', 'regression_threshold_pct', '25.0', 'More sensitive (25% vs 50%)'),
+        ('troubleshooting', 'storm_baseline_days', '3', 'Shorter baseline for faster detection'),
+        ('troubleshooting', 'storm_lookback_interval', '30 minutes', 'Shorter lookback window'),
+        ('troubleshooting', 'regression_baseline_days', '3', 'Shorter baseline for faster detection'),
+        ('troubleshooting', 'regression_lookback_interval', '30 minutes', 'Shorter lookback window'),
+        ('troubleshooting', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
+        ('troubleshooting', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
+        ('troubleshooting', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
+        ('troubleshooting', 'section_timeout_ms', '500', 'Longer per-section timeout for detailed collection'),
+        ('troubleshooting', 'statement_timeout_ms', '2000', 'Longer statement timeout'),
+        ('troubleshooting', 'work_mem_kb', '4096', 'More work_mem for complex queries'),
+        ('troubleshooting', 'skip_locks_threshold', '100', 'Higher threshold - collect more'),
+        ('troubleshooting', 'skip_activity_conn_threshold', '200', 'Higher threshold - collect more'),
+        ('troubleshooting', 'load_throttle_xact_threshold', '2000', 'Higher threshold - collect under load'),
+        ('troubleshooting', 'load_throttle_blk_threshold', '20000', 'Higher threshold - collect under I/O'),
+        ('troubleshooting', 'statements_interval_minutes', '5', 'More frequent statement collection'),
+        ('troubleshooting', 'statements_min_calls', '1', 'Include all queries'),
+        ('troubleshooting', 'table_stats_top_n', '100', 'Track more tables'),
+        ('troubleshooting', 'collection_jitter_enabled', 'false', 'No jitter for consistent timing'),
+        ('troubleshooting', 'auto_mode_enabled', 'false', 'Stay in normal mode for debugging'),
+        ('troubleshooting', 'auto_mode_connections_threshold', '80', 'Higher emergency threshold'),
+        ('minimal_overhead', 'sample_interval_seconds', '300', 'Sample every 5 minutes'),
+        ('minimal_overhead', 'adaptive_sampling', 'true', 'Skip when idle'),
+        ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10', 'Higher idle threshold (10 vs 5)'),
+        ('minimal_overhead', 'load_shedding_enabled', 'true', 'Skip during high load'),
+        ('minimal_overhead', 'load_shedding_active_pct', '50', 'Very aggressive (50%)'),
+        ('minimal_overhead', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('minimal_overhead', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+        ('minimal_overhead', 'circuit_breaker_threshold_ms', '500', 'Very strict (500ms)'),
+        ('minimal_overhead', 'enable_locks', 'false', 'Disable locks'),
+        ('minimal_overhead', 'enable_progress', 'false', 'Disable progress'),
+        ('minimal_overhead', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('minimal_overhead', 'statements_enabled', 'false', 'Disable pg_stat_statements collection'),
+        ('minimal_overhead', 'retention_snapshots_days', '7', 'Keep 7 days'),
+        ('minimal_overhead', 'aggregate_retention_days', '3', 'Keep 3 days'),
+        ('minimal_overhead', 'table_stats_enabled', 'false', 'Disable table statistics (reduce overhead)'),
+        ('minimal_overhead', 'index_stats_enabled', 'false', 'Disable index statistics (reduce overhead)'),
+        ('minimal_overhead', 'config_snapshots_enabled', 'true', 'Collect config snapshots (low overhead)'),
+        ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('minimal_overhead', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
+        ('minimal_overhead', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
+        ('minimal_overhead', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
+        ('minimal_overhead', 'section_timeout_ms', '100', 'Very fast per-section timeout'),
+        ('minimal_overhead', 'statement_timeout_ms', '500', 'Very fast statement timeout'),
+        ('minimal_overhead', 'work_mem_kb', '1024', 'Minimal work_mem'),
+        ('minimal_overhead', 'skip_locks_threshold', '20', 'Very aggressive lock skip'),
+        ('minimal_overhead', 'skip_activity_conn_threshold', '30', 'Very aggressive activity skip'),
+        ('minimal_overhead', 'load_throttle_xact_threshold', '300', 'Very low xact threshold'),
+        ('minimal_overhead', 'load_throttle_blk_threshold', '3000', 'Very low I/O threshold'),
+        ('minimal_overhead', 'statements_interval_minutes', '30', 'Infrequent statement collection'),
+        ('minimal_overhead', 'statements_min_calls', '10', 'Only hot queries'),
+        ('minimal_overhead', 'table_stats_top_n', '20', 'Track fewer tables'),
+        ('minimal_overhead', 'collection_jitter_enabled', 'false', 'No jitter (minimize complexity)'),
+        ('minimal_overhead', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('minimal_overhead', 'auto_mode_connections_threshold', '40', 'Very early emergency mode')
+    ) AS t(profile, key, value, description);
+$$;
+
+-- Non-profile settings (system defaults that profiles don't manage)
 INSERT INTO flight_recorder.config (key, value) VALUES
     ('schema_version', '2.22'),
     ('mode', 'normal'),
-    ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
     ('statements_top_n', '20'),
-    ('statements_interval_minutes', '15'),
-    ('statements_min_calls', '1'),
-    ('enable_locks', 'true'),
-    ('enable_progress', 'true'),
     ('circuit_breaker_threshold_ms', '1000'),
-    ('circuit_breaker_enabled', 'true'),
     ('circuit_breaker_window_minutes', '15'),
-    ('statement_timeout_ms', '1000'),
     ('lock_timeout_ms', '100'),
-    ('work_mem_kb', '2048'),
-    ('section_timeout_ms', '250'),
-    ('skip_locks_threshold', '50'),
-    ('skip_activity_conn_threshold', '100'),
     ('schema_size_warning_mb', '5000'),
     ('schema_size_critical_mb', '10000'),
     ('schema_size_check_enabled', 'true'),
-    ('auto_mode_enabled', 'true'),
-    ('auto_mode_connections_threshold', '60'),
     ('auto_mode_trips_threshold', '1'),
-    ('retention_samples_days', '7'),
-    ('aggregate_retention_days', '7'),
-    ('retention_snapshots_days', '30'),
-    ('retention_statements_days', '30'),
-    ('retention_collection_stats_days', '30'),
     ('alert_enabled', 'false'),
     ('alert_circuit_breaker_count', '5'),
     ('alert_schema_size_mb', '8000'),
-    ('snapshot_based_collection', 'true'),
     ('lock_timeout_strategy', 'fail_fast'),
     ('check_ddl_before_collection', 'true'),
     ('check_replica_lag', 'true'),
@@ -620,14 +782,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('schema_size_percentage', '5.0'),
     ('schema_size_min_mb', '1000'),
     ('schema_size_max_mb', '10000'),
-    ('adaptive_sampling', 'false'),
     ('adaptive_sampling_idle_threshold', '5'),
-    ('load_shedding_enabled', 'true'),
     ('load_shedding_active_pct', '70'),
-    ('load_throttle_enabled', 'true'),
-    ('load_throttle_xact_threshold', '1000'),
-    ('load_throttle_blk_threshold', '10000'),
-    ('collection_jitter_enabled', 'true'),
     ('collection_jitter_max_seconds', '10'),
     ('archive_samples_enabled', 'true'),
     ('archive_sample_frequency_minutes', '15'),
@@ -640,13 +796,8 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('capacity_thresholds_critical_pct', '80'),
     ('collect_database_size', 'true'),
     ('collect_connection_metrics', 'true'),
-    ('table_stats_enabled', 'true'),
-    ('table_stats_top_n', '50'),
     ('table_stats_mode', 'top_n'),
     ('table_stats_activity_threshold', '0'),
-    ('index_stats_enabled', 'true'),
-    ('config_snapshots_enabled', 'true'),
-    ('db_role_config_snapshots_enabled', 'true'),
     ('ring_buffer_slots', '120'),
     ('storm_threshold_multiplier', '3.0'),
     ('storm_lookback_interval', '1 hour'),
@@ -663,6 +814,14 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('statements_ranking_metric', 'buffers'),
     ('regression_detection_metric', 'buffers')
 ON CONFLICT (key) DO NOTHING;
+
+-- Profile-managed defaults (from 'default' profile)
+INSERT INTO flight_recorder.config (key, value)
+SELECT ps.key, ps.value
+FROM flight_recorder._profile_settings() ps
+WHERE ps.profile = 'default'
+ON CONFLICT (key) DO NOTHING;
+
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
     collection_type TEXT NOT NULL,
@@ -3529,6 +3688,18 @@ LANGUAGE sql STABLE AS $$
         flight_recorder._pretty_bytes(e.temp_bytes - s.temp_bytes)
     FROM start_snap s, end_snap e
 $$;
+
+-- Returns the ring buffer retention interval based on configured sample interval
+-- Used by recent_* views and recent_*_current() functions to determine query window
+CREATE OR REPLACE FUNCTION flight_recorder._get_ring_retention_interval()
+RETURNS INTERVAL
+LANGUAGE sql STABLE AS $$
+    SELECT ((120 * COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
+    ))::text || ' seconds')::interval;
+$$;
+
 CREATE OR REPLACE VIEW flight_recorder.recent_waits AS
 SELECT
     sr.captured_at,
@@ -3539,7 +3710,7 @@ SELECT
     w.count
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.wait_samples_ring w ON w.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '10 hours'
+WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
   AND w.backend_type IS NOT NULL
 ORDER BY sr.captured_at DESC, w.count DESC;
 CREATE OR REPLACE VIEW flight_recorder.recent_activity AS
@@ -3562,7 +3733,7 @@ SELECT
     a.query_preview
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '10 hours'
+WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
   AND a.pid IS NOT NULL
 ORDER BY sr.captured_at DESC, a.query_start ASC;
 CREATE OR REPLACE VIEW flight_recorder.recent_locks AS
@@ -3581,7 +3752,7 @@ SELECT
     l.blocking_query_preview
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.lock_samples_ring l ON l.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '10 hours'
+WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
   AND l.blocked_pid IS NOT NULL
 ORDER BY sr.captured_at DESC, l.blocked_duration DESC;
 
@@ -3599,24 +3770,13 @@ SELECT
     a.query_preview
 FROM flight_recorder.samples_ring sr
 JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
-WHERE sr.captured_at > now() - interval '10 hours'
+WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
   AND a.pid IS NOT NULL
   AND a.state = 'idle in transaction'
 ORDER BY a.xact_start ASC NULLS LAST;
 
 COMMENT ON VIEW flight_recorder.recent_idle_in_transaction IS
 'Sessions currently idle in transaction, ordered by how long they have been idle';
-
--- Returns the ring buffer retention interval based on configured sample interval
--- Used by recent_*_current() functions to determine query window
-CREATE OR REPLACE FUNCTION flight_recorder._get_ring_retention_interval()
-RETURNS INTERVAL
-LANGUAGE sql STABLE AS $$
-    SELECT ((120 * COALESCE(
-        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
-        60
-    ))::text || ' seconds')::interval;
-$$;
 
 -- Retrieves recent wait event samples from the flight recorder ring buffer
 -- Filters by configured retention interval and orders by capture time and occurrence count
@@ -5080,185 +5240,6 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.apply_optimization_profile(TEXT) IS 'Applies a ring buffer optimization profile. Updates ring_buffer_slots, sample_interval_seconds, and archive_sample_frequency_minutes. Call rebuild_ring_buffers() after if slot count changed.';
-
--- Single source of truth for all profile settings
--- Used by explain_profile() and apply_profile() to avoid duplication
-CREATE OR REPLACE FUNCTION flight_recorder._profile_settings()
-RETURNS TABLE(
-    profile     TEXT,
-    key         TEXT,
-    value       TEXT,
-    description TEXT
-)
-LANGUAGE sql STABLE AS $$
-    SELECT * FROM (VALUES
-        ('default', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
-        ('default', 'adaptive_sampling', 'true', 'Skip collection when system idle'),
-        ('default', 'load_shedding_enabled', 'true', 'Skip during high load (>70% connections)'),
-        ('default', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-        ('default', 'circuit_breaker_enabled', 'true', 'Auto-skip if collections run slow'),
-        ('default', 'enable_locks', 'true', 'Collect lock contention data'),
-        ('default', 'enable_progress', 'true', 'Collect operation progress'),
-        ('default', 'snapshot_based_collection', 'true', 'Use snapshot-based collection (67% fewer locks)'),
-        ('default', 'retention_snapshots_days', '30', 'Keep 30 days of snapshot data'),
-        ('default', 'aggregate_retention_days', '7', 'Keep 7 days of aggregate data'),
-        ('default', 'table_stats_enabled', 'true', 'Collect table statistics'),
-        ('default', 'index_stats_enabled', 'true', 'Collect index statistics'),
-        ('default', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-        ('default', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-        ('default', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-        ('default', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
-        ('default', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
-        ('default', 'section_timeout_ms', '250', 'Per-section timeout 250ms'),
-        ('default', 'statement_timeout_ms', '1000', 'Statement timeout 1 second'),
-        ('default', 'work_mem_kb', '2048', 'work_mem 2MB for collection queries'),
-        ('default', 'skip_locks_threshold', '50', 'Skip lock collection if > 50 blocked'),
-        ('default', 'skip_activity_conn_threshold', '100', 'Skip activity if > 100 active'),
-        ('default', 'load_throttle_xact_threshold', '1000', 'Skip if > 1000 xact/sec'),
-        ('default', 'load_throttle_blk_threshold', '10000', 'Skip if > 10000 blk/sec'),
-        ('default', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
-        ('default', 'statements_min_calls', '1', 'Include queries with >= 1 call'),
-        ('default', 'table_stats_top_n', '50', 'Track top 50 tables'),
-        ('default', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
-        ('default', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-        ('default', 'auto_mode_connections_threshold', '60', 'Emergency mode at 60% connections'),
-        ('production_safe', 'sample_interval_seconds', '300', 'Sample every 5 minutes (40% less overhead)'),
-        ('production_safe', 'adaptive_sampling', 'true', 'Skip when idle'),
-        ('production_safe', 'load_shedding_enabled', 'true', 'Skip during high load'),
-        ('production_safe', 'load_shedding_active_pct', '60', 'More aggressive load shedding (60% vs 70%)'),
-        ('production_safe', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-        ('production_safe', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-        ('production_safe', 'circuit_breaker_threshold_ms', '800', 'Stricter circuit breaker (800ms vs 1000ms)'),
-        ('production_safe', 'enable_locks', 'false', 'Disable lock collection (reduce overhead)'),
-        ('production_safe', 'enable_progress', 'false', 'Disable progress tracking'),
-        ('production_safe', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-        ('production_safe', 'lock_timeout_ms', '50', 'Faster lock timeout (50ms vs 100ms)'),
-        ('production_safe', 'retention_snapshots_days', '30', 'Keep 30 days'),
-        ('production_safe', 'aggregate_retention_days', '7', 'Keep 7 days'),
-        ('production_safe', 'table_stats_enabled', 'true', 'Collect table statistics'),
-        ('production_safe', 'index_stats_enabled', 'true', 'Collect index statistics'),
-        ('production_safe', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-        ('production_safe', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-        ('production_safe', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-        ('production_safe', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
-        ('production_safe', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
-        ('production_safe', 'section_timeout_ms', '200', 'Faster per-section timeout'),
-        ('production_safe', 'statement_timeout_ms', '800', 'Faster statement timeout'),
-        ('production_safe', 'work_mem_kb', '1024', 'Lower work_mem to reduce overhead'),
-        ('production_safe', 'skip_locks_threshold', '30', 'More aggressive lock skip'),
-        ('production_safe', 'skip_activity_conn_threshold', '50', 'More aggressive activity skip'),
-        ('production_safe', 'load_throttle_xact_threshold', '500', 'Lower xact threshold'),
-        ('production_safe', 'load_throttle_blk_threshold', '5000', 'Lower I/O threshold'),
-        ('production_safe', 'statements_interval_minutes', '30', 'Less frequent statement collection'),
-        ('production_safe', 'statements_min_calls', '5', 'Only queries with >= 5 calls'),
-        ('production_safe', 'table_stats_top_n', '30', 'Track fewer tables'),
-        ('production_safe', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
-        ('production_safe', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-        ('production_safe', 'auto_mode_connections_threshold', '50', 'Earlier emergency mode'),
-        ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
-        ('development', 'adaptive_sampling', 'false', 'Always collect (never skip when idle)'),
-        ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
-        ('development', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-        ('development', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-        ('development', 'enable_locks', 'true', 'Collect lock data'),
-        ('development', 'enable_progress', 'true', 'Collect progress data'),
-        ('development', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-        ('development', 'retention_snapshots_days', '7', 'Keep 7 days (less than production)'),
-        ('development', 'aggregate_retention_days', '3', 'Keep 3 days'),
-        ('development', 'table_stats_enabled', 'true', 'Collect table statistics'),
-        ('development', 'index_stats_enabled', 'true', 'Collect index statistics'),
-        ('development', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-        ('development', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-        ('development', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
-        ('development', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
-        ('development', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
-        ('development', 'section_timeout_ms', '250', 'Standard per-section timeout'),
-        ('development', 'statement_timeout_ms', '1000', 'Standard statement timeout'),
-        ('development', 'work_mem_kb', '2048', 'Standard work_mem'),
-        ('development', 'skip_locks_threshold', '50', 'Standard lock skip threshold'),
-        ('development', 'skip_activity_conn_threshold', '100', 'Standard activity skip threshold'),
-        ('development', 'load_throttle_xact_threshold', '1000', 'Standard xact threshold'),
-        ('development', 'load_throttle_blk_threshold', '10000', 'Standard I/O threshold'),
-        ('development', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
-        ('development', 'statements_min_calls', '1', 'Include all queries'),
-        ('development', 'table_stats_top_n', '50', 'Track top 50 tables'),
-        ('development', 'collection_jitter_enabled', 'true', 'Add jitter'),
-        ('development', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-        ('development', 'auto_mode_connections_threshold', '60', 'Standard emergency threshold'),
-        ('troubleshooting', 'sample_interval_seconds', '60', 'Sample every minute (detailed data)'),
-        ('troubleshooting', 'adaptive_sampling', 'false', 'Never skip - always collect'),
-        ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
-        ('troubleshooting', 'load_throttle_enabled', 'false', 'Collect even during I/O pressure'),
-        ('troubleshooting', 'circuit_breaker_enabled', 'true', 'Keep circuit breaker enabled'),
-        ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold - 2 seconds'),
-        ('troubleshooting', 'enable_locks', 'true', 'Collect all lock data'),
-        ('troubleshooting', 'enable_progress', 'true', 'Collect all progress data'),
-        ('troubleshooting', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-        ('troubleshooting', 'statements_top_n', '50', 'Collect top 50 queries (vs 20)'),
-        ('troubleshooting', 'retention_snapshots_days', '7', 'Keep 7 days'),
-        ('troubleshooting', 'aggregate_retention_days', '3', 'Keep 3 days'),
-        ('troubleshooting', 'table_stats_enabled', 'true', 'Collect table statistics'),
-        ('troubleshooting', 'index_stats_enabled', 'true', 'Collect index statistics'),
-        ('troubleshooting', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-        ('troubleshooting', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-        ('troubleshooting', 'storm_threshold_multiplier', '2.0', 'More sensitive (2x vs 3x baseline)'),
-        ('troubleshooting', 'regression_threshold_pct', '25.0', 'More sensitive (25% vs 50%)'),
-        ('troubleshooting', 'storm_baseline_days', '3', 'Shorter baseline for faster detection'),
-        ('troubleshooting', 'storm_lookback_interval', '30 minutes', 'Shorter lookback window'),
-        ('troubleshooting', 'regression_baseline_days', '3', 'Shorter baseline for faster detection'),
-        ('troubleshooting', 'regression_lookback_interval', '30 minutes', 'Shorter lookback window'),
-        ('troubleshooting', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-        ('troubleshooting', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
-        ('troubleshooting', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
-        ('troubleshooting', 'section_timeout_ms', '500', 'Longer per-section timeout for detailed collection'),
-        ('troubleshooting', 'statement_timeout_ms', '2000', 'Longer statement timeout'),
-        ('troubleshooting', 'work_mem_kb', '4096', 'More work_mem for complex queries'),
-        ('troubleshooting', 'skip_locks_threshold', '100', 'Higher threshold - collect more'),
-        ('troubleshooting', 'skip_activity_conn_threshold', '200', 'Higher threshold - collect more'),
-        ('troubleshooting', 'load_throttle_xact_threshold', '2000', 'Higher threshold - collect under load'),
-        ('troubleshooting', 'load_throttle_blk_threshold', '20000', 'Higher threshold - collect under I/O'),
-        ('troubleshooting', 'statements_interval_minutes', '5', 'More frequent statement collection'),
-        ('troubleshooting', 'statements_min_calls', '1', 'Include all queries'),
-        ('troubleshooting', 'table_stats_top_n', '100', 'Track more tables'),
-        ('troubleshooting', 'collection_jitter_enabled', 'false', 'No jitter for consistent timing'),
-        ('troubleshooting', 'auto_mode_enabled', 'false', 'Stay in normal mode for debugging'),
-        ('troubleshooting', 'auto_mode_connections_threshold', '80', 'Higher emergency threshold'),
-        ('minimal_overhead', 'sample_interval_seconds', '300', 'Sample every 5 minutes'),
-        ('minimal_overhead', 'adaptive_sampling', 'true', 'Skip when idle'),
-        ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10', 'Higher idle threshold (10 vs 5)'),
-        ('minimal_overhead', 'load_shedding_enabled', 'true', 'Skip during high load'),
-        ('minimal_overhead', 'load_shedding_active_pct', '50', 'Very aggressive (50%)'),
-        ('minimal_overhead', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-        ('minimal_overhead', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-        ('minimal_overhead', 'circuit_breaker_threshold_ms', '500', 'Very strict (500ms)'),
-        ('minimal_overhead', 'enable_locks', 'false', 'Disable locks'),
-        ('minimal_overhead', 'enable_progress', 'false', 'Disable progress'),
-        ('minimal_overhead', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-        ('minimal_overhead', 'statements_enabled', 'false', 'Disable pg_stat_statements collection'),
-        ('minimal_overhead', 'retention_snapshots_days', '7', 'Keep 7 days'),
-        ('minimal_overhead', 'aggregate_retention_days', '3', 'Keep 3 days'),
-        ('minimal_overhead', 'table_stats_enabled', 'false', 'Disable table statistics (reduce overhead)'),
-        ('minimal_overhead', 'index_stats_enabled', 'false', 'Disable index statistics (reduce overhead)'),
-        ('minimal_overhead', 'config_snapshots_enabled', 'true', 'Collect config snapshots (low overhead)'),
-        ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-        ('minimal_overhead', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
-        ('minimal_overhead', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
-        ('minimal_overhead', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
-        ('minimal_overhead', 'section_timeout_ms', '100', 'Very fast per-section timeout'),
-        ('minimal_overhead', 'statement_timeout_ms', '500', 'Very fast statement timeout'),
-        ('minimal_overhead', 'work_mem_kb', '1024', 'Minimal work_mem'),
-        ('minimal_overhead', 'skip_locks_threshold', '20', 'Very aggressive lock skip'),
-        ('minimal_overhead', 'skip_activity_conn_threshold', '30', 'Very aggressive activity skip'),
-        ('minimal_overhead', 'load_throttle_xact_threshold', '300', 'Very low xact threshold'),
-        ('minimal_overhead', 'load_throttle_blk_threshold', '3000', 'Very low I/O threshold'),
-        ('minimal_overhead', 'statements_interval_minutes', '30', 'Infrequent statement collection'),
-        ('minimal_overhead', 'statements_min_calls', '10', 'Only hot queries'),
-        ('minimal_overhead', 'table_stats_top_n', '20', 'Track fewer tables'),
-        ('minimal_overhead', 'collection_jitter_enabled', 'false', 'No jitter (minimize complexity)'),
-        ('minimal_overhead', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-        ('minimal_overhead', 'auto_mode_connections_threshold', '40', 'Very early emergency mode')
-    ) AS t(profile, key, value, description);
-$$;
 
 -- Preview the configuration changes from applying a specified profile
 -- Compares current settings against profile values to show impact before applying
