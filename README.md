@@ -1,42 +1,22 @@
 # pg-flight-recorder
 
-[![GitHub release](https://img.shields.io/github/v/release/dventimisupabase/pg-flight-recorder)](https://github.com/dventimisupabase/pg-flight-recorder/releases/latest)
-[![Test Suite](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/test.yml/badge.svg)](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/test.yml)
-[![Lint](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/lint.yml/badge.svg)](https://github.com/dventimisupabase/pg-flight-recorder/actions/workflows/lint.yml)
-
-**"What was happening in my database?"**
-
-Server-side flight recorder for PostgreSQL. Runs automatically via pg_cron. Zero config.
-
-**Records:** Query activity, wait events, lock conflicts, connection stats, and performance metrics.
+Server-side flight recorder for PostgreSQL. Answers "what was happening in my database?"
 
 ## Install
-
-**PostgreSQL 15+** (requires pg_cron):
 
 ```bash
 psql -f install.sql
 ```
 
-## Use
+Requires PostgreSQL 15+ with pg_cron.
 
-It runs automatically. When you need answers:
+## Use
 
 ```sql
 SELECT flight_recorder.report('1 hour');
 ```
 
-Paste the output into your AI assistant of choice, or read it yourself. The report includes anomalies, wait events, query performance, lock contention, configuration changes, and more.
-
-## Is It Safe?
-
-**Yes.** ~0.02% CPU overhead. 23-32ms per collection.
-
-- Validated on resource-constrained hardware (Supabase Micro: 2 core, 1GB)
-- Built-in protection: load shedding, circuit breakers, fast timeouts
-- 0% DDL blocking across 202 operations in testing
-
-Safe for staging (always-on), production troubleshooting, and production always-on (test in staging first).
+That's it. It runs automatically. The report tells you what happened.
 
 ## Uninstall
 
@@ -44,6 +24,6 @@ Safe for staging (always-on), production troubleshooting, and production always-
 psql -f uninstall.sql
 ```
 
-## More Info
+## Reference
 
-See [REFERENCE.md](REFERENCE.md) for all functions, views, profiles, and configuration options.
+See [REFERENCE.md](REFERENCE.md) for configuration, functions, and details.
