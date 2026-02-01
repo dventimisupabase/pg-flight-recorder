@@ -11,7 +11,7 @@
 DO $$
 DECLARE
     v_current_version TEXT;
-    v_target_version TEXT := '2.18';  -- Update this when adding migrations
+    v_target_version TEXT := '2.22';  -- Update this when adding migrations
 BEGIN
     -- Check if flight_recorder schema exists
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flight_recorder') THEN
@@ -114,8 +114,23 @@ END $$;
 -- Migration from 2.15 to 2.16
 \i migrations/2.15_to_2.16.sql
 
--- Migration from 2.16 to 2.17: SQLite export function
+-- Migration from 2.16 to 2.17: Buffer-based performance metrics
 \i migrations/2.16_to_2.17.sql
+
+-- Migration from 2.17 to 2.18: Enhanced SQLite export (kept for version continuity)
+\i migrations/2.17_to_2.18.sql
+
+-- Migration from 2.18 to 2.19: Remove SQLite export function
+\i migrations/2.18_to_2.19.sql
+
+-- Migration from 2.19 to 2.20: Remove canary queries feature
+\i migrations/2.19_to_2.20.sql
+
+-- Migration from 2.20 to 2.21: Remove auto-detect wrappers
+\i migrations/2.20_to_2.21.sql
+
+-- Migration from 2.21 to 2.22: Remove visual timeline, forecasting, and high_ddl profile
+\i migrations/2.21_to_2.22.sql
 
 -- =============================================================================
 -- Post-upgrade verification

@@ -3,11 +3,11 @@
 -- =============================================================================
 -- Tests: Kill switch, P0-P4 safety features, configuration profiles
 -- Sections: 8, 9, 10 (P1/P2), 11, 12, Configuration Profiles
--- Test count: 83
+-- Test count: 80
 -- =============================================================================
 
 BEGIN;
-SELECT plan(83);
+SELECT plan(80);
 
 -- Disable checkpoint detection during tests to prevent snapshot skipping
 UPDATE flight_recorder.config SET value = 'false' WHERE key = 'check_checkpoint_backup';
@@ -223,19 +223,8 @@ SELECT lives_ok(
 -- Ring buffer uses modular arithmetic (120 slots), no partition management needed
 
 -- =============================================================================
--- 11. P3 FEATURES - Self-Monitoring and Health Checks (9 tests)
+-- 11. P3 FEATURES - Self-Monitoring and Health Checks (7 tests)
 -- =============================================================================
-
--- Test P3: Config entries exist
-SELECT ok(
-    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'self_monitoring_enabled'),
-    'P3: Self-monitoring enabled config should exist'
-);
-
-SELECT ok(
-    EXISTS (SELECT 1 FROM flight_recorder.config WHERE key = 'health_check_enabled'),
-    'P3: Health check enabled config should exist'
-);
 
 -- Test P3: Health check function exists
 SELECT has_function(
@@ -457,8 +446,8 @@ SELECT has_function(
 
 -- Test list_profiles returns expected profiles
 SELECT ok(
-    (SELECT count(*) FROM flight_recorder.list_profiles()) = 6,
-    'Profiles: list_profiles should return 6 profiles'
+    (SELECT count(*) FROM flight_recorder.list_profiles()) = 5,
+    'Profiles: list_profiles should return 5 profiles'
 );
 
 SELECT ok(
@@ -484,11 +473,6 @@ SELECT ok(
 SELECT ok(
     (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'minimal_overhead') = 1,
     'Profiles: minimal_overhead profile should exist'
-);
-
-SELECT ok(
-    (SELECT count(*) FROM flight_recorder.list_profiles() WHERE profile_name = 'high_ddl') = 1,
-    'Profiles: high_ddl profile should exist'
 );
 
 -- Test explain_profile works for each profile

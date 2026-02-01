@@ -47,11 +47,3 @@ psql -f uninstall.sql
 ## More Info
 
 See [REFERENCE.md](REFERENCE.md) for all functions, views, profiles, and configuration options.
-
-### Export to SQLite
-
-Export data for offline analysis or AI-driven exploration:
-
-```bash
-psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db
-```

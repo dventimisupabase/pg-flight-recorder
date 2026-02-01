@@ -491,107 +491,6 @@ CREATE INDEX IF NOT EXISTS db_role_config_snapshots_param_idx
 COMMENT ON TABLE flight_recorder.db_role_config_snapshots IS 'Database and role-level configuration overrides (ALTER DATABASE/ROLE SET) for change tracking';
 
 
--- Canary query definitions for synthetic performance monitoring
--- Pre-defined queries run periodically to detect silent performance degradation
-CREATE TABLE IF NOT EXISTS flight_recorder.canaries (
-    id                  SERIAL PRIMARY KEY,
-    name                TEXT NOT NULL UNIQUE,
-    description         TEXT,
-    query_text          TEXT NOT NULL,
-    expected_time_ms    NUMERIC,
-    threshold_warning   NUMERIC DEFAULT 1.5,
-    threshold_critical  NUMERIC DEFAULT 2.0,
-    enabled             BOOLEAN DEFAULT true,
-    created_at          TIMESTAMPTZ DEFAULT now()
-);
-COMMENT ON TABLE flight_recorder.canaries IS 'Canary query definitions for synthetic performance monitoring. Pre-defined queries detect silent degradation.';
-
--- Canary query execution results
--- Stores timing, buffer metrics, and optional EXPLAIN output for baseline comparison
-CREATE TABLE IF NOT EXISTS flight_recorder.canary_results (
-    id                  BIGSERIAL PRIMARY KEY,
-    canary_id           INTEGER REFERENCES flight_recorder.canaries(id) ON DELETE CASCADE,
-    executed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    duration_ms         NUMERIC NOT NULL,
-    plan                JSONB,
-    error_message       TEXT,
-    success             BOOLEAN DEFAULT true,
-    shared_blks_hit     BIGINT,
-    shared_blks_read    BIGINT,
-    temp_blks_read      BIGINT,
-    temp_blks_written   BIGINT,
-    total_buffers       BIGINT
-);
-CREATE INDEX IF NOT EXISTS canary_results_canary_id_executed_at_idx
-    ON flight_recorder.canary_results(canary_id, executed_at);
-CREATE INDEX IF NOT EXISTS canary_results_executed_at_idx
-    ON flight_recorder.canary_results(executed_at);
-COMMENT ON TABLE flight_recorder.canary_results IS 'Canary query execution results with timing and buffer metrics for performance baseline comparison';
-COMMENT ON COLUMN flight_recorder.canary_results.shared_blks_hit IS 'Shared buffer cache hits during canary execution';
-COMMENT ON COLUMN flight_recorder.canary_results.shared_blks_read IS 'Shared buffer cache misses (disk reads) during canary execution';
-COMMENT ON COLUMN flight_recorder.canary_results.temp_blks_read IS 'Temporary file blocks read during canary execution';
-COMMENT ON COLUMN flight_recorder.canary_results.temp_blks_written IS 'Temporary file blocks written during canary execution';
-COMMENT ON COLUMN flight_recorder.canary_results.total_buffers IS 'Total buffer operations (shared_blks_hit + shared_blks_read + temp_blks_read + temp_blks_written)';
-
--- Query storm detection results
--- Stores detected query storms with classification and resolution tracking
-CREATE TABLE IF NOT EXISTS flight_recorder.query_storms (
-    id                  BIGSERIAL PRIMARY KEY,
-    detected_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    queryid             BIGINT NOT NULL,
-    query_fingerprint   TEXT NOT NULL,
-    storm_type          TEXT NOT NULL,  -- RETRY_STORM, CACHE_MISS, SPIKE, NORMAL
-    severity            TEXT NOT NULL DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
-    recent_count        BIGINT NOT NULL,
-    baseline_count      BIGINT NOT NULL,
-    multiplier          NUMERIC,
-    correlation         JSONB,  -- Correlated metrics at detection time
-    resolved_at         TIMESTAMPTZ,
-    resolution_notes    TEXT
-);
-CREATE INDEX IF NOT EXISTS query_storms_detected_at_idx
-    ON flight_recorder.query_storms(detected_at);
-CREATE INDEX IF NOT EXISTS query_storms_queryid_idx
-    ON flight_recorder.query_storms(queryid);
-CREATE INDEX IF NOT EXISTS query_storms_storm_type_idx
-    ON flight_recorder.query_storms(storm_type) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS query_storms_severity_idx
-    ON flight_recorder.query_storms(severity) WHERE resolved_at IS NULL;
-COMMENT ON TABLE flight_recorder.query_storms IS 'Query storm detection results. Tracks query execution spikes classified as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
-
--- Performance regression detection results
--- Stores detected query performance regressions with classification and resolution tracking
-CREATE TABLE IF NOT EXISTS flight_recorder.query_regressions (
-    id                      BIGSERIAL PRIMARY KEY,
-    detected_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    queryid                 BIGINT NOT NULL,
-    query_fingerprint       TEXT NOT NULL,
-    severity                TEXT NOT NULL DEFAULT 'MEDIUM',  -- LOW, MEDIUM, HIGH, CRITICAL
-    baseline_avg_ms         NUMERIC NOT NULL,
-    current_avg_ms          NUMERIC NOT NULL,
-    change_pct              NUMERIC NOT NULL,
-    correlation             JSONB,  -- Correlated metrics at detection time
-    probable_causes         TEXT[],
-    resolved_at             TIMESTAMPTZ,
-    resolution_notes        TEXT,
-    baseline_avg_buffers    NUMERIC,
-    current_avg_buffers     NUMERIC,
-    buffer_change_pct       NUMERIC,
-    detection_metric        TEXT DEFAULT 'buffers'
-);
-CREATE INDEX IF NOT EXISTS query_regressions_detected_at_idx
-    ON flight_recorder.query_regressions(detected_at);
-CREATE INDEX IF NOT EXISTS query_regressions_queryid_idx
-    ON flight_recorder.query_regressions(queryid);
-CREATE INDEX IF NOT EXISTS query_regressions_severity_idx
-    ON flight_recorder.query_regressions(severity) WHERE resolved_at IS NULL;
-COMMENT ON TABLE flight_recorder.query_regressions IS 'Performance regression detection results. Tracks queries with significant performance changes using buffer-based metrics (default) or timing with severity levels (LOW, MEDIUM, HIGH, CRITICAL) and correlated metrics.';
-COMMENT ON COLUMN flight_recorder.query_regressions.baseline_avg_buffers IS 'Average total buffer operations during baseline period';
-COMMENT ON COLUMN flight_recorder.query_regressions.current_avg_buffers IS 'Average total buffer operations during recent period';
-COMMENT ON COLUMN flight_recorder.query_regressions.buffer_change_pct IS 'Percentage change in buffer operations (positive = regression)';
-COMMENT ON COLUMN flight_recorder.query_regressions.detection_metric IS 'Metric used for detection: ''buffers'' (default) or ''time''';
-
-
 -- Formats byte values as human-readable strings with appropriate units (GB, MB, KB, B)
 CREATE OR REPLACE FUNCTION flight_recorder._pretty_bytes(bytes BIGINT)
 RETURNS TEXT
@@ -604,192 +503,6 @@ LANGUAGE sql IMMUTABLE AS $$
         ELSE bytes::text || ' B'
     END
 $$;
-
-
--- =============================================================================
--- VISUAL TIMELINE FUNCTIONS (Sparklines and ASCII Charts)
--- =============================================================================
-
--- Generates a compact sparkline from an array of numeric values using Unicode block characters
--- Input: Array of numeric values, optional width (default 20)
--- Output: String like ▁▂▃▅▇█▆▄▃▂ showing relative values
--- Handles NULLs in array, empty arrays, and constant values
-CREATE OR REPLACE FUNCTION flight_recorder._sparkline(
-    p_values NUMERIC[],
-    p_width INTEGER DEFAULT 20
-)
-RETURNS TEXT
-LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE
-    v_blocks CONSTANT TEXT := '▁▂▃▄▅▆▇█';
-    v_min NUMERIC;
-    v_max NUMERIC;
-    v_range NUMERIC;
-    v_result TEXT := '';
-    v_value NUMERIC;
-    v_index INTEGER;
-    v_len INTEGER;
-    v_step INTEGER;
-    i INTEGER;
-BEGIN
-    -- Handle NULL or empty array
-    IF p_values IS NULL OR array_length(p_values, 1) IS NULL THEN
-        RETURN '';
-    END IF;
-
-    v_len := array_length(p_values, 1);
-
-    -- Calculate min/max excluding NULLs
-    SELECT min(val), max(val)
-    INTO v_min, v_max
-    FROM unnest(p_values) AS val
-    WHERE val IS NOT NULL;
-
-    -- Handle all-NULL array
-    IF v_min IS NULL THEN
-        RETURN '';
-    END IF;
-
-    v_range := v_max - v_min;
-
-    -- Handle constant values (all same) - return middle height bars
-    IF v_range = 0 THEN
-        FOR i IN 1..LEAST(p_width, v_len) LOOP
-            v_result := v_result || '▄';
-        END LOOP;
-        RETURN v_result;
-    END IF;
-
-    -- Sample or use all values based on width
-    IF v_len <= p_width THEN
-        -- Use all values
-        FOR i IN 1..v_len LOOP
-            v_value := p_values[i];
-            IF v_value IS NULL THEN
-                v_result := v_result || ' ';
-            ELSE
-                -- Scale to 0-7 index
-                v_index := LEAST(7, FLOOR((v_value - v_min) / v_range * 7.999)::integer);
-                v_result := v_result || substr(v_blocks, v_index + 1, 1);
-            END IF;
-        END LOOP;
-    ELSE
-        -- Sample evenly across the array
-        v_step := v_len / p_width;
-        FOR i IN 1..p_width LOOP
-            v_value := p_values[1 + ((i - 1) * v_step)];
-            IF v_value IS NULL THEN
-                v_result := v_result || ' ';
-            ELSE
-                v_index := LEAST(7, FLOOR((v_value - v_min) / v_range * 7.999)::integer);
-                v_result := v_result || substr(v_blocks, v_index + 1, 1);
-            END IF;
-        END LOOP;
-    END IF;
-
-    RETURN v_result;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._sparkline IS
-'Generates a compact sparkline from numeric array using Unicode block characters (▁▂▃▄▅▆▇█). Used for visual trend display in reports.';
-
-
--- Performs least-squares linear regression on paired arrays
--- Returns slope (rate of change), intercept, and R² (coefficient of determination)
--- Used by forecast functions to predict resource depletion
-CREATE OR REPLACE FUNCTION flight_recorder._linear_regression(
-    p_x NUMERIC[],
-    p_y NUMERIC[]
-)
-RETURNS TABLE(
-    slope NUMERIC,
-    intercept NUMERIC,
-    r_squared NUMERIC
-)
-LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE
-    v_n INTEGER;
-    v_sum_x NUMERIC := 0;
-    v_sum_y NUMERIC := 0;
-    v_sum_xy NUMERIC := 0;
-    v_sum_xx NUMERIC := 0;
-    v_sum_yy NUMERIC := 0;
-    v_mean_x NUMERIC;
-    v_mean_y NUMERIC;
-    v_slope NUMERIC;
-    v_intercept NUMERIC;
-    v_ss_tot NUMERIC;
-    v_ss_res NUMERIC;
-    v_r_squared NUMERIC;
-    i INTEGER;
-BEGIN
-    -- Validate inputs
-    IF p_x IS NULL OR p_y IS NULL THEN
-        RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
-        RETURN;
-    END IF;
-
-    v_n := array_length(p_x, 1);
-
-    -- Need at least 3 points for meaningful regression
-    IF v_n IS NULL OR v_n < 3 OR array_length(p_y, 1) != v_n THEN
-        RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
-        RETURN;
-    END IF;
-
-    -- Calculate sums
-    FOR i IN 1..v_n LOOP
-        IF p_x[i] IS NOT NULL AND p_y[i] IS NOT NULL THEN
-            v_sum_x := v_sum_x + p_x[i];
-            v_sum_y := v_sum_y + p_y[i];
-            v_sum_xy := v_sum_xy + (p_x[i] * p_y[i]);
-            v_sum_xx := v_sum_xx + (p_x[i] * p_x[i]);
-            v_sum_yy := v_sum_yy + (p_y[i] * p_y[i]);
-        END IF;
-    END LOOP;
-
-    -- Calculate means
-    v_mean_x := v_sum_x / v_n;
-    v_mean_y := v_sum_y / v_n;
-
-    -- Calculate slope: m = (n*sum(xy) - sum(x)*sum(y)) / (n*sum(x²) - sum(x)²)
-    IF (v_n * v_sum_xx - v_sum_x * v_sum_x) = 0 THEN
-        -- All x values are the same (vertical line)
-        RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
-        RETURN;
-    END IF;
-
-    v_slope := (v_n * v_sum_xy - v_sum_x * v_sum_y) / (v_n * v_sum_xx - v_sum_x * v_sum_x);
-
-    -- Calculate intercept: b = mean(y) - m * mean(x)
-    v_intercept := v_mean_y - v_slope * v_mean_x;
-
-    -- Calculate R² (coefficient of determination)
-    -- R² = 1 - SS_res / SS_tot where SS_tot = sum((y - mean(y))²) and SS_res = sum((y - predicted)²)
-    v_ss_tot := v_sum_yy - (v_sum_y * v_sum_y / v_n);
-    v_ss_res := 0;
-
-    FOR i IN 1..v_n LOOP
-        IF p_x[i] IS NOT NULL AND p_y[i] IS NOT NULL THEN
-            v_ss_res := v_ss_res + power(p_y[i] - (v_slope * p_x[i] + v_intercept), 2);
-        END IF;
-    END LOOP;
-
-    IF v_ss_tot = 0 THEN
-        -- All y values are the same (horizontal line) - perfect fit
-        v_r_squared := 1.0;
-    ELSE
-        v_r_squared := GREATEST(0, 1 - v_ss_res / v_ss_tot);
-    END IF;
-
-    RETURN QUERY SELECT
-        round(v_slope, 10),
-        round(v_intercept, 10),
-        round(v_r_squared, 4);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._linear_regression IS
-'Performs least-squares linear regression on paired numeric arrays. Returns slope (rate of change), intercept, and R² (coefficient of determination, 0-1 where 1 is perfect fit). Returns NULLs if insufficient data (<3 points) or invalid input.';
 
 
 -- Linear interpolation helper for time-travel debugging
@@ -847,349 +560,6 @@ COMMENT ON FUNCTION flight_recorder._interpolate_metric IS
 'Linear interpolation helper for time-travel debugging. Calculates estimated metric value at a target timestamp between two known data points. Returns rounded value (4 decimal places). Handles edge cases: NULL inputs, same timestamps, and clamps ratio to [0,1] to prevent extrapolation.';
 
 
--- Generates a horizontal progress bar showing filled/empty portions
--- Input: Current value, maximum value, optional width (default 20)
--- Output: String like ███████████████░░░░░ showing percentage filled
-CREATE OR REPLACE FUNCTION flight_recorder._bar(
-    p_value NUMERIC,
-    p_max NUMERIC,
-    p_width INTEGER DEFAULT 20
-)
-RETURNS TEXT
-LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE
-    v_filled INTEGER;
-    v_pct NUMERIC;
-BEGIN
-    -- Handle edge cases
-    IF p_value IS NULL OR p_max IS NULL OR p_max <= 0 THEN
-        RETURN repeat('░', p_width);
-    END IF;
-
-    -- Clamp percentage to 0-100
-    v_pct := GREATEST(0, LEAST(100, (p_value / p_max) * 100));
-
-    -- Calculate filled portion
-    v_filled := round(v_pct / 100 * p_width)::integer;
-
-    RETURN repeat('█', v_filled) || repeat('░', p_width - v_filled);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._bar IS
-'Generates a horizontal progress bar using Unicode block characters (█ filled, ░ empty). Useful for displaying utilization percentages.';
-
-
--- Generates an ASCII timeline chart for a metric over a time period
--- Supported metrics: connections_active, connections_total, wal_bytes, temp_bytes,
---                   xact_commit, xact_rollback, blks_read, blks_hit, db_size_bytes
-CREATE OR REPLACE FUNCTION flight_recorder.timeline(
-    p_metric TEXT,
-    p_duration INTERVAL DEFAULT '4 hours',
-    p_width INTEGER DEFAULT 60,
-    p_height INTEGER DEFAULT 10
-)
-RETURNS TEXT
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_data NUMERIC[];
-    v_times TIMESTAMPTZ[];
-    v_min NUMERIC;
-    v_max NUMERIC;
-    v_range NUMERIC;
-    v_chart TEXT := '';
-    v_row TEXT;
-    v_y_label TEXT;
-    v_scaled_data INTEGER[];
-    v_value NUMERIC;
-    v_scaled INTEGER;
-    v_prev_scaled INTEGER;
-    v_char TEXT;
-    i INTEGER;
-    j INTEGER;
-    v_label_width INTEGER := 6;
-    v_metric_col TEXT;
-BEGIN
-    -- Map metric aliases to actual column names
-    v_metric_col := CASE lower(p_metric)
-        WHEN 'connections' THEN 'connections_active'
-        WHEN 'connections_active' THEN 'connections_active'
-        WHEN 'connections_total' THEN 'connections_total'
-        WHEN 'wal' THEN 'wal_bytes'
-        WHEN 'wal_bytes' THEN 'wal_bytes'
-        WHEN 'temp' THEN 'temp_bytes'
-        WHEN 'temp_bytes' THEN 'temp_bytes'
-        WHEN 'commits' THEN 'xact_commit'
-        WHEN 'xact_commit' THEN 'xact_commit'
-        WHEN 'rollbacks' THEN 'xact_rollback'
-        WHEN 'xact_rollback' THEN 'xact_rollback'
-        WHEN 'blks_read' THEN 'blks_read'
-        WHEN 'blks_hit' THEN 'blks_hit'
-        WHEN 'db_size' THEN 'db_size_bytes'
-        WHEN 'db_size_bytes' THEN 'db_size_bytes'
-        ELSE NULL
-    END;
-
-    IF v_metric_col IS NULL THEN
-        RETURN E'Error: Unsupported metric ''' || p_metric || E'''\n' ||
-               E'Supported: connections, wal_bytes, temp_bytes, xact_commit, xact_rollback, blks_read, blks_hit, db_size_bytes';
-    END IF;
-
-    -- Fetch data points
-    EXECUTE format(
-        'SELECT array_agg(%I ORDER BY captured_at), array_agg(captured_at ORDER BY captured_at)
-         FROM (
-             SELECT %I, captured_at
-             FROM flight_recorder.snapshots
-             WHERE captured_at > now() - $1
-               AND %I IS NOT NULL
-             ORDER BY captured_at
-             LIMIT $2
-         ) sub',
-        v_metric_col, v_metric_col, v_metric_col
-    ) INTO v_data, v_times
-    USING p_duration, p_width;
-
-    -- Handle no data
-    IF v_data IS NULL OR array_length(v_data, 1) IS NULL OR array_length(v_data, 1) < 2 THEN
-        RETURN p_metric || E' (last ' || p_duration || E')\nInsufficient data - need at least 2 data points';
-    END IF;
-
-    -- Calculate min/max
-    SELECT min(val), max(val) INTO v_min, v_max FROM unnest(v_data) AS val;
-    v_range := GREATEST(v_max - v_min, 1);
-
-    -- Add some padding to min/max for better visualization
-    v_min := v_min - v_range * 0.05;
-    v_max := v_max + v_range * 0.05;
-    v_range := v_max - v_min;
-
-    -- Pre-calculate scaled values (0 to p_height)
-    v_scaled_data := ARRAY[]::INTEGER[];
-    FOR i IN 1..array_length(v_data, 1) LOOP
-        v_value := v_data[i];
-        IF v_value IS NOT NULL THEN
-            v_scaled := round((v_value - v_min) / v_range * p_height)::integer;
-        ELSE
-            v_scaled := NULL;
-        END IF;
-        v_scaled_data := v_scaled_data || v_scaled;
-    END LOOP;
-
-    -- Build header
-    v_chart := p_metric || ' (last ' || p_duration || ')' || E'\n';
-
-    -- Build chart from top to bottom
-    FOR i IN REVERSE p_height..0 LOOP
-        -- Y-axis label
-        v_value := v_min + (v_range * i / p_height);
-        IF v_metric_col IN ('wal_bytes', 'temp_bytes', 'db_size_bytes') THEN
-            v_y_label := flight_recorder._pretty_bytes(v_value::bigint);
-        ELSE
-            v_y_label := to_char(v_value, 'FM999999');
-        END IF;
-        v_row := lpad(left(v_y_label, v_label_width), v_label_width) || ' ┤';
-
-        -- Plot data points
-        v_prev_scaled := NULL;
-        FOR j IN 1..array_length(v_scaled_data, 1) LOOP
-            v_scaled := v_scaled_data[j];
-
-            IF v_scaled IS NULL THEN
-                v_char := ' ';
-            ELSIF v_scaled = i THEN
-                -- Determine line character based on neighbors
-                IF v_prev_scaled IS NULL THEN
-                    v_char := '─';
-                ELSIF v_prev_scaled < i THEN
-                    v_char := '╭';  -- Coming up from below
-                ELSIF v_prev_scaled > i THEN
-                    v_char := '╮';  -- Coming down from above
-                ELSE
-                    v_char := '─';  -- Same level
-                END IF;
-            ELSIF v_prev_scaled IS NOT NULL AND
-                  ((v_prev_scaled <= i AND v_scaled > i) OR (v_prev_scaled > i AND v_scaled <= i)) THEN
-                -- Vertical line between two points that cross this row
-                v_char := '│';
-            ELSE
-                v_char := ' ';
-            END IF;
-
-            v_row := v_row || v_char;
-            v_prev_scaled := v_scaled;
-        END LOOP;
-
-        v_chart := v_chart || v_row || E'\n';
-    END LOOP;
-
-    -- X-axis
-    v_row := repeat(' ', v_label_width) || ' └' || repeat('─', array_length(v_scaled_data, 1));
-    v_chart := v_chart || v_row || E'\n';
-
-    -- Time labels (start, middle, end)
-    IF array_length(v_times, 1) >= 3 THEN
-        v_row := repeat(' ', v_label_width + 2) ||
-                 to_char(v_times[1], 'HH24:MI') ||
-                 repeat(' ', GREATEST(1, array_length(v_times, 1)/2 - 8)) ||
-                 to_char(v_times[array_length(v_times, 1)/2], 'HH24:MI') ||
-                 repeat(' ', GREATEST(1, array_length(v_times, 1)/2 - 8)) ||
-                 to_char(v_times[array_length(v_times, 1)], 'HH24:MI');
-        v_chart := v_chart || v_row || E'\n';
-    END IF;
-
-    RETURN v_chart;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.timeline IS
-'Generates an ASCII timeline chart for a metric. Supported metrics: connections, wal_bytes, temp_bytes, xact_commit, xact_rollback, blks_read, blks_hit, db_size_bytes.';
-
-
--- Returns a summary table with sparkline trends for key metrics
-CREATE OR REPLACE FUNCTION flight_recorder.sparkline_metrics(
-    p_duration INTERVAL DEFAULT '1 hour'
-)
-RETURNS TABLE(
-    metric TEXT,
-    current_value TEXT,
-    trend TEXT,
-    min_value TEXT,
-    max_value TEXT
-)
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_values NUMERIC[];
-    v_min NUMERIC;
-    v_max NUMERIC;
-    v_current NUMERIC;
-BEGIN
-    -- Connections Active
-    SELECT array_agg(connections_active ORDER BY captured_at),
-           min(connections_active), max(connections_active),
-           (array_agg(connections_active ORDER BY captured_at DESC))[1]
-    INTO v_values, v_min, v_max, v_current
-    FROM flight_recorder.snapshots
-    WHERE captured_at > now() - p_duration
-      AND connections_active IS NOT NULL;
-
-    IF v_current IS NOT NULL THEN
-        metric := 'connections_active';
-        current_value := v_current::text;
-        trend := flight_recorder._sparkline(v_values);
-        min_value := v_min::text;
-        max_value := v_max::text;
-        RETURN NEXT;
-    END IF;
-
-    -- Cache Hit Ratio (computed)
-    SELECT array_agg(
-               CASE WHEN blks_hit + blks_read > 0
-                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
-                    ELSE NULL
-               END ORDER BY captured_at
-           ),
-           min(CASE WHEN blks_hit + blks_read > 0
-                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
-                    ELSE NULL END),
-           max(CASE WHEN blks_hit + blks_read > 0
-                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
-                    ELSE NULL END),
-           (array_agg(
-               CASE WHEN blks_hit + blks_read > 0
-                    THEN round(100.0 * blks_hit / (blks_hit + blks_read), 1)
-                    ELSE NULL
-               END ORDER BY captured_at DESC
-           ))[1]
-    INTO v_values, v_min, v_max, v_current
-    FROM flight_recorder.snapshots
-    WHERE captured_at > now() - p_duration
-      AND blks_hit IS NOT NULL;
-
-    IF v_current IS NOT NULL THEN
-        metric := 'cache_hit_ratio';
-        current_value := v_current::text || '%';
-        trend := flight_recorder._sparkline(v_values);
-        min_value := COALESCE(v_min::text, '-') || '%';
-        max_value := COALESCE(v_max::text, '-') || '%';
-        RETURN NEXT;
-    END IF;
-
-    -- WAL Bytes
-    SELECT array_agg(wal_bytes ORDER BY captured_at),
-           min(wal_bytes), max(wal_bytes),
-           (array_agg(wal_bytes ORDER BY captured_at DESC))[1]
-    INTO v_values, v_min, v_max, v_current
-    FROM flight_recorder.snapshots
-    WHERE captured_at > now() - p_duration
-      AND wal_bytes IS NOT NULL;
-
-    IF v_current IS NOT NULL THEN
-        metric := 'wal_bytes';
-        current_value := flight_recorder._pretty_bytes(v_current::bigint);
-        trend := flight_recorder._sparkline(v_values);
-        min_value := flight_recorder._pretty_bytes(v_min::bigint);
-        max_value := flight_recorder._pretty_bytes(v_max::bigint);
-        RETURN NEXT;
-    END IF;
-
-    -- Temp Bytes
-    SELECT array_agg(temp_bytes ORDER BY captured_at),
-           min(temp_bytes), max(temp_bytes),
-           (array_agg(temp_bytes ORDER BY captured_at DESC))[1]
-    INTO v_values, v_min, v_max, v_current
-    FROM flight_recorder.snapshots
-    WHERE captured_at > now() - p_duration
-      AND temp_bytes IS NOT NULL;
-
-    IF v_current IS NOT NULL THEN
-        metric := 'temp_bytes';
-        current_value := flight_recorder._pretty_bytes(v_current::bigint);
-        trend := flight_recorder._sparkline(v_values);
-        min_value := flight_recorder._pretty_bytes(v_min::bigint);
-        max_value := flight_recorder._pretty_bytes(v_max::bigint);
-        RETURN NEXT;
-    END IF;
-
-    -- Transactions per interval (xact_commit)
-    SELECT array_agg(xact_commit ORDER BY captured_at),
-           min(xact_commit), max(xact_commit),
-           (array_agg(xact_commit ORDER BY captured_at DESC))[1]
-    INTO v_values, v_min, v_max, v_current
-    FROM flight_recorder.snapshots
-    WHERE captured_at > now() - p_duration
-      AND xact_commit IS NOT NULL;
-
-    IF v_current IS NOT NULL THEN
-        metric := 'xact_commit';
-        current_value := v_current::text;
-        trend := flight_recorder._sparkline(v_values);
-        min_value := v_min::text;
-        max_value := v_max::text;
-        RETURN NEXT;
-    END IF;
-
-    -- Database Size
-    SELECT array_agg(db_size_bytes ORDER BY captured_at),
-           min(db_size_bytes), max(db_size_bytes),
-           (array_agg(db_size_bytes ORDER BY captured_at DESC))[1]
-    INTO v_values, v_min, v_max, v_current
-    FROM flight_recorder.snapshots
-    WHERE captured_at > now() - p_duration
-      AND db_size_bytes IS NOT NULL;
-
-    IF v_current IS NOT NULL THEN
-        metric := 'db_size_bytes';
-        current_value := flight_recorder._pretty_bytes(v_current::bigint);
-        trend := flight_recorder._sparkline(v_values);
-        min_value := flight_recorder._pretty_bytes(v_min::bigint);
-        max_value := flight_recorder._pretty_bytes(v_max::bigint);
-        RETURN NEXT;
-    END IF;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.sparkline_metrics IS
-'Returns a summary table with sparkline trends for key metrics (connections, cache hit ratio, WAL, temp bytes, transactions, database size).';
-
-
 -- Returns the PostgreSQL major version number
 -- Extracts major version by dividing server_version_num by 10000
 CREATE OR REPLACE FUNCTION flight_recorder._pg_version()
@@ -1207,7 +577,7 @@ CREATE TABLE IF NOT EXISTS flight_recorder.config (
     updated_at  TIMESTAMPTZ DEFAULT now()
 );
 INSERT INTO flight_recorder.config (key, value) VALUES
-    ('schema_version', '2.18'),
+    ('schema_version', '2.22'),
     ('mode', 'normal'),
     ('sample_interval_seconds', '180'),
     ('statements_enabled', 'auto'),
@@ -1236,8 +606,6 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('retention_snapshots_days', '30'),
     ('retention_statements_days', '30'),
     ('retention_collection_stats_days', '30'),
-    ('self_monitoring_enabled', 'true'),
-    ('health_check_enabled', 'true'),
     ('alert_enabled', 'false'),
     ('alert_circuit_breaker_count', '5'),
     ('alert_schema_size_mb', '8000'),
@@ -1270,8 +638,6 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('capacity_planning_enabled', 'true'),
     ('capacity_thresholds_warning_pct', '60'),
     ('capacity_thresholds_critical_pct', '80'),
-    ('capacity_forecast_window_days', '90'),
-    ('snapshot_retention_days_extended', '90'),
     ('collect_database_size', 'true'),
     ('collect_connection_metrics', 'true'),
     ('table_stats_enabled', 'true'),
@@ -1282,46 +648,20 @@ INSERT INTO flight_recorder.config (key, value) VALUES
     ('config_snapshots_enabled', 'true'),
     ('db_role_config_snapshots_enabled', 'true'),
     ('ring_buffer_slots', '120'),
-    ('canary_enabled', 'false'),
-    ('canary_interval_minutes', '15'),
-    ('canary_capture_plans', 'false'),
-    ('retention_canary_days', '7'),
-    ('storm_detection_enabled', 'false'),
     ('storm_threshold_multiplier', '3.0'),
     ('storm_lookback_interval', '1 hour'),
     ('storm_baseline_days', '7'),
-    ('storm_detection_interval_minutes', '15'),
-    ('storm_min_duration_minutes', '5'),
-    ('storm_notify_enabled', 'true'),
-    ('storm_notify_channel', 'flight_recorder_storms'),
     ('storm_severity_low_max', '5.0'),
     ('storm_severity_medium_max', '10.0'),
     ('storm_severity_high_max', '50.0'),
-    ('retention_storms_days', '30'),
-    ('regression_detection_enabled', 'false'),
     ('regression_threshold_pct', '50.0'),
     ('regression_lookback_interval', '1 hour'),
     ('regression_baseline_days', '7'),
-    ('regression_detection_interval_minutes', '60'),
-    ('regression_min_duration_minutes', '30'),
-    ('regression_notify_enabled', 'true'),
-    ('regression_notify_channel', 'flight_recorder_regressions'),
     ('regression_severity_low_max', '200.0'),
     ('regression_severity_medium_max', '500.0'),
     ('regression_severity_high_max', '1000.0'),
-    ('retention_regressions_days', '30'),
-    ('forecast_enabled', 'true'),
-    ('forecast_lookback_days', '7'),
-    ('forecast_window_days', '7'),
-    ('forecast_alert_enabled', 'false'),
-    ('forecast_alert_threshold', '3 days'),
-    ('forecast_notify_channel', 'flight_recorder_forecasts'),
-    ('forecast_disk_capacity_gb', '100'),
-    ('forecast_min_samples', '10'),
-    ('forecast_min_confidence', '0.5'),
     ('statements_ranking_metric', 'buffers'),
-    ('regression_detection_metric', 'buffers'),
-    ('canary_comparison_metric', 'buffers')
+    ('regression_detection_metric', 'buffers')
 ON CONFLICT (key) DO NOTHING;
 CREATE UNLOGGED TABLE IF NOT EXISTS flight_recorder.collection_stats (
     id              SERIAL PRIMARY KEY,
@@ -2850,25 +2190,19 @@ COMMENT ON FUNCTION flight_recorder.archive_ring_samples() IS 'Raw archives: Arc
 
 
 -- Removes aged aggregate and archived sample data based on configured retention periods
--- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, canary_results, query_storms, query_regressions, and all *_samples_archive tables
+-- Deletes expired records from wait_event_aggregates, lock_aggregates, activity_aggregates, and all *_samples_archive tables
 CREATE OR REPLACE FUNCTION flight_recorder.cleanup_aggregates()
 RETURNS VOID
 LANGUAGE plpgsql AS $$
 DECLARE
     v_aggregate_retention interval;
     v_archive_retention interval;
-    v_canary_retention interval;
-    v_storm_retention interval;
-    v_regression_retention interval;
     v_deleted_waits INTEGER;
     v_deleted_locks INTEGER;
     v_deleted_queries INTEGER;
     v_deleted_activity_archive INTEGER;
     v_deleted_lock_archive INTEGER;
     v_deleted_wait_archive INTEGER;
-    v_deleted_canary INTEGER;
-    v_deleted_storms INTEGER;
-    v_deleted_regressions INTEGER;
 BEGIN
     v_aggregate_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'aggregate_retention_days')::interval,
@@ -2877,18 +2211,6 @@ BEGIN
     v_archive_retention := COALESCE(
         (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'archive_retention_days')::interval,
         '7 days'::interval
-    );
-    v_canary_retention := COALESCE(
-        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_canary_days')::interval,
-        '7 days'::interval
-    );
-    v_storm_retention := COALESCE(
-        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_storms_days')::interval,
-        '30 days'::interval
-    );
-    v_regression_retention := COALESCE(
-        (SELECT value || ' days' FROM flight_recorder.config WHERE key = 'retention_regressions_days')::interval,
-        '30 days'::interval
     );
     DELETE FROM flight_recorder.wait_event_aggregates
     WHERE start_time < now() - v_aggregate_retention;
@@ -2908,24 +2230,14 @@ BEGIN
     DELETE FROM flight_recorder.wait_samples_archive
     WHERE captured_at < now() - v_archive_retention;
     GET DIAGNOSTICS v_deleted_wait_archive = ROW_COUNT;
-    DELETE FROM flight_recorder.canary_results
-    WHERE executed_at < now() - v_canary_retention;
-    GET DIAGNOSTICS v_deleted_canary = ROW_COUNT;
-    DELETE FROM flight_recorder.query_storms
-    WHERE detected_at < now() - v_storm_retention;
-    GET DIAGNOSTICS v_deleted_storms = ROW_COUNT;
-    DELETE FROM flight_recorder.query_regressions
-    WHERE detected_at < now() - v_regression_retention;
-    GET DIAGNOSTICS v_deleted_regressions = ROW_COUNT;
     IF v_deleted_waits > 0 OR v_deleted_locks > 0 OR v_deleted_queries > 0 OR
-       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 OR
-       v_deleted_canary > 0 OR v_deleted_storms > 0 OR v_deleted_regressions > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives, % canary results, % storms, % regressions',
-            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive, v_deleted_canary, v_deleted_storms, v_deleted_regressions;
+       v_deleted_activity_archive > 0 OR v_deleted_lock_archive > 0 OR v_deleted_wait_archive > 0 THEN
+        RAISE NOTICE 'pg-flight-recorder: Cleaned up % wait aggregates, % lock aggregates, % query aggregates, % activity archives, % lock archives, % wait archives',
+            v_deleted_waits, v_deleted_locks, v_deleted_queries, v_deleted_activity_archive, v_deleted_lock_archive, v_deleted_wait_archive;
     END IF;
 END;
 $$;
-COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate, archive, canary, storm, and regression data based on retention periods';
+COMMENT ON FUNCTION flight_recorder.cleanup_aggregates() IS 'Cleanup: Remove old aggregate and archive data based on retention periods';
 
 
 -- Collects table-level statistics from pg_stat_user_tables
@@ -4295,6 +3607,17 @@ ORDER BY a.xact_start ASC NULLS LAST;
 COMMENT ON VIEW flight_recorder.recent_idle_in_transaction IS
 'Sessions currently idle in transaction, ordered by how long they have been idle';
 
+-- Returns the ring buffer retention interval based on configured sample interval
+-- Used by recent_*_current() functions to determine query window
+CREATE OR REPLACE FUNCTION flight_recorder._get_ring_retention_interval()
+RETURNS INTERVAL
+LANGUAGE sql STABLE AS $$
+    SELECT ((120 * COALESCE(
+        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
+        60
+    ))::text || ' seconds')::interval;
+$$;
+
 -- Retrieves recent wait event samples from the flight recorder ring buffer
 -- Filters by configured retention interval and orders by capture time and occurrence count
 CREATE OR REPLACE FUNCTION flight_recorder.recent_waits_current()
@@ -4305,15 +3628,8 @@ RETURNS TABLE (
     wait_event TEXT,
     state TEXT,
     count INTEGER
-) AS $$
-DECLARE
-    v_retention_interval INTERVAL;
-BEGIN
-    v_retention_interval := (120 * COALESCE(
-        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
-        60
-    ))::text || ' seconds';
-    RETURN QUERY
+)
+LANGUAGE sql STABLE AS $$
     SELECT
         sr.captured_at,
         w.backend_type,
@@ -4323,11 +3639,10 @@ BEGIN
         w.count
     FROM flight_recorder.samples_ring sr
     JOIN flight_recorder.wait_samples_ring w ON w.slot_id = sr.slot_id
-    WHERE sr.captured_at > now() - v_retention_interval
+    WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
       AND w.backend_type IS NOT NULL
     ORDER BY sr.captured_at DESC, w.count DESC;
-END;
-$$ LANGUAGE plpgsql STABLE;
+$$;
 -- Retrieves recent backend session activity with query duration and wait event details
 -- Queries the activity ring buffer for sessions within the configured retention window
 CREATE OR REPLACE FUNCTION flight_recorder.recent_activity_current()
@@ -4343,15 +3658,8 @@ RETURNS TABLE (
     query_start TIMESTAMPTZ,
     running_for INTERVAL,
     query_preview TEXT
-) AS $$
-DECLARE
-    v_retention_interval INTERVAL;
-BEGIN
-    v_retention_interval := (120 * COALESCE(
-        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
-        60
-    ))::text || ' seconds';
-    RETURN QUERY
+)
+LANGUAGE sql STABLE AS $$
     SELECT
         sr.captured_at,
         a.pid,
@@ -4366,11 +3674,10 @@ BEGIN
         a.query_preview
     FROM flight_recorder.samples_ring sr
     JOIN flight_recorder.activity_samples_ring a ON a.slot_id = sr.slot_id
-    WHERE sr.captured_at > now() - v_retention_interval
+    WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
       AND a.pid IS NOT NULL
     ORDER BY sr.captured_at DESC, a.query_start ASC;
-END;
-$$ LANGUAGE plpgsql STABLE;
+$$;
 -- Returns recent lock contention events showing which processes are blocked and their blocking processes
 -- Filters data within the configured retention window from ring buffer samples
 CREATE OR REPLACE FUNCTION flight_recorder.recent_locks_current()
@@ -4387,15 +3694,8 @@ RETURNS TABLE (
     locked_relation TEXT,
     blocked_query_preview TEXT,
     blocking_query_preview TEXT
-) AS $$
-DECLARE
-    v_retention_interval INTERVAL;
-BEGIN
-    v_retention_interval := (120 * COALESCE(
-        flight_recorder._get_config('sample_interval_seconds', '60')::integer,
-        60
-    ))::text || ' seconds';
-    RETURN QUERY
+)
+LANGUAGE sql STABLE AS $$
     SELECT
         sr.captured_at,
         l.blocked_pid,
@@ -4411,11 +3711,10 @@ BEGIN
         l.blocking_query_preview
     FROM flight_recorder.samples_ring sr
     JOIN flight_recorder.lock_samples_ring l ON l.slot_id = sr.slot_id
-    WHERE sr.captured_at > now() - v_retention_interval
+    WHERE sr.captured_at > now() - flight_recorder._get_ring_retention_interval()
       AND l.blocked_pid IS NOT NULL
     ORDER BY sr.captured_at DESC, l.blocked_duration DESC;
-END;
-$$ LANGUAGE plpgsql STABLE;
+$$;
 CREATE OR REPLACE VIEW flight_recorder.recent_replication AS
 SELECT
     sn.captured_at,
@@ -5656,12 +4955,7 @@ LANGUAGE sql STABLE AS $$
          'Absolute minimum footprint',
          'Resource-constrained systems, replicas, or minimal monitoring',
          '300s (10h retention)',
-         'Ultra-minimal (~0.008% CPU)'),
-        ('high_ddl',
-         'Optimized for frequent schema changes',
-         'Multi-tenant SaaS or high DDL workloads',
-         '180s (6h retention)',
-         'Minimal (~0.013% CPU)')
+         'Ultra-minimal (~0.008% CPU)')
     ) AS t(profile_name, description, use_case, sample_interval, overhead_level)
 $$;
 
@@ -5787,6 +5081,185 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.apply_optimization_profile(TEXT) IS 'Applies a ring buffer optimization profile. Updates ring_buffer_slots, sample_interval_seconds, and archive_sample_frequency_minutes. Call rebuild_ring_buffers() after if slot count changed.';
 
+-- Single source of truth for all profile settings
+-- Used by explain_profile() and apply_profile() to avoid duplication
+CREATE OR REPLACE FUNCTION flight_recorder._profile_settings()
+RETURNS TABLE(
+    profile     TEXT,
+    key         TEXT,
+    value       TEXT,
+    description TEXT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM (VALUES
+        ('default', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+        ('default', 'adaptive_sampling', 'true', 'Skip collection when system idle'),
+        ('default', 'load_shedding_enabled', 'true', 'Skip during high load (>70% connections)'),
+        ('default', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('default', 'circuit_breaker_enabled', 'true', 'Auto-skip if collections run slow'),
+        ('default', 'enable_locks', 'true', 'Collect lock contention data'),
+        ('default', 'enable_progress', 'true', 'Collect operation progress'),
+        ('default', 'snapshot_based_collection', 'true', 'Use snapshot-based collection (67% fewer locks)'),
+        ('default', 'retention_snapshots_days', '30', 'Keep 30 days of snapshot data'),
+        ('default', 'aggregate_retention_days', '7', 'Keep 7 days of aggregate data'),
+        ('default', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('default', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('default', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('default', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('default', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
+        ('default', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
+        ('default', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
+        ('default', 'section_timeout_ms', '250', 'Per-section timeout 250ms'),
+        ('default', 'statement_timeout_ms', '1000', 'Statement timeout 1 second'),
+        ('default', 'work_mem_kb', '2048', 'work_mem 2MB for collection queries'),
+        ('default', 'skip_locks_threshold', '50', 'Skip lock collection if > 50 blocked'),
+        ('default', 'skip_activity_conn_threshold', '100', 'Skip activity if > 100 active'),
+        ('default', 'load_throttle_xact_threshold', '1000', 'Skip if > 1000 xact/sec'),
+        ('default', 'load_throttle_blk_threshold', '10000', 'Skip if > 10000 blk/sec'),
+        ('default', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
+        ('default', 'statements_min_calls', '1', 'Include queries with >= 1 call'),
+        ('default', 'table_stats_top_n', '50', 'Track top 50 tables'),
+        ('default', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
+        ('default', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('default', 'auto_mode_connections_threshold', '60', 'Emergency mode at 60% connections'),
+        ('production_safe', 'sample_interval_seconds', '300', 'Sample every 5 minutes (40% less overhead)'),
+        ('production_safe', 'adaptive_sampling', 'true', 'Skip when idle'),
+        ('production_safe', 'load_shedding_enabled', 'true', 'Skip during high load'),
+        ('production_safe', 'load_shedding_active_pct', '60', 'More aggressive load shedding (60% vs 70%)'),
+        ('production_safe', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('production_safe', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+        ('production_safe', 'circuit_breaker_threshold_ms', '800', 'Stricter circuit breaker (800ms vs 1000ms)'),
+        ('production_safe', 'enable_locks', 'false', 'Disable lock collection (reduce overhead)'),
+        ('production_safe', 'enable_progress', 'false', 'Disable progress tracking'),
+        ('production_safe', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('production_safe', 'lock_timeout_ms', '50', 'Faster lock timeout (50ms vs 100ms)'),
+        ('production_safe', 'retention_snapshots_days', '30', 'Keep 30 days'),
+        ('production_safe', 'aggregate_retention_days', '7', 'Keep 7 days'),
+        ('production_safe', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('production_safe', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('production_safe', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('production_safe', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('production_safe', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
+        ('production_safe', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
+        ('production_safe', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
+        ('production_safe', 'section_timeout_ms', '200', 'Faster per-section timeout'),
+        ('production_safe', 'statement_timeout_ms', '800', 'Faster statement timeout'),
+        ('production_safe', 'work_mem_kb', '1024', 'Lower work_mem to reduce overhead'),
+        ('production_safe', 'skip_locks_threshold', '30', 'More aggressive lock skip'),
+        ('production_safe', 'skip_activity_conn_threshold', '50', 'More aggressive activity skip'),
+        ('production_safe', 'load_throttle_xact_threshold', '500', 'Lower xact threshold'),
+        ('production_safe', 'load_throttle_blk_threshold', '5000', 'Lower I/O threshold'),
+        ('production_safe', 'statements_interval_minutes', '30', 'Less frequent statement collection'),
+        ('production_safe', 'statements_min_calls', '5', 'Only queries with >= 5 calls'),
+        ('production_safe', 'table_stats_top_n', '30', 'Track fewer tables'),
+        ('production_safe', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
+        ('production_safe', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('production_safe', 'auto_mode_connections_threshold', '50', 'Earlier emergency mode'),
+        ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
+        ('development', 'adaptive_sampling', 'false', 'Always collect (never skip when idle)'),
+        ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
+        ('development', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('development', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+        ('development', 'enable_locks', 'true', 'Collect lock data'),
+        ('development', 'enable_progress', 'true', 'Collect progress data'),
+        ('development', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('development', 'retention_snapshots_days', '7', 'Keep 7 days (less than production)'),
+        ('development', 'aggregate_retention_days', '3', 'Keep 3 days'),
+        ('development', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('development', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('development', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('development', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('development', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
+        ('development', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
+        ('development', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
+        ('development', 'section_timeout_ms', '250', 'Standard per-section timeout'),
+        ('development', 'statement_timeout_ms', '1000', 'Standard statement timeout'),
+        ('development', 'work_mem_kb', '2048', 'Standard work_mem'),
+        ('development', 'skip_locks_threshold', '50', 'Standard lock skip threshold'),
+        ('development', 'skip_activity_conn_threshold', '100', 'Standard activity skip threshold'),
+        ('development', 'load_throttle_xact_threshold', '1000', 'Standard xact threshold'),
+        ('development', 'load_throttle_blk_threshold', '10000', 'Standard I/O threshold'),
+        ('development', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
+        ('development', 'statements_min_calls', '1', 'Include all queries'),
+        ('development', 'table_stats_top_n', '50', 'Track top 50 tables'),
+        ('development', 'collection_jitter_enabled', 'true', 'Add jitter'),
+        ('development', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('development', 'auto_mode_connections_threshold', '60', 'Standard emergency threshold'),
+        ('troubleshooting', 'sample_interval_seconds', '60', 'Sample every minute (detailed data)'),
+        ('troubleshooting', 'adaptive_sampling', 'false', 'Never skip - always collect'),
+        ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
+        ('troubleshooting', 'load_throttle_enabled', 'false', 'Collect even during I/O pressure'),
+        ('troubleshooting', 'circuit_breaker_enabled', 'true', 'Keep circuit breaker enabled'),
+        ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold - 2 seconds'),
+        ('troubleshooting', 'enable_locks', 'true', 'Collect all lock data'),
+        ('troubleshooting', 'enable_progress', 'true', 'Collect all progress data'),
+        ('troubleshooting', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('troubleshooting', 'statements_top_n', '50', 'Collect top 50 queries (vs 20)'),
+        ('troubleshooting', 'retention_snapshots_days', '7', 'Keep 7 days'),
+        ('troubleshooting', 'aggregate_retention_days', '3', 'Keep 3 days'),
+        ('troubleshooting', 'table_stats_enabled', 'true', 'Collect table statistics'),
+        ('troubleshooting', 'index_stats_enabled', 'true', 'Collect index statistics'),
+        ('troubleshooting', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
+        ('troubleshooting', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('troubleshooting', 'storm_threshold_multiplier', '2.0', 'More sensitive (2x vs 3x baseline)'),
+        ('troubleshooting', 'regression_threshold_pct', '25.0', 'More sensitive (25% vs 50%)'),
+        ('troubleshooting', 'storm_baseline_days', '3', 'Shorter baseline for faster detection'),
+        ('troubleshooting', 'storm_lookback_interval', '30 minutes', 'Shorter lookback window'),
+        ('troubleshooting', 'regression_baseline_days', '3', 'Shorter baseline for faster detection'),
+        ('troubleshooting', 'regression_lookback_interval', '30 minutes', 'Shorter lookback window'),
+        ('troubleshooting', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
+        ('troubleshooting', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
+        ('troubleshooting', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
+        ('troubleshooting', 'section_timeout_ms', '500', 'Longer per-section timeout for detailed collection'),
+        ('troubleshooting', 'statement_timeout_ms', '2000', 'Longer statement timeout'),
+        ('troubleshooting', 'work_mem_kb', '4096', 'More work_mem for complex queries'),
+        ('troubleshooting', 'skip_locks_threshold', '100', 'Higher threshold - collect more'),
+        ('troubleshooting', 'skip_activity_conn_threshold', '200', 'Higher threshold - collect more'),
+        ('troubleshooting', 'load_throttle_xact_threshold', '2000', 'Higher threshold - collect under load'),
+        ('troubleshooting', 'load_throttle_blk_threshold', '20000', 'Higher threshold - collect under I/O'),
+        ('troubleshooting', 'statements_interval_minutes', '5', 'More frequent statement collection'),
+        ('troubleshooting', 'statements_min_calls', '1', 'Include all queries'),
+        ('troubleshooting', 'table_stats_top_n', '100', 'Track more tables'),
+        ('troubleshooting', 'collection_jitter_enabled', 'false', 'No jitter for consistent timing'),
+        ('troubleshooting', 'auto_mode_enabled', 'false', 'Stay in normal mode for debugging'),
+        ('troubleshooting', 'auto_mode_connections_threshold', '80', 'Higher emergency threshold'),
+        ('minimal_overhead', 'sample_interval_seconds', '300', 'Sample every 5 minutes'),
+        ('minimal_overhead', 'adaptive_sampling', 'true', 'Skip when idle'),
+        ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10', 'Higher idle threshold (10 vs 5)'),
+        ('minimal_overhead', 'load_shedding_enabled', 'true', 'Skip during high load'),
+        ('minimal_overhead', 'load_shedding_active_pct', '50', 'Very aggressive (50%)'),
+        ('minimal_overhead', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
+        ('minimal_overhead', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
+        ('minimal_overhead', 'circuit_breaker_threshold_ms', '500', 'Very strict (500ms)'),
+        ('minimal_overhead', 'enable_locks', 'false', 'Disable locks'),
+        ('minimal_overhead', 'enable_progress', 'false', 'Disable progress'),
+        ('minimal_overhead', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
+        ('minimal_overhead', 'statements_enabled', 'false', 'Disable pg_stat_statements collection'),
+        ('minimal_overhead', 'retention_snapshots_days', '7', 'Keep 7 days'),
+        ('minimal_overhead', 'aggregate_retention_days', '3', 'Keep 3 days'),
+        ('minimal_overhead', 'table_stats_enabled', 'false', 'Disable table statistics (reduce overhead)'),
+        ('minimal_overhead', 'index_stats_enabled', 'false', 'Disable index statistics (reduce overhead)'),
+        ('minimal_overhead', 'config_snapshots_enabled', 'true', 'Collect config snapshots (low overhead)'),
+        ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
+        ('minimal_overhead', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
+        ('minimal_overhead', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
+        ('minimal_overhead', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
+        ('minimal_overhead', 'section_timeout_ms', '100', 'Very fast per-section timeout'),
+        ('minimal_overhead', 'statement_timeout_ms', '500', 'Very fast statement timeout'),
+        ('minimal_overhead', 'work_mem_kb', '1024', 'Minimal work_mem'),
+        ('minimal_overhead', 'skip_locks_threshold', '20', 'Very aggressive lock skip'),
+        ('minimal_overhead', 'skip_activity_conn_threshold', '30', 'Very aggressive activity skip'),
+        ('minimal_overhead', 'load_throttle_xact_threshold', '300', 'Very low xact threshold'),
+        ('minimal_overhead', 'load_throttle_blk_threshold', '3000', 'Very low I/O threshold'),
+        ('minimal_overhead', 'statements_interval_minutes', '30', 'Infrequent statement collection'),
+        ('minimal_overhead', 'statements_min_calls', '10', 'Only hot queries'),
+        ('minimal_overhead', 'table_stats_top_n', '20', 'Track fewer tables'),
+        ('minimal_overhead', 'collection_jitter_enabled', 'false', 'No jitter (minimize complexity)'),
+        ('minimal_overhead', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
+        ('minimal_overhead', 'auto_mode_connections_threshold', '40', 'Very early emergency mode')
+    ) AS t(profile, key, value, description);
+$$;
+
 -- Preview the configuration changes from applying a specified profile
 -- Compares current settings against profile values to show impact before applying
 CREATE OR REPLACE FUNCTION flight_recorder.explain_profile(p_profile_name TEXT)
@@ -5803,273 +5276,15 @@ BEGIN
         RAISE EXCEPTION 'Unknown profile: %. Run flight_recorder.list_profiles() to see available profiles.', p_profile_name;
     END IF;
     RETURN QUERY
-    WITH profile_settings AS (
-        SELECT * FROM (VALUES
-            ('default', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
-            ('default', 'adaptive_sampling', 'true', 'Skip collection when system idle'),
-            ('default', 'load_shedding_enabled', 'true', 'Skip during high load (>70% connections)'),
-            ('default', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-            ('default', 'circuit_breaker_enabled', 'true', 'Auto-skip if collections run slow'),
-            ('default', 'enable_locks', 'true', 'Collect lock contention data'),
-            ('default', 'enable_progress', 'true', 'Collect operation progress'),
-            ('default', 'snapshot_based_collection', 'true', 'Use snapshot-based collection (67% fewer locks)'),
-            ('default', 'retention_snapshots_days', '30', 'Keep 30 days of snapshot data'),
-            ('default', 'aggregate_retention_days', '7', 'Keep 7 days of aggregate data'),
-            ('default', 'table_stats_enabled', 'true', 'Collect table statistics'),
-            ('default', 'index_stats_enabled', 'true', 'Collect index statistics'),
-            ('default', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-            ('default', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-            ('default', 'canary_enabled', 'false', 'Canary queries disabled by default'),
-            ('default', 'canary_interval_minutes', '15', 'Run canaries every 15 minutes'),
-            ('default', 'canary_capture_plans', 'false', 'Do not capture execution plans'),
-            ('default', 'retention_canary_days', '7', 'Keep canary results 7 days'),
-            ('default', 'storm_detection_enabled', 'false', 'Storm detection disabled by default'),
-            ('default', 'storm_threshold_multiplier', '3.0', 'Alert at 3x baseline'),
-            ('default', 'storm_detection_interval_minutes', '15', 'Check for storms every 15 minutes'),
-            ('default', 'retention_storms_days', '30', 'Keep storm history 30 days'),
-            ('default', 'regression_detection_enabled', 'false', 'Regression detection disabled by default'),
-            ('default', 'regression_threshold_pct', '50.0', 'Alert at 50% degradation'),
-            ('default', 'regression_detection_interval_minutes', '60', 'Check for regressions hourly'),
-            ('default', 'retention_regressions_days', '30', 'Keep regression history 30 days'),
-            ('default', 'forecast_enabled', 'true', 'Forecasting enabled (read-only analysis)'),
-            ('default', 'forecast_alert_enabled', 'false', 'Forecast alerts disabled by default'),
-            ('default', 'forecast_alert_threshold', '3 days', 'Alert when exhaustion within 3 days'),
-            ('default', 'forecast_lookback_days', '7', 'Lookback 7 days for trend analysis'),
-            ('default', 'forecast_window_days', '7', 'Forecast 7 days into future'),
-            ('default', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-            ('default', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
-            ('default', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
-            ('default', 'section_timeout_ms', '250', 'Per-section timeout 250ms'),
-            ('default', 'statement_timeout_ms', '1000', 'Statement timeout 1 second'),
-            ('default', 'work_mem_kb', '2048', 'work_mem 2MB for collection queries'),
-            ('default', 'skip_locks_threshold', '50', 'Skip lock collection if > 50 blocked'),
-            ('default', 'skip_activity_conn_threshold', '100', 'Skip activity if > 100 active'),
-            ('default', 'load_throttle_xact_threshold', '1000', 'Skip if > 1000 xact/sec'),
-            ('default', 'load_throttle_blk_threshold', '10000', 'Skip if > 10000 blk/sec'),
-            ('default', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
-            ('default', 'statements_min_calls', '1', 'Include queries with >= 1 call'),
-            ('default', 'table_stats_top_n', '50', 'Track top 50 tables'),
-            ('default', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
-            ('default', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-            ('default', 'auto_mode_connections_threshold', '60', 'Emergency mode at 60% connections'),
-            ('production_safe', 'sample_interval_seconds', '300', 'Sample every 5 minutes (40% less overhead)'),
-            ('production_safe', 'adaptive_sampling', 'true', 'Skip when idle'),
-            ('production_safe', 'load_shedding_enabled', 'true', 'Skip during high load'),
-            ('production_safe', 'load_shedding_active_pct', '60', 'More aggressive load shedding (60% vs 70%)'),
-            ('production_safe', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-            ('production_safe', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-            ('production_safe', 'circuit_breaker_threshold_ms', '800', 'Stricter circuit breaker (800ms vs 1000ms)'),
-            ('production_safe', 'enable_locks', 'false', 'Disable lock collection (reduce overhead)'),
-            ('production_safe', 'enable_progress', 'false', 'Disable progress tracking'),
-            ('production_safe', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-            ('production_safe', 'lock_timeout_ms', '50', 'Faster lock timeout (50ms vs 100ms)'),
-            ('production_safe', 'retention_snapshots_days', '30', 'Keep 30 days'),
-            ('production_safe', 'aggregate_retention_days', '7', 'Keep 7 days'),
-            ('production_safe', 'table_stats_enabled', 'true', 'Collect table statistics'),
-            ('production_safe', 'index_stats_enabled', 'true', 'Collect index statistics'),
-            ('production_safe', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-            ('production_safe', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-            ('production_safe', 'canary_enabled', 'false', 'Canary queries disabled (reduce overhead)'),
-            ('production_safe', 'storm_detection_enabled', 'false', 'Storm detection disabled (reduce overhead)'),
-            ('production_safe', 'regression_detection_enabled', 'false', 'Regression detection disabled (reduce overhead)'),
-            ('production_safe', 'forecast_enabled', 'true', 'Forecasting enabled (read-only, low overhead)'),
-            ('production_safe', 'forecast_alert_enabled', 'false', 'Forecast alerts disabled'),
-            ('production_safe', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-            ('production_safe', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
-            ('production_safe', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
-            ('production_safe', 'section_timeout_ms', '200', 'Faster per-section timeout'),
-            ('production_safe', 'statement_timeout_ms', '800', 'Faster statement timeout'),
-            ('production_safe', 'work_mem_kb', '1024', 'Lower work_mem to reduce overhead'),
-            ('production_safe', 'skip_locks_threshold', '30', 'More aggressive lock skip'),
-            ('production_safe', 'skip_activity_conn_threshold', '50', 'More aggressive activity skip'),
-            ('production_safe', 'load_throttle_xact_threshold', '500', 'Lower xact threshold'),
-            ('production_safe', 'load_throttle_blk_threshold', '5000', 'Lower I/O threshold'),
-            ('production_safe', 'statements_interval_minutes', '30', 'Less frequent statement collection'),
-            ('production_safe', 'statements_min_calls', '5', 'Only queries with >= 5 calls'),
-            ('production_safe', 'table_stats_top_n', '30', 'Track fewer tables'),
-            ('production_safe', 'collection_jitter_enabled', 'true', 'Add jitter to prevent thundering herd'),
-            ('production_safe', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-            ('production_safe', 'auto_mode_connections_threshold', '50', 'Earlier emergency mode'),
-            ('development', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
-            ('development', 'adaptive_sampling', 'false', 'Always collect (never skip when idle)'),
-            ('development', 'load_shedding_enabled', 'true', 'Skip during high load'),
-            ('development', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-            ('development', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-            ('development', 'enable_locks', 'true', 'Collect lock data'),
-            ('development', 'enable_progress', 'true', 'Collect progress data'),
-            ('development', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-            ('development', 'retention_snapshots_days', '7', 'Keep 7 days (less than production)'),
-            ('development', 'aggregate_retention_days', '3', 'Keep 3 days'),
-            ('development', 'table_stats_enabled', 'true', 'Collect table statistics'),
-            ('development', 'index_stats_enabled', 'true', 'Collect index statistics'),
-            ('development', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-            ('development', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-            ('development', 'canary_enabled', 'true', 'Canary queries enabled for testing'),
-            ('development', 'canary_interval_minutes', '15', 'Run canaries every 15 minutes'),
-            ('development', 'retention_canary_days', '3', 'Keep canary results 3 days'),
-            ('development', 'storm_detection_enabled', 'true', 'Storm detection enabled'),
-            ('development', 'retention_storms_days', '7', 'Keep storm history 7 days'),
-            ('development', 'regression_detection_enabled', 'true', 'Regression detection enabled'),
-            ('development', 'retention_regressions_days', '7', 'Keep regression history 7 days'),
-            ('development', 'forecast_enabled', 'true', 'Forecasting enabled'),
-            ('development', 'forecast_alert_enabled', 'true', 'Forecast alerts enabled'),
-            ('development', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
-            ('development', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
-            ('development', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
-            ('development', 'section_timeout_ms', '250', 'Standard per-section timeout'),
-            ('development', 'statement_timeout_ms', '1000', 'Standard statement timeout'),
-            ('development', 'work_mem_kb', '2048', 'Standard work_mem'),
-            ('development', 'skip_locks_threshold', '50', 'Standard lock skip threshold'),
-            ('development', 'skip_activity_conn_threshold', '100', 'Standard activity skip threshold'),
-            ('development', 'load_throttle_xact_threshold', '1000', 'Standard xact threshold'),
-            ('development', 'load_throttle_blk_threshold', '10000', 'Standard I/O threshold'),
-            ('development', 'statements_interval_minutes', '15', 'Collect statements every 15 minutes'),
-            ('development', 'statements_min_calls', '1', 'Include all queries'),
-            ('development', 'table_stats_top_n', '50', 'Track top 50 tables'),
-            ('development', 'collection_jitter_enabled', 'true', 'Add jitter'),
-            ('development', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-            ('development', 'auto_mode_connections_threshold', '60', 'Standard emergency threshold'),
-            ('troubleshooting', 'sample_interval_seconds', '60', 'Sample every minute (detailed data)'),
-            ('troubleshooting', 'adaptive_sampling', 'false', 'Never skip - always collect'),
-            ('troubleshooting', 'load_shedding_enabled', 'false', 'Collect even under load'),
-            ('troubleshooting', 'load_throttle_enabled', 'false', 'Collect even during I/O pressure'),
-            ('troubleshooting', 'circuit_breaker_enabled', 'true', 'Keep circuit breaker enabled'),
-            ('troubleshooting', 'circuit_breaker_threshold_ms', '2000', 'More lenient threshold - 2 seconds'),
-            ('troubleshooting', 'enable_locks', 'true', 'Collect all lock data'),
-            ('troubleshooting', 'enable_progress', 'true', 'Collect all progress data'),
-            ('troubleshooting', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-            ('troubleshooting', 'statements_top_n', '50', 'Collect top 50 queries (vs 20)'),
-            ('troubleshooting', 'retention_snapshots_days', '7', 'Keep 7 days'),
-            ('troubleshooting', 'aggregate_retention_days', '3', 'Keep 3 days'),
-            ('troubleshooting', 'table_stats_enabled', 'true', 'Collect table statistics'),
-            ('troubleshooting', 'index_stats_enabled', 'true', 'Collect index statistics'),
-            ('troubleshooting', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-            ('troubleshooting', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-            ('troubleshooting', 'canary_enabled', 'true', 'Canary queries enabled'),
-            ('troubleshooting', 'canary_interval_minutes', '5', 'Run canaries every 5 minutes (frequent)'),
-            ('troubleshooting', 'canary_capture_plans', 'true', 'Capture execution plans for debugging'),
-            ('troubleshooting', 'retention_canary_days', '7', 'Keep canary results 7 days'),
-            ('troubleshooting', 'storm_detection_enabled', 'true', 'Storm detection enabled'),
-            ('troubleshooting', 'storm_threshold_multiplier', '2.0', 'More sensitive (2x vs 3x baseline)'),
-            ('troubleshooting', 'storm_detection_interval_minutes', '5', 'Check for storms every 5 minutes'),
-            ('troubleshooting', 'retention_storms_days', '7', 'Keep storm history 7 days'),
-            ('troubleshooting', 'regression_detection_enabled', 'true', 'Regression detection enabled'),
-            ('troubleshooting', 'regression_threshold_pct', '25.0', 'More sensitive (25% vs 50%)'),
-            ('troubleshooting', 'regression_detection_interval_minutes', '15', 'Check every 15 minutes'),
-            ('troubleshooting', 'retention_regressions_days', '7', 'Keep regression history 7 days'),
-            ('troubleshooting', 'forecast_enabled', 'true', 'Forecasting enabled'),
-            ('troubleshooting', 'forecast_alert_enabled', 'true', 'Forecast alerts enabled'),
-            ('troubleshooting', 'forecast_alert_threshold', '7 days', 'Earlier alerts (7 days vs 3 days)'),
-            ('troubleshooting', 'forecast_lookback_days', '3', 'Shorter lookback for faster detection'),
-            ('troubleshooting', 'forecast_window_days', '3', 'Shorter forecast window'),
-            ('troubleshooting', 'storm_baseline_days', '3', 'Shorter baseline for faster detection'),
-            ('troubleshooting', 'storm_lookback_interval', '30 minutes', 'Shorter lookback window'),
-            ('troubleshooting', 'storm_min_duration_minutes', '2', 'Faster storm alerting'),
-            ('troubleshooting', 'regression_baseline_days', '3', 'Shorter baseline for faster detection'),
-            ('troubleshooting', 'regression_lookback_interval', '30 minutes', 'Shorter lookback window'),
-            ('troubleshooting', 'regression_min_duration_minutes', '10', 'Faster regression alerting'),
-            ('troubleshooting', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-            ('troubleshooting', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
-            ('troubleshooting', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
-            ('troubleshooting', 'section_timeout_ms', '500', 'Longer per-section timeout for detailed collection'),
-            ('troubleshooting', 'statement_timeout_ms', '2000', 'Longer statement timeout'),
-            ('troubleshooting', 'work_mem_kb', '4096', 'More work_mem for complex queries'),
-            ('troubleshooting', 'skip_locks_threshold', '100', 'Higher threshold - collect more'),
-            ('troubleshooting', 'skip_activity_conn_threshold', '200', 'Higher threshold - collect more'),
-            ('troubleshooting', 'load_throttle_xact_threshold', '2000', 'Higher threshold - collect under load'),
-            ('troubleshooting', 'load_throttle_blk_threshold', '20000', 'Higher threshold - collect under I/O'),
-            ('troubleshooting', 'statements_interval_minutes', '5', 'More frequent statement collection'),
-            ('troubleshooting', 'statements_min_calls', '1', 'Include all queries'),
-            ('troubleshooting', 'table_stats_top_n', '100', 'Track more tables'),
-            ('troubleshooting', 'collection_jitter_enabled', 'false', 'No jitter for consistent timing'),
-            ('troubleshooting', 'auto_mode_enabled', 'false', 'Stay in normal mode for debugging'),
-            ('troubleshooting', 'auto_mode_connections_threshold', '80', 'Higher emergency threshold'),
-            ('minimal_overhead', 'sample_interval_seconds', '300', 'Sample every 5 minutes'),
-            ('minimal_overhead', 'adaptive_sampling', 'true', 'Skip when idle'),
-            ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10', 'Higher idle threshold (10 vs 5)'),
-            ('minimal_overhead', 'load_shedding_enabled', 'true', 'Skip during high load'),
-            ('minimal_overhead', 'load_shedding_active_pct', '50', 'Very aggressive (50%)'),
-            ('minimal_overhead', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-            ('minimal_overhead', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-            ('minimal_overhead', 'circuit_breaker_threshold_ms', '500', 'Very strict (500ms)'),
-            ('minimal_overhead', 'enable_locks', 'false', 'Disable locks'),
-            ('minimal_overhead', 'enable_progress', 'false', 'Disable progress'),
-            ('minimal_overhead', 'snapshot_based_collection', 'true', 'Snapshot-based collection'),
-            ('minimal_overhead', 'statements_enabled', 'false', 'Disable pg_stat_statements collection'),
-            ('minimal_overhead', 'retention_snapshots_days', '7', 'Keep 7 days'),
-            ('minimal_overhead', 'aggregate_retention_days', '3', 'Keep 3 days'),
-            ('minimal_overhead', 'table_stats_enabled', 'false', 'Disable table statistics (reduce overhead)'),
-            ('minimal_overhead', 'index_stats_enabled', 'false', 'Disable index statistics (reduce overhead)'),
-            ('minimal_overhead', 'config_snapshots_enabled', 'true', 'Collect config snapshots (low overhead)'),
-            ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-            ('minimal_overhead', 'canary_enabled', 'false', 'Canary queries disabled'),
-            ('minimal_overhead', 'storm_detection_enabled', 'false', 'Storm detection disabled'),
-            ('minimal_overhead', 'regression_detection_enabled', 'false', 'Regression detection disabled'),
-            ('minimal_overhead', 'forecast_enabled', 'false', 'Forecasting disabled (minimize all overhead)'),
-            ('minimal_overhead', 'retention_samples_days', '3', 'Keep raw samples 3 days'),
-            ('minimal_overhead', 'retention_statements_days', '7', 'Keep statement snapshots 7 days'),
-            ('minimal_overhead', 'retention_collection_stats_days', '7', 'Keep collection stats 7 days'),
-            ('minimal_overhead', 'section_timeout_ms', '100', 'Very fast per-section timeout'),
-            ('minimal_overhead', 'statement_timeout_ms', '500', 'Very fast statement timeout'),
-            ('minimal_overhead', 'work_mem_kb', '1024', 'Minimal work_mem'),
-            ('minimal_overhead', 'skip_locks_threshold', '20', 'Very aggressive lock skip'),
-            ('minimal_overhead', 'skip_activity_conn_threshold', '30', 'Very aggressive activity skip'),
-            ('minimal_overhead', 'load_throttle_xact_threshold', '300', 'Very low xact threshold'),
-            ('minimal_overhead', 'load_throttle_blk_threshold', '3000', 'Very low I/O threshold'),
-            ('minimal_overhead', 'statements_interval_minutes', '30', 'Infrequent statement collection'),
-            ('minimal_overhead', 'statements_min_calls', '10', 'Only hot queries'),
-            ('minimal_overhead', 'table_stats_top_n', '20', 'Track fewer tables'),
-            ('minimal_overhead', 'collection_jitter_enabled', 'false', 'No jitter (minimize complexity)'),
-            ('minimal_overhead', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-            ('minimal_overhead', 'auto_mode_connections_threshold', '40', 'Very early emergency mode'),
-            ('high_ddl', 'sample_interval_seconds', '180', 'Sample every 3 minutes'),
-            ('high_ddl', 'adaptive_sampling', 'true', 'Skip when idle'),
-            ('high_ddl', 'load_shedding_enabled', 'true', 'Skip during high load'),
-            ('high_ddl', 'load_throttle_enabled', 'true', 'Skip during I/O pressure'),
-            ('high_ddl', 'circuit_breaker_enabled', 'true', 'Auto-skip if slow'),
-            ('high_ddl', 'enable_locks', 'true', 'Collect locks'),
-            ('high_ddl', 'enable_progress', 'true', 'Collect progress'),
-            ('high_ddl', 'snapshot_based_collection', 'true', 'Snapshot-based (critical for DDL)'),
-            ('high_ddl', 'lock_timeout_strategy', 'skip_if_locked', 'Skip if catalogs locked by DDL'),
-            ('high_ddl', 'lock_timeout_ms', '50', 'Very fast timeout (50ms)'),
-            ('high_ddl', 'check_ddl_before_collection', 'true', 'Pre-check for DDL locks'),
-            ('high_ddl', 'retention_snapshots_days', '30', 'Keep 30 days'),
-            ('high_ddl', 'aggregate_retention_days', '7', 'Keep 7 days'),
-            ('high_ddl', 'table_stats_enabled', 'true', 'Collect table statistics'),
-            ('high_ddl', 'index_stats_enabled', 'true', 'Collect index statistics'),
-            ('high_ddl', 'config_snapshots_enabled', 'true', 'Collect config snapshots'),
-            ('high_ddl', 'db_role_config_snapshots_enabled', 'true', 'Collect database/role config overrides'),
-            ('high_ddl', 'canary_enabled', 'false', 'Canary queries disabled (could block on DDL)'),
-            ('high_ddl', 'storm_detection_enabled', 'false', 'Storm detection disabled'),
-            ('high_ddl', 'regression_detection_enabled', 'false', 'Regression detection disabled'),
-            ('high_ddl', 'forecast_enabled', 'true', 'Forecasting enabled (read-only, safe with DDL)'),
-            ('high_ddl', 'retention_samples_days', '7', 'Keep raw samples 7 days'),
-            ('high_ddl', 'retention_statements_days', '30', 'Keep statement snapshots 30 days'),
-            ('high_ddl', 'retention_collection_stats_days', '30', 'Keep collection stats 30 days'),
-            ('high_ddl', 'section_timeout_ms', '200', 'Faster timeout to avoid DDL waits'),
-            ('high_ddl', 'statement_timeout_ms', '800', 'Faster statement timeout'),
-            ('high_ddl', 'work_mem_kb', '2048', 'Standard work_mem'),
-            ('high_ddl', 'skip_locks_threshold', '30', 'Aggressive lock skip for DDL environments'),
-            ('high_ddl', 'skip_activity_conn_threshold', '100', 'Standard activity skip'),
-            ('high_ddl', 'load_throttle_xact_threshold', '1000', 'Standard xact threshold'),
-            ('high_ddl', 'load_throttle_blk_threshold', '10000', 'Standard I/O threshold'),
-            ('high_ddl', 'statements_interval_minutes', '15', 'Standard statement collection'),
-            ('high_ddl', 'statements_min_calls', '1', 'Include all queries'),
-            ('high_ddl', 'table_stats_top_n', '50', 'Track top 50 tables'),
-            ('high_ddl', 'collection_jitter_enabled', 'true', 'Add jitter'),
-            ('high_ddl', 'auto_mode_enabled', 'true', 'Enable automatic mode switching'),
-            ('high_ddl', 'auto_mode_connections_threshold', '60', 'Standard emergency threshold')
-        ) AS t(profile, key, value, description)
-        WHERE profile = p_profile_name
-    )
     SELECT
         ps.key::text AS setting_key,
         c.value::text AS current_value,
         ps.value::text AS profile_value,
         (c.value IS DISTINCT FROM ps.value)::boolean AS will_change,
         ps.description::text AS description
-    FROM profile_settings ps
+    FROM flight_recorder._profile_settings() ps
     LEFT JOIN flight_recorder.config c ON c.key = ps.key
+    WHERE ps.profile = p_profile_name
     ORDER BY will_change DESC, ps.key;
 END $$;
 
@@ -6093,347 +5308,15 @@ BEGIN
     RAISE NOTICE 'Applying profile: %', p_profile_name;
     RETURN QUERY
     WITH profile_settings AS (
-        SELECT * FROM (VALUES
-            ('default', 'sample_interval_seconds', '180'),
-            ('default', 'adaptive_sampling', 'true'),
-            ('default', 'load_shedding_enabled', 'true'),
-            ('default', 'load_throttle_enabled', 'true'),
-            ('default', 'circuit_breaker_enabled', 'true'),
-            ('default', 'enable_locks', 'true'),
-            ('default', 'enable_progress', 'true'),
-            ('default', 'snapshot_based_collection', 'true'),
-            ('default', 'retention_snapshots_days', '30'),
-            ('default', 'aggregate_retention_days', '7'),
-            ('default', 'archive_samples_enabled', 'true'),
-            ('default', 'archive_sample_frequency_minutes', '15'),
-            ('default', 'archive_retention_days', '7'),
-            ('default', 'archive_activity_samples', 'true'),
-            ('default', 'archive_lock_samples', 'true'),
-            ('default', 'archive_wait_samples', 'true'),
-            ('default', 'capacity_planning_enabled', 'true'),
-            ('default', 'capacity_thresholds_warning_pct', '60'),
-            ('default', 'capacity_thresholds_critical_pct', '80'),
-            ('default', 'capacity_forecast_window_days', '90'),
-            ('default', 'snapshot_retention_days_extended', '90'),
-            ('default', 'collect_database_size', 'true'),
-            ('default', 'collect_connection_metrics', 'true'),
-            ('default', 'table_stats_enabled', 'true'),
-            ('default', 'index_stats_enabled', 'true'),
-            ('default', 'config_snapshots_enabled', 'true'),
-            ('default', 'db_role_config_snapshots_enabled', 'true'),
-            ('default', 'canary_enabled', 'false'),
-            ('default', 'canary_interval_minutes', '15'),
-            ('default', 'canary_capture_plans', 'false'),
-            ('default', 'retention_canary_days', '7'),
-            ('default', 'storm_detection_enabled', 'false'),
-            ('default', 'storm_threshold_multiplier', '3.0'),
-            ('default', 'storm_detection_interval_minutes', '15'),
-            ('default', 'retention_storms_days', '30'),
-            ('default', 'regression_detection_enabled', 'false'),
-            ('default', 'regression_threshold_pct', '50.0'),
-            ('default', 'regression_detection_interval_minutes', '60'),
-            ('default', 'retention_regressions_days', '30'),
-            ('default', 'forecast_enabled', 'true'),
-            ('default', 'forecast_alert_enabled', 'false'),
-            ('default', 'forecast_alert_threshold', '3 days'),
-            ('default', 'forecast_lookback_days', '7'),
-            ('default', 'forecast_window_days', '7'),
-            ('default', 'retention_samples_days', '7'),
-            ('default', 'retention_statements_days', '30'),
-            ('default', 'retention_collection_stats_days', '30'),
-            ('default', 'section_timeout_ms', '250'),
-            ('default', 'statement_timeout_ms', '1000'),
-            ('default', 'work_mem_kb', '2048'),
-            ('default', 'skip_locks_threshold', '50'),
-            ('default', 'skip_activity_conn_threshold', '100'),
-            ('default', 'load_throttle_xact_threshold', '1000'),
-            ('default', 'load_throttle_blk_threshold', '10000'),
-            ('default', 'statements_interval_minutes', '15'),
-            ('default', 'statements_min_calls', '1'),
-            ('default', 'table_stats_top_n', '50'),
-            ('default', 'collection_jitter_enabled', 'true'),
-            ('default', 'auto_mode_enabled', 'true'),
-            ('default', 'auto_mode_connections_threshold', '60'),
-            ('production_safe', 'sample_interval_seconds', '300'),
-            ('production_safe', 'adaptive_sampling', 'true'),
-            ('production_safe', 'load_shedding_enabled', 'true'),
-            ('production_safe', 'load_shedding_active_pct', '60'),
-            ('production_safe', 'load_throttle_enabled', 'true'),
-            ('production_safe', 'circuit_breaker_enabled', 'true'),
-            ('production_safe', 'circuit_breaker_threshold_ms', '800'),
-            ('production_safe', 'enable_locks', 'false'),
-            ('production_safe', 'enable_progress', 'false'),
-            ('production_safe', 'snapshot_based_collection', 'true'),
-            ('production_safe', 'lock_timeout_ms', '50'),
-            ('production_safe', 'retention_snapshots_days', '30'),
-            ('production_safe', 'aggregate_retention_days', '7'),
-            ('production_safe', 'archive_samples_enabled', 'true'),
-            ('production_safe', 'archive_sample_frequency_minutes', '30'),
-            ('production_safe', 'archive_retention_days', '14'),
-            ('production_safe', 'archive_activity_samples', 'true'),
-            ('production_safe', 'archive_lock_samples', 'true'),
-            ('production_safe', 'archive_wait_samples', 'false'),
-            ('production_safe', 'capacity_planning_enabled', 'true'),
-            ('production_safe', 'capacity_thresholds_warning_pct', '60'),
-            ('production_safe', 'capacity_thresholds_critical_pct', '80'),
-            ('production_safe', 'capacity_forecast_window_days', '90'),
-            ('production_safe', 'snapshot_retention_days_extended', '90'),
-            ('production_safe', 'collect_database_size', 'true'),
-            ('production_safe', 'collect_connection_metrics', 'true'),
-            ('production_safe', 'table_stats_enabled', 'true'),
-            ('production_safe', 'index_stats_enabled', 'true'),
-            ('production_safe', 'config_snapshots_enabled', 'true'),
-            ('production_safe', 'db_role_config_snapshots_enabled', 'true'),
-            ('production_safe', 'canary_enabled', 'false'),
-            ('production_safe', 'storm_detection_enabled', 'false'),
-            ('production_safe', 'regression_detection_enabled', 'false'),
-            ('production_safe', 'forecast_enabled', 'true'),
-            ('production_safe', 'forecast_alert_enabled', 'false'),
-            ('production_safe', 'retention_samples_days', '7'),
-            ('production_safe', 'retention_statements_days', '30'),
-            ('production_safe', 'retention_collection_stats_days', '30'),
-            ('production_safe', 'section_timeout_ms', '200'),
-            ('production_safe', 'statement_timeout_ms', '800'),
-            ('production_safe', 'work_mem_kb', '1024'),
-            ('production_safe', 'skip_locks_threshold', '30'),
-            ('production_safe', 'skip_activity_conn_threshold', '50'),
-            ('production_safe', 'load_throttle_xact_threshold', '500'),
-            ('production_safe', 'load_throttle_blk_threshold', '5000'),
-            ('production_safe', 'statements_interval_minutes', '30'),
-            ('production_safe', 'statements_min_calls', '5'),
-            ('production_safe', 'table_stats_top_n', '30'),
-            ('production_safe', 'collection_jitter_enabled', 'true'),
-            ('production_safe', 'auto_mode_enabled', 'true'),
-            ('production_safe', 'auto_mode_connections_threshold', '50'),
-            ('development', 'sample_interval_seconds', '180'),
-            ('development', 'adaptive_sampling', 'false'),
-            ('development', 'load_shedding_enabled', 'true'),
-            ('development', 'load_throttle_enabled', 'true'),
-            ('development', 'circuit_breaker_enabled', 'true'),
-            ('development', 'enable_locks', 'true'),
-            ('development', 'enable_progress', 'true'),
-            ('development', 'snapshot_based_collection', 'true'),
-            ('development', 'retention_snapshots_days', '7'),
-            ('development', 'aggregate_retention_days', '3'),
-            ('development', 'archive_samples_enabled', 'true'),
-            ('development', 'archive_sample_frequency_minutes', '15'),
-            ('development', 'archive_retention_days', '3'),
-            ('development', 'archive_activity_samples', 'true'),
-            ('development', 'archive_lock_samples', 'true'),
-            ('development', 'archive_wait_samples', 'true'),
-            ('development', 'capacity_planning_enabled', 'true'),
-            ('development', 'capacity_thresholds_warning_pct', '60'),
-            ('development', 'capacity_thresholds_critical_pct', '80'),
-            ('development', 'capacity_forecast_window_days', '30'),
-            ('development', 'snapshot_retention_days_extended', '30'),
-            ('development', 'collect_database_size', 'true'),
-            ('development', 'collect_connection_metrics', 'true'),
-            ('development', 'table_stats_enabled', 'true'),
-            ('development', 'index_stats_enabled', 'true'),
-            ('development', 'config_snapshots_enabled', 'true'),
-            ('development', 'db_role_config_snapshots_enabled', 'true'),
-            ('development', 'canary_enabled', 'true'),
-            ('development', 'canary_interval_minutes', '15'),
-            ('development', 'retention_canary_days', '3'),
-            ('development', 'storm_detection_enabled', 'true'),
-            ('development', 'retention_storms_days', '7'),
-            ('development', 'regression_detection_enabled', 'true'),
-            ('development', 'retention_regressions_days', '7'),
-            ('development', 'forecast_enabled', 'true'),
-            ('development', 'forecast_alert_enabled', 'true'),
-            ('development', 'retention_samples_days', '3'),
-            ('development', 'retention_statements_days', '7'),
-            ('development', 'retention_collection_stats_days', '7'),
-            ('development', 'section_timeout_ms', '250'),
-            ('development', 'statement_timeout_ms', '1000'),
-            ('development', 'work_mem_kb', '2048'),
-            ('development', 'skip_locks_threshold', '50'),
-            ('development', 'skip_activity_conn_threshold', '100'),
-            ('development', 'load_throttle_xact_threshold', '1000'),
-            ('development', 'load_throttle_blk_threshold', '10000'),
-            ('development', 'statements_interval_minutes', '15'),
-            ('development', 'statements_min_calls', '1'),
-            ('development', 'table_stats_top_n', '50'),
-            ('development', 'collection_jitter_enabled', 'true'),
-            ('development', 'auto_mode_enabled', 'true'),
-            ('development', 'auto_mode_connections_threshold', '60'),
-            ('troubleshooting', 'sample_interval_seconds', '60'),
-            ('troubleshooting', 'adaptive_sampling', 'false'),
-            ('troubleshooting', 'load_shedding_enabled', 'false'),
-            ('troubleshooting', 'load_throttle_enabled', 'false'),
-            ('troubleshooting', 'circuit_breaker_enabled', 'true'),
-            ('troubleshooting', 'circuit_breaker_threshold_ms', '2000'),
-            ('troubleshooting', 'enable_locks', 'true'),
-            ('troubleshooting', 'enable_progress', 'true'),
-            ('troubleshooting', 'snapshot_based_collection', 'true'),
-            ('troubleshooting', 'statements_top_n', '50'),
-            ('troubleshooting', 'retention_snapshots_days', '7'),
-            ('troubleshooting', 'aggregate_retention_days', '3'),
-            ('troubleshooting', 'archive_samples_enabled', 'true'),
-            ('troubleshooting', 'archive_sample_frequency_minutes', '5'),
-            ('troubleshooting', 'archive_retention_days', '7'),
-            ('troubleshooting', 'archive_activity_samples', 'true'),
-            ('troubleshooting', 'archive_lock_samples', 'true'),
-            ('troubleshooting', 'archive_wait_samples', 'true'),
-            ('troubleshooting', 'capacity_planning_enabled', 'true'),
-            ('troubleshooting', 'capacity_thresholds_warning_pct', '50'),
-            ('troubleshooting', 'capacity_thresholds_critical_pct', '70'),
-            ('troubleshooting', 'capacity_forecast_window_days', '30'),
-            ('troubleshooting', 'snapshot_retention_days_extended', '30'),
-            ('troubleshooting', 'collect_database_size', 'true'),
-            ('troubleshooting', 'collect_connection_metrics', 'true'),
-            ('troubleshooting', 'table_stats_enabled', 'true'),
-            ('troubleshooting', 'index_stats_enabled', 'true'),
-            ('troubleshooting', 'config_snapshots_enabled', 'true'),
-            ('troubleshooting', 'db_role_config_snapshots_enabled', 'true'),
-            ('troubleshooting', 'canary_enabled', 'true'),
-            ('troubleshooting', 'canary_interval_minutes', '5'),
-            ('troubleshooting', 'canary_capture_plans', 'true'),
-            ('troubleshooting', 'retention_canary_days', '7'),
-            ('troubleshooting', 'storm_detection_enabled', 'true'),
-            ('troubleshooting', 'storm_threshold_multiplier', '2.0'),
-            ('troubleshooting', 'storm_detection_interval_minutes', '5'),
-            ('troubleshooting', 'retention_storms_days', '7'),
-            ('troubleshooting', 'regression_detection_enabled', 'true'),
-            ('troubleshooting', 'regression_threshold_pct', '25.0'),
-            ('troubleshooting', 'regression_detection_interval_minutes', '15'),
-            ('troubleshooting', 'retention_regressions_days', '7'),
-            ('troubleshooting', 'forecast_enabled', 'true'),
-            ('troubleshooting', 'forecast_alert_enabled', 'true'),
-            ('troubleshooting', 'forecast_alert_threshold', '7 days'),
-            ('troubleshooting', 'forecast_lookback_days', '3'),
-            ('troubleshooting', 'forecast_window_days', '3'),
-            ('troubleshooting', 'storm_baseline_days', '3'),
-            ('troubleshooting', 'storm_lookback_interval', '30 minutes'),
-            ('troubleshooting', 'storm_min_duration_minutes', '2'),
-            ('troubleshooting', 'regression_baseline_days', '3'),
-            ('troubleshooting', 'regression_lookback_interval', '30 minutes'),
-            ('troubleshooting', 'regression_min_duration_minutes', '10'),
-            ('troubleshooting', 'retention_samples_days', '7'),
-            ('troubleshooting', 'retention_statements_days', '7'),
-            ('troubleshooting', 'retention_collection_stats_days', '7'),
-            ('troubleshooting', 'section_timeout_ms', '500'),
-            ('troubleshooting', 'statement_timeout_ms', '2000'),
-            ('troubleshooting', 'work_mem_kb', '4096'),
-            ('troubleshooting', 'skip_locks_threshold', '100'),
-            ('troubleshooting', 'skip_activity_conn_threshold', '200'),
-            ('troubleshooting', 'load_throttle_xact_threshold', '2000'),
-            ('troubleshooting', 'load_throttle_blk_threshold', '20000'),
-            ('troubleshooting', 'statements_interval_minutes', '5'),
-            ('troubleshooting', 'statements_min_calls', '1'),
-            ('troubleshooting', 'table_stats_top_n', '100'),
-            ('troubleshooting', 'collection_jitter_enabled', 'false'),
-            ('troubleshooting', 'auto_mode_enabled', 'false'),
-            ('troubleshooting', 'auto_mode_connections_threshold', '80'),
-            ('minimal_overhead', 'sample_interval_seconds', '300'),
-            ('minimal_overhead', 'adaptive_sampling', 'true'),
-            ('minimal_overhead', 'adaptive_sampling_idle_threshold', '10'),
-            ('minimal_overhead', 'load_shedding_enabled', 'true'),
-            ('minimal_overhead', 'load_shedding_active_pct', '50'),
-            ('minimal_overhead', 'load_throttle_enabled', 'true'),
-            ('minimal_overhead', 'circuit_breaker_enabled', 'true'),
-            ('minimal_overhead', 'circuit_breaker_threshold_ms', '500'),
-            ('minimal_overhead', 'enable_locks', 'false'),
-            ('minimal_overhead', 'enable_progress', 'false'),
-            ('minimal_overhead', 'snapshot_based_collection', 'true'),
-            ('minimal_overhead', 'statements_enabled', 'false'),
-            ('minimal_overhead', 'retention_snapshots_days', '7'),
-            ('minimal_overhead', 'aggregate_retention_days', '3'),
-            ('minimal_overhead', 'archive_samples_enabled', 'false'),
-            ('minimal_overhead', 'archive_sample_frequency_minutes', '30'),
-            ('minimal_overhead', 'archive_retention_days', '3'),
-            ('minimal_overhead', 'archive_activity_samples', 'false'),
-            ('minimal_overhead', 'archive_lock_samples', 'false'),
-            ('minimal_overhead', 'archive_wait_samples', 'false'),
-            ('minimal_overhead', 'capacity_planning_enabled', 'true'),
-            ('minimal_overhead', 'capacity_thresholds_warning_pct', '70'),
-            ('minimal_overhead', 'capacity_thresholds_critical_pct', '85'),
-            ('minimal_overhead', 'capacity_forecast_window_days', '30'),
-            ('minimal_overhead', 'snapshot_retention_days_extended', '30'),
-            ('minimal_overhead', 'collect_database_size', 'true'),
-            ('minimal_overhead', 'collect_connection_metrics', 'true'),
-            ('minimal_overhead', 'table_stats_enabled', 'false'),
-            ('minimal_overhead', 'index_stats_enabled', 'false'),
-            ('minimal_overhead', 'config_snapshots_enabled', 'true'),
-            ('minimal_overhead', 'db_role_config_snapshots_enabled', 'true'),
-            ('minimal_overhead', 'canary_enabled', 'false'),
-            ('minimal_overhead', 'storm_detection_enabled', 'false'),
-            ('minimal_overhead', 'regression_detection_enabled', 'false'),
-            ('minimal_overhead', 'forecast_enabled', 'false'),
-            ('minimal_overhead', 'retention_samples_days', '3'),
-            ('minimal_overhead', 'retention_statements_days', '7'),
-            ('minimal_overhead', 'retention_collection_stats_days', '7'),
-            ('minimal_overhead', 'section_timeout_ms', '100'),
-            ('minimal_overhead', 'statement_timeout_ms', '500'),
-            ('minimal_overhead', 'work_mem_kb', '1024'),
-            ('minimal_overhead', 'skip_locks_threshold', '20'),
-            ('minimal_overhead', 'skip_activity_conn_threshold', '30'),
-            ('minimal_overhead', 'load_throttle_xact_threshold', '300'),
-            ('minimal_overhead', 'load_throttle_blk_threshold', '3000'),
-            ('minimal_overhead', 'statements_interval_minutes', '30'),
-            ('minimal_overhead', 'statements_min_calls', '10'),
-            ('minimal_overhead', 'table_stats_top_n', '20'),
-            ('minimal_overhead', 'collection_jitter_enabled', 'false'),
-            ('minimal_overhead', 'auto_mode_enabled', 'true'),
-            ('minimal_overhead', 'auto_mode_connections_threshold', '40'),
-            ('high_ddl', 'sample_interval_seconds', '180'),
-            ('high_ddl', 'adaptive_sampling', 'true'),
-            ('high_ddl', 'load_shedding_enabled', 'true'),
-            ('high_ddl', 'load_throttle_enabled', 'true'),
-            ('high_ddl', 'circuit_breaker_enabled', 'true'),
-            ('high_ddl', 'enable_locks', 'true'),
-            ('high_ddl', 'enable_progress', 'true'),
-            ('high_ddl', 'snapshot_based_collection', 'true'),
-            ('high_ddl', 'lock_timeout_strategy', 'skip_if_locked'),
-            ('high_ddl', 'lock_timeout_ms', '50'),
-            ('high_ddl', 'check_ddl_before_collection', 'true'),
-            ('high_ddl', 'retention_snapshots_days', '30'),
-            ('high_ddl', 'aggregate_retention_days', '7'),
-            ('high_ddl', 'archive_samples_enabled', 'true'),
-            ('high_ddl', 'archive_sample_frequency_minutes', '15'),
-            ('high_ddl', 'archive_retention_days', '7'),
-            ('high_ddl', 'archive_activity_samples', 'true'),
-            ('high_ddl', 'archive_lock_samples', 'true'),
-            ('high_ddl', 'archive_wait_samples', 'true'),
-            ('high_ddl', 'capacity_planning_enabled', 'true'),
-            ('high_ddl', 'capacity_thresholds_warning_pct', '60'),
-            ('high_ddl', 'capacity_thresholds_critical_pct', '80'),
-            ('high_ddl', 'capacity_forecast_window_days', '90'),
-            ('high_ddl', 'snapshot_retention_days_extended', '90'),
-            ('high_ddl', 'collect_database_size', 'true'),
-            ('high_ddl', 'collect_connection_metrics', 'true'),
-            ('high_ddl', 'table_stats_enabled', 'true'),
-            ('high_ddl', 'index_stats_enabled', 'true'),
-            ('high_ddl', 'config_snapshots_enabled', 'true'),
-            ('high_ddl', 'db_role_config_snapshots_enabled', 'true'),
-            ('high_ddl', 'canary_enabled', 'false'),
-            ('high_ddl', 'storm_detection_enabled', 'false'),
-            ('high_ddl', 'regression_detection_enabled', 'false'),
-            ('high_ddl', 'forecast_enabled', 'true'),
-            ('high_ddl', 'retention_samples_days', '7'),
-            ('high_ddl', 'retention_statements_days', '30'),
-            ('high_ddl', 'retention_collection_stats_days', '30'),
-            ('high_ddl', 'section_timeout_ms', '200'),
-            ('high_ddl', 'statement_timeout_ms', '800'),
-            ('high_ddl', 'work_mem_kb', '2048'),
-            ('high_ddl', 'skip_locks_threshold', '30'),
-            ('high_ddl', 'skip_activity_conn_threshold', '100'),
-            ('high_ddl', 'load_throttle_xact_threshold', '1000'),
-            ('high_ddl', 'load_throttle_blk_threshold', '10000'),
-            ('high_ddl', 'statements_interval_minutes', '15'),
-            ('high_ddl', 'statements_min_calls', '1'),
-            ('high_ddl', 'table_stats_top_n', '50'),
-            ('high_ddl', 'collection_jitter_enabled', 'true'),
-            ('high_ddl', 'auto_mode_enabled', 'true'),
-            ('high_ddl', 'auto_mode_connections_threshold', '60')
-        ) AS t(profile, key, value)
-        WHERE profile = p_profile_name
+        SELECT ps.profile, ps.key, ps.value
+        FROM flight_recorder._profile_settings() ps
+        WHERE ps.profile = p_profile_name
     ),
     updates AS (
         INSERT INTO flight_recorder.config (key, value, updated_at)
         SELECT ps.key, ps.value, now()
         FROM profile_settings ps
-        ON CONFLICT (key) DO UPDATE 
+        ON CONFLICT (key) DO UPDATE
         SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
         WHERE flight_recorder.config.value IS DISTINCT FROM EXCLUDED.value
         RETURNING key, value
@@ -6452,11 +5335,10 @@ BEGIN
         WHEN 'production_safe' THEN 'emergency'
         WHEN 'minimal_overhead' THEN 'emergency'
         WHEN 'troubleshooting' THEN 'normal'
-        WHEN 'high_ddl' THEN 'normal'
         ELSE 'normal'
     END;
     PERFORM flight_recorder.set_mode(v_mode);
-    RAISE NOTICE 'Profile "%" applied: % settings changed, mode set to %', 
+    RAISE NOTICE 'Profile "%" applied: % settings changed, mode set to %',
         p_profile_name, v_changes_made, v_mode;
 END $$;
 
@@ -6664,26 +5546,8 @@ BEGIN
         PERFORM cron.unschedule('flight_recorder_archive')
         WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_archive');
         IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
-        PERFORM cron.unschedule('flight_recorder_canary')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
-        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
-        PERFORM cron.unschedule('flight_recorder_storm')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
-        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
-        PERFORM cron.unschedule('flight_recorder_regression')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_regression');
-        IF FOUND THEN v_unscheduled := v_unscheduled + 1; END IF;
         INSERT INTO flight_recorder.config (key, value, updated_at)
         VALUES ('enabled', 'false', now())
-        ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
-        INSERT INTO flight_recorder.config (key, value, updated_at)
-        VALUES ('canary_enabled', 'false', now())
-        ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
-        INSERT INTO flight_recorder.config (key, value, updated_at)
-        VALUES ('storm_detection_enabled', 'false', now())
-        ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
-        INSERT INTO flight_recorder.config (key, value, updated_at)
-        VALUES ('regression_detection_enabled', 'false', now())
         ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
         RETURN format('Flight Recorder collection stopped. Unscheduled %s cron jobs. Use flight_recorder.enable() to restart.', v_unscheduled);
     EXCEPTION
@@ -6694,316 +5558,6 @@ BEGIN
     END;
 END;
 $$;
-
--- Executes all enabled canary queries and records timing and buffer metrics
--- Uses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) to capture precise buffer counts
-CREATE OR REPLACE FUNCTION flight_recorder.run_canaries()
-RETURNS TABLE(
-    canary_name TEXT,
-    duration_ms NUMERIC,
-    success BOOLEAN,
-    error_message TEXT
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_canary RECORD;
-    v_start_time TIMESTAMPTZ;
-    v_duration_ms NUMERIC;
-    v_explain_json JSONB;
-    v_error TEXT;
-    v_success BOOLEAN;
-    v_shared_blks_hit BIGINT;
-    v_shared_blks_read BIGINT;
-    v_temp_blks_read BIGINT;
-    v_temp_blks_written BIGINT;
-    v_total_buffers BIGINT;
-BEGIN
-    v_enabled := COALESCE(
-        flight_recorder._get_config('canary_enabled', 'false')::boolean,
-        false
-    );
-
-    IF NOT v_enabled THEN
-        RETURN;
-    END IF;
-
-    FOR v_canary IN
-        SELECT c.id, c.name, c.query_text
-        FROM flight_recorder.canaries c
-        WHERE c.enabled = true
-        ORDER BY c.id
-    LOOP
-        v_start_time := clock_timestamp();
-        v_explain_json := NULL;
-        v_error := NULL;
-        v_success := true;
-        v_shared_blks_hit := 0;
-        v_shared_blks_read := 0;
-        v_temp_blks_read := 0;
-        v_temp_blks_written := 0;
-
-        BEGIN
-            -- Execute with EXPLAIN ANALYZE BUFFERS to capture precise metrics
-            EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s', v_canary.query_text)
-            INTO v_explain_json;
-
-            -- Extract timing from EXPLAIN output
-            v_duration_ms := (v_explain_json->0->>'Execution Time')::numeric;
-
-            -- Extract buffer counts from Planning + Execution
-            -- Planning buffers
-            v_shared_blks_hit := COALESCE((v_explain_json->0->'Planning'->>'Shared Hit Blocks')::bigint, 0);
-            v_shared_blks_read := COALESCE((v_explain_json->0->'Planning'->>'Shared Read Blocks')::bigint, 0);
-            v_temp_blks_read := COALESCE((v_explain_json->0->'Planning'->>'Temp Read Blocks')::bigint, 0);
-            v_temp_blks_written := COALESCE((v_explain_json->0->'Planning'->>'Temp Written Blocks')::bigint, 0);
-
-            -- Execution buffers (at top level of plan)
-            v_shared_blks_hit := v_shared_blks_hit + COALESCE((v_explain_json->0->'Plan'->>'Shared Hit Blocks')::bigint, 0);
-            v_shared_blks_read := v_shared_blks_read + COALESCE((v_explain_json->0->'Plan'->>'Shared Read Blocks')::bigint, 0);
-            v_temp_blks_read := v_temp_blks_read + COALESCE((v_explain_json->0->'Plan'->>'Temp Read Blocks')::bigint, 0);
-            v_temp_blks_written := v_temp_blks_written + COALESCE((v_explain_json->0->'Plan'->>'Temp Written Blocks')::bigint, 0);
-
-            v_total_buffers := v_shared_blks_hit + v_shared_blks_read + v_temp_blks_read + v_temp_blks_written;
-
-        EXCEPTION WHEN OTHERS THEN
-            v_duration_ms := EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) * 1000;
-            v_error := SQLERRM;
-            v_success := false;
-        END;
-
-        -- Record the result with buffer metrics
-        INSERT INTO flight_recorder.canary_results (
-            canary_id, executed_at, duration_ms, plan,
-            shared_blks_hit, shared_blks_read, temp_blks_read, temp_blks_written, total_buffers,
-            error_message, success
-        )
-        VALUES (
-            v_canary.id, v_start_time, v_duration_ms, v_explain_json,
-            v_shared_blks_hit, v_shared_blks_read, v_temp_blks_read, v_temp_blks_written, v_total_buffers,
-            v_error, v_success
-        );
-
-        -- Return the result
-        canary_name := v_canary.name;
-        duration_ms := v_duration_ms;
-        success := v_success;
-        error_message := v_error;
-        RETURN NEXT;
-    END LOOP;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.run_canaries() IS 'Execute all enabled canary queries with EXPLAIN ANALYZE BUFFERS to capture timing and buffer metrics. Returns execution summary.';
-
--- Returns canary status by comparing current performance to baseline
--- Uses buffer metrics by default (configurable via canary_comparison_metric)
--- Baseline: p50 over last 7 days (excluding last day)
--- Current: p50 over last hour
--- Status: OK, DEGRADED (50%+ higher), CRITICAL (100%+ higher)
-CREATE OR REPLACE FUNCTION flight_recorder.canary_status()
-RETURNS TABLE(
-    canary_name TEXT,
-    description TEXT,
-    baseline_ms NUMERIC,
-    current_ms NUMERIC,
-    baseline_buffers NUMERIC,
-    current_buffers NUMERIC,
-    change_pct NUMERIC,
-    status TEXT,
-    metric_used TEXT,
-    last_executed TIMESTAMPTZ,
-    last_error TEXT
-)
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_canary RECORD;
-    v_baseline_ms NUMERIC;
-    v_current_ms NUMERIC;
-    v_baseline_buffers NUMERIC;
-    v_current_buffers NUMERIC;
-    v_baseline NUMERIC;
-    v_current NUMERIC;
-    v_change_pct NUMERIC;
-    v_status TEXT;
-    v_last_executed TIMESTAMPTZ;
-    v_last_error TEXT;
-    v_threshold_warning NUMERIC;
-    v_threshold_critical NUMERIC;
-    v_metric TEXT;
-BEGIN
-    -- Get comparison metric (default to buffers)
-    v_metric := flight_recorder._get_config('canary_comparison_metric', 'buffers');
-
-    FOR v_canary IN
-        SELECT c.id, c.name, c.description, c.threshold_warning, c.threshold_critical
-        FROM flight_recorder.canaries c
-        WHERE c.enabled = true
-        ORDER BY c.id
-    LOOP
-        -- Calculate baseline timing: p50 over last 7 days excluding last day
-        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.duration_ms)
-        INTO v_baseline_ms
-        FROM flight_recorder.canary_results cr
-        WHERE cr.canary_id = v_canary.id
-          AND cr.success = true
-          AND cr.executed_at >= now() - interval '7 days'
-          AND cr.executed_at < now() - interval '1 day';
-
-        -- Calculate current timing: p50 over last hour
-        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.duration_ms)
-        INTO v_current_ms
-        FROM flight_recorder.canary_results cr
-        WHERE cr.canary_id = v_canary.id
-          AND cr.success = true
-          AND cr.executed_at >= now() - interval '1 hour';
-
-        -- Calculate baseline buffers: p50 over last 7 days excluding last day
-        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.total_buffers)
-        INTO v_baseline_buffers
-        FROM flight_recorder.canary_results cr
-        WHERE cr.canary_id = v_canary.id
-          AND cr.success = true
-          AND cr.total_buffers IS NOT NULL
-          AND cr.executed_at >= now() - interval '7 days'
-          AND cr.executed_at < now() - interval '1 day';
-
-        -- Calculate current buffers: p50 over last hour
-        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY cr.total_buffers)
-        INTO v_current_buffers
-        FROM flight_recorder.canary_results cr
-        WHERE cr.canary_id = v_canary.id
-          AND cr.success = true
-          AND cr.total_buffers IS NOT NULL
-          AND cr.executed_at >= now() - interval '1 hour';
-
-        -- Get last execution info
-        SELECT cr.executed_at, cr.error_message
-        INTO v_last_executed, v_last_error
-        FROM flight_recorder.canary_results cr
-        WHERE cr.canary_id = v_canary.id
-        ORDER BY cr.executed_at DESC
-        LIMIT 1;
-
-        -- Choose metric for comparison (buffers by default, fall back to time if no buffer data)
-        IF v_metric = 'buffers' AND v_baseline_buffers IS NOT NULL AND v_current_buffers IS NOT NULL THEN
-            v_baseline := v_baseline_buffers;
-            v_current := v_current_buffers;
-        ELSE
-            v_baseline := v_baseline_ms;
-            v_current := v_current_ms;
-            v_metric := 'time';  -- Override if using time as fallback
-        END IF;
-
-        -- Calculate change percentage and status
-        IF v_baseline IS NOT NULL AND v_current IS NOT NULL AND v_baseline > 0 THEN
-            v_change_pct := ROUND(((v_current - v_baseline) / v_baseline) * 100, 1);
-
-            v_threshold_warning := COALESCE(v_canary.threshold_warning, 1.5);
-            v_threshold_critical := COALESCE(v_canary.threshold_critical, 2.0);
-
-            IF v_current >= v_baseline * v_threshold_critical THEN
-                v_status := 'CRITICAL';
-            ELSIF v_current >= v_baseline * v_threshold_warning THEN
-                v_status := 'DEGRADED';
-            ELSE
-                v_status := 'OK';
-            END IF;
-        ELSE
-            v_change_pct := NULL;
-            v_status := 'INSUFFICIENT_DATA';
-        END IF;
-
-        -- Return the result
-        canary_name := v_canary.name;
-        description := v_canary.description;
-        baseline_ms := ROUND(v_baseline_ms, 2);
-        current_ms := ROUND(v_current_ms, 2);
-        baseline_buffers := ROUND(v_baseline_buffers, 0);
-        current_buffers := ROUND(v_current_buffers, 0);
-        change_pct := v_change_pct;
-        status := v_status;
-        metric_used := v_metric;
-        last_executed := v_last_executed;
-        last_error := v_last_error;
-        RETURN NEXT;
-    END LOOP;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.canary_status() IS 'Returns canary status comparing current performance (last hour p50) to baseline (last 7 days p50, excluding last day). Uses buffer metrics by default (configurable). Status: OK, DEGRADED (50%+ higher), CRITICAL (100%+ higher).';
-
--- Enables canary monitoring and schedules periodic execution via pg_cron
-CREATE OR REPLACE FUNCTION flight_recorder.enable_canaries()
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_interval INTEGER;
-    v_cron_expression TEXT;
-BEGIN
-    -- Enable canary feature
-    INSERT INTO flight_recorder.config (key, value, updated_at)
-    VALUES ('canary_enabled', 'true', now())
-    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
-
-    -- Get configured interval
-    v_interval := COALESCE(
-        flight_recorder._get_config('canary_interval_minutes', '15')::integer,
-        15
-    );
-
-    -- Build cron expression
-    v_cron_expression := format('*/%s * * * *', v_interval);
-
-    -- Schedule the canary job
-    BEGIN
-        PERFORM cron.unschedule('flight_recorder_canary')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
-
-        PERFORM cron.schedule('flight_recorder_canary', v_cron_expression, 'SELECT * FROM flight_recorder.run_canaries()');
-
-        RETURN format('Canary monitoring enabled. Scheduled to run every %s minutes. Use canary_status() to check results.', v_interval);
-    EXCEPTION
-        WHEN undefined_table THEN
-            RETURN 'pg_cron extension not found. Canary feature enabled but not scheduled. Run run_canaries() manually.';
-        WHEN undefined_function THEN
-            RETURN 'pg_cron extension not found. Canary feature enabled but not scheduled. Run run_canaries() manually.';
-    END;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.enable_canaries() IS 'Enable canary monitoring and schedule periodic execution via pg_cron.';
-
--- Disables canary monitoring and unschedules the cron job
-CREATE OR REPLACE FUNCTION flight_recorder.disable_canaries()
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-BEGIN
-    -- Disable canary feature
-    INSERT INTO flight_recorder.config (key, value, updated_at)
-    VALUES ('canary_enabled', 'false', now())
-    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
-
-    -- Unschedule the canary job
-    BEGIN
-        PERFORM cron.unschedule('flight_recorder_canary')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_canary');
-
-        RETURN 'Canary monitoring disabled and unscheduled.';
-    EXCEPTION
-        WHEN undefined_table THEN
-            RETURN 'Canary monitoring disabled.';
-        WHEN undefined_function THEN
-            RETURN 'Canary monitoring disabled.';
-    END;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.disable_canaries() IS 'Disable canary monitoring and unschedule the cron job.';
-
--- Insert pre-defined canary queries that use only system catalogs
-INSERT INTO flight_recorder.canaries (name, description, query_text) VALUES
-    ('index_lookup', 'B-tree index lookup on pg_class', 'SELECT oid FROM pg_class WHERE relname = ''pg_class'' LIMIT 1'),
-    ('small_agg', 'Count aggregation on pg_stat_activity', 'SELECT count(*) FROM pg_stat_activity'),
-    ('seq_scan_baseline', 'Sequential scan count on pg_namespace', 'SELECT count(*) FROM pg_namespace'),
-    ('simple_join', 'Join pg_namespace to pg_class', 'SELECT count(*) FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE n.nspname = ''pg_catalog''')
-ON CONFLICT (name) DO NOTHING;
 
 -- Detects query storms by comparing recent query execution counts to baseline
 -- Returns queries with execution spikes classified by type and severity
@@ -7125,581 +5679,6 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.detect_query_storms(INTERVAL, NUMERIC) IS 'Detect query storms by comparing recent execution counts to baseline. Classifies as RETRY_STORM, CACHE_MISS, SPIKE, or NORMAL with severity levels (LOW, MEDIUM, HIGH, CRITICAL).';
-
--- Sends a pg_notify alert for storm events
--- Called internally when storms are detected or resolved
-CREATE OR REPLACE FUNCTION flight_recorder._notify_storm(
-    p_action TEXT,           -- 'detected' or 'resolved'
-    p_storm_id BIGINT,
-    p_queryid BIGINT,
-    p_storm_type TEXT,
-    p_severity TEXT DEFAULT NULL,
-    p_recent_count BIGINT DEFAULT NULL,
-    p_baseline_count BIGINT DEFAULT NULL,
-    p_multiplier NUMERIC DEFAULT NULL,
-    p_resolution_notes TEXT DEFAULT NULL
-)
-RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_channel TEXT;
-    v_payload JSONB;
-BEGIN
-    -- Check if notifications are enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('storm_notify_enabled', 'true')::boolean,
-        true
-    );
-
-    IF NOT v_enabled THEN
-        RETURN;
-    END IF;
-
-    -- Get channel name
-    v_channel := COALESCE(
-        flight_recorder._get_config('storm_notify_channel', 'flight_recorder_storms'),
-        'flight_recorder_storms'
-    );
-
-    -- Build payload
-    v_payload := jsonb_build_object(
-        'action', p_action,
-        'storm_id', p_storm_id,
-        'queryid', p_queryid,
-        'storm_type', p_storm_type,
-        'severity', p_severity,
-        'timestamp', now()
-    );
-
-    -- Add optional fields based on action
-    IF p_action = 'detected' THEN
-        v_payload := v_payload || jsonb_build_object(
-            'recent_count', p_recent_count,
-            'baseline_count', p_baseline_count,
-            'multiplier', p_multiplier
-        );
-    ELSIF p_action = 'resolved' THEN
-        v_payload := v_payload || jsonb_build_object(
-            'resolution_notes', p_resolution_notes
-        );
-    END IF;
-
-    -- Send notification
-    PERFORM pg_notify(v_channel, v_payload::text);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._notify_storm(TEXT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BIGINT, NUMERIC, TEXT) IS 'Internal: Send pg_notify alert for storm events. Configure via storm_notify_enabled and storm_notify_channel settings.';
-
--- Compute correlation data for storm detection
--- Gathers metrics from snapshots, lock_aggregates, and wait_event_aggregates
--- to provide context about what else was happening when a storm was detected
-CREATE OR REPLACE FUNCTION flight_recorder._compute_storm_correlation(
-    p_lookback INTERVAL DEFAULT '5 minutes'
-)
-RETURNS JSONB
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_result JSONB := '{}';
-    v_checkpoint JSONB;
-    v_locks JSONB;
-    v_waits JSONB;
-    v_io JSONB;
-    v_cutoff TIMESTAMPTZ := now() - p_lookback;
-BEGIN
-    -- Checkpoint correlation from most recent snapshot
-    SELECT jsonb_build_object(
-        'active', CASE
-            WHEN s.checkpoint_time > v_cutoff THEN true
-            ELSE false
-        END,
-        'ckpt_write_time_ms', COALESCE(s.ckpt_write_time, 0),
-        'ckpt_sync_time_ms', COALESCE(s.ckpt_sync_time, 0),
-        'ckpt_buffers', COALESCE(s.ckpt_buffers, 0)
-    )
-    INTO v_checkpoint
-    FROM flight_recorder.snapshots s
-    WHERE s.captured_at >= v_cutoff
-    ORDER BY s.captured_at DESC
-    LIMIT 1;
-
-    IF v_checkpoint IS NOT NULL THEN
-        v_result := v_result || jsonb_build_object('checkpoint', v_checkpoint);
-    END IF;
-
-    -- Lock contention correlation
-    SELECT jsonb_build_object(
-        'blocked_count', COALESCE(SUM(la.occurrence_count), 0),
-        'max_duration_seconds', COALESCE(
-            EXTRACT(EPOCH FROM MAX(la.max_duration)),
-            0
-        ),
-        'lock_types', COALESCE(
-            jsonb_agg(DISTINCT la.lock_type) FILTER (WHERE la.lock_type IS NOT NULL),
-            '[]'::jsonb
-        )
-    )
-    INTO v_locks
-    FROM flight_recorder.lock_aggregates la
-    WHERE la.start_time >= v_cutoff
-       OR la.end_time >= v_cutoff;
-
-    IF v_locks IS NOT NULL AND (v_locks->>'blocked_count')::int > 0 THEN
-        v_result := v_result || jsonb_build_object('locks', v_locks);
-    END IF;
-
-    -- Wait event correlation
-    SELECT jsonb_build_object(
-        'top_events', COALESCE(
-            (SELECT jsonb_agg(t)
-             FROM (
-                 SELECT jsonb_build_object(
-                     'event', wa.wait_event_type || ':' || wa.wait_event,
-                     'count', wa.total_waiters
-                 ) AS t
-                 FROM flight_recorder.wait_event_aggregates wa
-                 WHERE (wa.start_time >= v_cutoff OR wa.end_time >= v_cutoff)
-                   AND wa.wait_event IS NOT NULL
-                 ORDER BY wa.total_waiters DESC
-                 LIMIT 5
-             ) sub),
-            '[]'::jsonb
-        ),
-        'total_waiters', COALESCE(
-            (SELECT SUM(wa.total_waiters)
-             FROM flight_recorder.wait_event_aggregates wa
-             WHERE wa.start_time >= v_cutoff OR wa.end_time >= v_cutoff),
-            0
-        )
-    )
-    INTO v_waits;
-
-    IF v_waits IS NOT NULL AND (v_waits->>'total_waiters')::bigint > 0 THEN
-        v_result := v_result || jsonb_build_object('waits', v_waits);
-    END IF;
-
-    -- IO correlation from snapshots (compute delta if we have 2+ snapshots)
-    SELECT jsonb_build_object(
-        'temp_bytes_delta', COALESCE(
-            (SELECT MAX(s.temp_bytes) - MIN(s.temp_bytes)
-             FROM flight_recorder.snapshots s
-             WHERE s.captured_at >= v_cutoff),
-            0
-        ),
-        'blks_read_delta', COALESCE(
-            (SELECT MAX(s.blks_read) - MIN(s.blks_read)
-             FROM flight_recorder.snapshots s
-             WHERE s.captured_at >= v_cutoff),
-            0
-        ),
-        'connections_active', COALESCE(
-            (SELECT s.connections_active
-             FROM flight_recorder.snapshots s
-             WHERE s.captured_at >= v_cutoff
-             ORDER BY s.captured_at DESC
-             LIMIT 1),
-            0
-        ),
-        'connections_total', COALESCE(
-            (SELECT s.connections_total
-             FROM flight_recorder.snapshots s
-             WHERE s.captured_at >= v_cutoff
-             ORDER BY s.captured_at DESC
-             LIMIT 1),
-            0
-        )
-    )
-    INTO v_io;
-
-    IF v_io IS NOT NULL AND (
-        (v_io->>'temp_bytes_delta')::bigint > 0 OR
-        (v_io->>'blks_read_delta')::bigint > 0
-    ) THEN
-        v_result := v_result || jsonb_build_object('io', v_io);
-    END IF;
-
-    -- Return NULL if no correlation data found
-    IF v_result = '{}'::jsonb THEN
-        RETURN NULL;
-    END IF;
-
-    RETURN v_result;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._compute_storm_correlation(INTERVAL) IS 'Internal: Compute correlation data (checkpoint, locks, waits, IO) for storm detection context.';
-
--- Auto-detect storms and log new ones to query_storms table
--- Also auto-resolves storms when query counts return to normal (with anti-flapping protection)
--- Called by pg_cron when storm detection is enabled
-CREATE OR REPLACE FUNCTION flight_recorder.auto_detect_storms()
-RETURNS INTEGER
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_min_duration INTERVAL;
-    v_storm RECORD;
-    v_active_storm RECORD;
-    v_current_storms BIGINT[];
-    v_new_count INTEGER := 0;
-    v_resolved_count INTEGER := 0;
-    v_skipped_count INTEGER := 0;
-    v_correlation JSONB;
-BEGIN
-    -- Check if storm detection is enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('storm_detection_enabled', 'false')::boolean,
-        false
-    );
-
-    IF NOT v_enabled THEN
-        RETURN 0;
-    END IF;
-
-    -- Get minimum duration before auto-resolution (anti-flapping)
-    v_min_duration := COALESCE(
-        (flight_recorder._get_config('storm_min_duration_minutes', '5') || ' minutes')::interval,
-        '5 minutes'::interval
-    );
-
-    -- Get current storm queryids for comparison
-    SELECT array_agg(queryid) INTO v_current_storms
-    FROM flight_recorder.detect_query_storms()
-    WHERE storm_type != 'NORMAL';
-
-    -- Auto-resolve active storms that are no longer spiking (with minimum duration check)
-    FOR v_active_storm IN
-        SELECT qs.id, qs.queryid, qs.storm_type, qs.severity, qs.detected_at
-        FROM flight_recorder.query_storms qs
-        WHERE qs.resolved_at IS NULL
-    LOOP
-        -- If this queryid is not in current storms, consider auto-resolving
-        IF v_current_storms IS NULL OR NOT (v_active_storm.queryid = ANY(v_current_storms)) THEN
-            -- Check minimum duration (anti-flapping protection)
-            IF v_active_storm.detected_at <= now() - v_min_duration THEN
-                UPDATE flight_recorder.query_storms
-                SET resolved_at = now(),
-                    resolution_notes = 'Auto-resolved: query counts returned to normal'
-                WHERE id = v_active_storm.id;
-
-                v_resolved_count := v_resolved_count + 1;
-
-                -- Send notification
-                PERFORM flight_recorder._notify_storm(
-                    'resolved',
-                    v_active_storm.id,
-                    v_active_storm.queryid,
-                    v_active_storm.storm_type,
-                    v_active_storm.severity,
-                    p_resolution_notes := 'Auto-resolved: query counts returned to normal'
-                );
-
-                RAISE NOTICE 'pg-flight-recorder: Storm auto-resolved - % for queryid % (counts normalized)',
-                    v_active_storm.storm_type, v_active_storm.queryid;
-            ELSE
-                v_skipped_count := v_skipped_count + 1;
-            END IF;
-        END IF;
-    END LOOP;
-
-    -- Compute correlation data once for all new storms
-    v_correlation := flight_recorder._compute_storm_correlation();
-
-    -- Detect and insert new storms (avoid duplicates for same queryid in last hour)
-    FOR v_storm IN SELECT * FROM flight_recorder.detect_query_storms() WHERE storm_type != 'NORMAL' LOOP
-        -- Only insert if no unresolved storm exists for this queryid
-        IF NOT EXISTS (
-            SELECT 1 FROM flight_recorder.query_storms
-            WHERE query_storms.queryid = v_storm.queryid
-              AND resolved_at IS NULL
-              AND detected_at > now() - interval '1 hour'
-        ) THEN
-            INSERT INTO flight_recorder.query_storms (
-                queryid, query_fingerprint, storm_type, severity,
-                recent_count, baseline_count, multiplier, correlation
-            ) VALUES (
-                v_storm.queryid, v_storm.query_fingerprint, v_storm.storm_type, v_storm.severity,
-                v_storm.recent_count, v_storm.baseline_count, v_storm.multiplier, v_correlation
-            )
-            RETURNING id INTO v_active_storm;
-
-            v_new_count := v_new_count + 1;
-
-            -- Send notification
-            PERFORM flight_recorder._notify_storm(
-                'detected',
-                v_active_storm.id,
-                v_storm.queryid,
-                v_storm.storm_type,
-                v_storm.severity,
-                v_storm.recent_count,
-                v_storm.baseline_count,
-                v_storm.multiplier
-            );
-
-            RAISE NOTICE 'pg-flight-recorder: Storm detected - % (%) for queryid % (% vs baseline %)',
-                v_storm.storm_type, v_storm.severity, v_storm.queryid, v_storm.recent_count, v_storm.baseline_count;
-        END IF;
-    END LOOP;
-
-    IF v_new_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Detected % new query storm(s)', v_new_count;
-    END IF;
-
-    IF v_resolved_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Auto-resolved % storm(s)', v_resolved_count;
-    END IF;
-
-    IF v_skipped_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: % storm(s) not yet eligible for auto-resolution (min duration: %)',
-            v_skipped_count, v_min_duration;
-    END IF;
-
-    RETURN v_new_count;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.auto_detect_storms() IS 'Auto-detect query storms and log to query_storms table. Auto-resolves storms when counts normalize, with anti-flapping protection. Sends pg_notify alerts when enabled (storm_notify_enabled). Called by pg_cron.';
-
--- Returns current storm status for monitoring
--- Shows active (unresolved) storms and recent resolved storms
-CREATE OR REPLACE FUNCTION flight_recorder.storm_status(
-    p_lookback INTERVAL DEFAULT '24 hours'
-)
-RETURNS TABLE(
-    storm_id BIGINT,
-    detected_at TIMESTAMPTZ,
-    queryid BIGINT,
-    query_fingerprint TEXT,
-    storm_type TEXT,
-    severity TEXT,
-    recent_count BIGINT,
-    baseline_count BIGINT,
-    multiplier NUMERIC,
-    correlation JSONB,
-    status TEXT,
-    duration INTERVAL
-)
-LANGUAGE plpgsql STABLE AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        qs.id AS storm_id,
-        qs.detected_at,
-        qs.queryid,
-        qs.query_fingerprint,
-        qs.storm_type,
-        qs.severity,
-        qs.recent_count,
-        qs.baseline_count,
-        qs.multiplier,
-        qs.correlation,
-        CASE
-            WHEN qs.resolved_at IS NULL THEN 'ACTIVE'
-            ELSE 'RESOLVED'
-        END AS status,
-        COALESCE(qs.resolved_at, now()) - qs.detected_at AS duration
-    FROM flight_recorder.query_storms qs
-    WHERE qs.detected_at >= now() - p_lookback
-       OR qs.resolved_at IS NULL
-    ORDER BY
-        CASE WHEN qs.resolved_at IS NULL THEN 0 ELSE 1 END,
-        CASE qs.severity
-            WHEN 'CRITICAL' THEN 1
-            WHEN 'HIGH' THEN 2
-            WHEN 'MEDIUM' THEN 3
-            WHEN 'LOW' THEN 4
-            ELSE 5
-        END,
-        qs.detected_at DESC;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.storm_status(INTERVAL) IS 'Show current storm status including active and recently resolved storms with severity and correlation data.';
-
--- Enables storm detection and schedules periodic detection via pg_cron
-CREATE OR REPLACE FUNCTION flight_recorder.enable_storm_detection()
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_interval INTEGER;
-    v_cron_expression TEXT;
-BEGIN
-    -- Enable storm detection feature
-    INSERT INTO flight_recorder.config (key, value, updated_at)
-    VALUES ('storm_detection_enabled', 'true', now())
-    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
-
-    -- Get configured interval
-    v_interval := COALESCE(
-        flight_recorder._get_config('storm_detection_interval_minutes', '15')::integer,
-        15
-    );
-
-    -- Build cron expression
-    v_cron_expression := format('*/%s * * * *', v_interval);
-
-    -- Schedule the storm detection job
-    BEGIN
-        PERFORM cron.unschedule('flight_recorder_storm')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
-
-        PERFORM cron.schedule('flight_recorder_storm', v_cron_expression, 'SELECT flight_recorder.auto_detect_storms()');
-
-        RETURN format('Storm detection enabled. Scheduled to run every %s minutes. Use storm_status() to check results.', v_interval);
-    EXCEPTION
-        WHEN undefined_table THEN
-            RETURN 'pg_cron extension not found. Storm detection enabled but not scheduled. Run detect_query_storms() manually.';
-        WHEN undefined_function THEN
-            RETURN 'pg_cron extension not found. Storm detection enabled but not scheduled. Run detect_query_storms() manually.';
-    END;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.enable_storm_detection() IS 'Enable storm detection and schedule periodic detection via pg_cron.';
-
--- Disables storm detection and unschedules the cron job
-CREATE OR REPLACE FUNCTION flight_recorder.disable_storm_detection()
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-BEGIN
-    -- Disable storm detection feature
-    INSERT INTO flight_recorder.config (key, value, updated_at)
-    VALUES ('storm_detection_enabled', 'false', now())
-    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
-
-    -- Unschedule the storm detection job
-    BEGIN
-        PERFORM cron.unschedule('flight_recorder_storm')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_storm');
-
-        RETURN 'Storm detection disabled and unscheduled.';
-    EXCEPTION
-        WHEN undefined_table THEN
-            RETURN 'Storm detection disabled.';
-        WHEN undefined_function THEN
-            RETURN 'Storm detection disabled.';
-    END;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.disable_storm_detection() IS 'Disable storm detection and unschedule the cron job.';
-
--- Resolves a single storm by ID, marking it as resolved with optional notes
-CREATE OR REPLACE FUNCTION flight_recorder.resolve_storm(
-    p_storm_id BIGINT,
-    p_notes TEXT DEFAULT NULL
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_storm RECORD;
-BEGIN
-    -- Check if storm exists
-    SELECT id, storm_type, queryid, resolved_at
-    INTO v_storm
-    FROM flight_recorder.query_storms
-    WHERE id = p_storm_id;
-
-    IF NOT FOUND THEN
-        RETURN format('Storm %s not found', p_storm_id);
-    END IF;
-
-    IF v_storm.resolved_at IS NOT NULL THEN
-        RETURN format('Storm %s already resolved at %s', p_storm_id, v_storm.resolved_at);
-    END IF;
-
-    -- Mark as resolved
-    UPDATE flight_recorder.query_storms
-    SET resolved_at = now(),
-        resolution_notes = p_notes
-    WHERE id = p_storm_id;
-
-    RETURN format('Storm %s (%s for queryid %s) resolved', p_storm_id, v_storm.storm_type, v_storm.queryid);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.resolve_storm(BIGINT, TEXT) IS 'Mark a storm as resolved with optional notes explaining the resolution.';
-
--- Resolves all active storms for a specific queryid
-CREATE OR REPLACE FUNCTION flight_recorder.resolve_storms_by_queryid(
-    p_queryid BIGINT,
-    p_notes TEXT DEFAULT NULL
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_count INTEGER;
-BEGIN
-    UPDATE flight_recorder.query_storms
-    SET resolved_at = now(),
-        resolution_notes = p_notes
-    WHERE queryid = p_queryid
-      AND resolved_at IS NULL;
-
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-
-    IF v_count = 0 THEN
-        RETURN format('No active storms found for queryid %s', p_queryid);
-    END IF;
-
-    RETURN format('Resolved %s storm(s) for queryid %s', v_count, p_queryid);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.resolve_storms_by_queryid(BIGINT, TEXT) IS 'Mark all active storms for a queryid as resolved with optional notes.';
-
--- Resolves all active storms at once (bulk resolution)
-CREATE OR REPLACE FUNCTION flight_recorder.resolve_all_storms(
-    p_notes TEXT DEFAULT 'Bulk resolution'
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_count INTEGER;
-BEGIN
-    UPDATE flight_recorder.query_storms
-    SET resolved_at = now(),
-        resolution_notes = p_notes
-    WHERE resolved_at IS NULL;
-
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-
-    IF v_count = 0 THEN
-        RETURN 'No active storms to resolve';
-    END IF;
-
-    RETURN format('Resolved %s storm(s)', v_count);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.resolve_all_storms(TEXT) IS 'Mark all active storms as resolved. Use for bulk resolution after incident review.';
-
--- Reopens a previously resolved storm (in case of incorrect resolution)
-CREATE OR REPLACE FUNCTION flight_recorder.reopen_storm(
-    p_storm_id BIGINT
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_storm RECORD;
-BEGIN
-    -- Check if storm exists
-    SELECT id, storm_type, queryid, resolved_at
-    INTO v_storm
-    FROM flight_recorder.query_storms
-    WHERE id = p_storm_id;
-
-    IF NOT FOUND THEN
-        RETURN format('Storm %s not found', p_storm_id);
-    END IF;
-
-    IF v_storm.resolved_at IS NULL THEN
-        RETURN format('Storm %s is already active (not resolved)', p_storm_id);
-    END IF;
-
-    -- Reopen the storm
-    UPDATE flight_recorder.query_storms
-    SET resolved_at = NULL,
-        resolution_notes = NULL
-    WHERE id = p_storm_id;
-
-    RETURN format('Storm %s (%s for queryid %s) reopened', p_storm_id, v_storm.storm_type, v_storm.queryid);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.reopen_storm(BIGINT) IS 'Reopen a previously resolved storm if it was resolved incorrectly.';
 
 -- =============================================================================
 -- PERFORMANCE REGRESSION DETECTION
@@ -7940,466 +5919,6 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION flight_recorder.detect_regressions(INTERVAL, NUMERIC) IS 'Detect performance regressions using buffer metrics (default) or timing. Classifies severity based on percentage change (LOW <200%, MEDIUM <500%, HIGH <1000%, CRITICAL >1000%). Configure via regression_detection_metric.';
-
--- Sends a pg_notify alert for regression events
--- Called internally when regressions are detected or resolved
-CREATE OR REPLACE FUNCTION flight_recorder._notify_regression(
-    p_action TEXT,           -- 'detected' or 'resolved'
-    p_regression_id BIGINT,
-    p_queryid BIGINT,
-    p_severity TEXT DEFAULT NULL,
-    p_baseline_avg_ms NUMERIC DEFAULT NULL,
-    p_current_avg_ms NUMERIC DEFAULT NULL,
-    p_change_pct NUMERIC DEFAULT NULL,
-    p_resolution_notes TEXT DEFAULT NULL
-)
-RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_channel TEXT;
-    v_payload JSONB;
-BEGIN
-    -- Check if notifications are enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('regression_notify_enabled', 'true')::boolean,
-        true
-    );
-
-    IF NOT v_enabled THEN
-        RETURN;
-    END IF;
-
-    -- Get channel name
-    v_channel := COALESCE(
-        flight_recorder._get_config('regression_notify_channel', 'flight_recorder_regressions'),
-        'flight_recorder_regressions'
-    );
-
-    -- Build payload
-    v_payload := jsonb_build_object(
-        'action', p_action,
-        'regression_id', p_regression_id,
-        'queryid', p_queryid,
-        'severity', p_severity,
-        'timestamp', now()
-    );
-
-    -- Add optional fields based on action
-    IF p_action = 'detected' THEN
-        v_payload := v_payload || jsonb_build_object(
-            'baseline_avg_ms', p_baseline_avg_ms,
-            'current_avg_ms', p_current_avg_ms,
-            'change_pct', p_change_pct
-        );
-    ELSIF p_action = 'resolved' THEN
-        v_payload := v_payload || jsonb_build_object(
-            'resolution_notes', p_resolution_notes
-        );
-    END IF;
-
-    -- Send notification
-    PERFORM pg_notify(v_channel, v_payload::text);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._notify_regression(TEXT, BIGINT, BIGINT, TEXT, NUMERIC, NUMERIC, NUMERIC, TEXT) IS 'Internal: Send pg_notify alert for regression events. Configure via regression_notify_enabled and regression_notify_channel settings.';
-
--- Auto-detect regressions and log new ones to query_regressions table
--- Also auto-resolves regressions when performance returns to normal (with anti-flapping protection)
--- Called by pg_cron when regression detection is enabled
-CREATE OR REPLACE FUNCTION flight_recorder.auto_detect_regressions()
-RETURNS INTEGER
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_min_duration INTERVAL;
-    v_regression RECORD;
-    v_active_regression RECORD;
-    v_current_regressions BIGINT[];
-    v_new_count INTEGER := 0;
-    v_resolved_count INTEGER := 0;
-    v_skipped_count INTEGER := 0;
-    v_correlation JSONB;
-BEGIN
-    -- Check if regression detection is enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('regression_detection_enabled', 'false')::boolean,
-        false
-    );
-
-    IF NOT v_enabled THEN
-        RETURN 0;
-    END IF;
-
-    -- Get minimum duration before auto-resolution (anti-flapping)
-    v_min_duration := COALESCE(
-        (flight_recorder._get_config('regression_min_duration_minutes', '30') || ' minutes')::interval,
-        '30 minutes'::interval
-    );
-
-    -- Get current regression queryids for comparison
-    SELECT array_agg(queryid) INTO v_current_regressions
-    FROM flight_recorder.detect_regressions();
-
-    -- Auto-resolve active regressions that are no longer regressed (with minimum duration check)
-    FOR v_active_regression IN
-        SELECT qr.id, qr.queryid, qr.severity, qr.detected_at
-        FROM flight_recorder.query_regressions qr
-        WHERE qr.resolved_at IS NULL
-    LOOP
-        -- If this queryid is not in current regressions, consider auto-resolving
-        IF v_current_regressions IS NULL OR NOT (v_active_regression.queryid = ANY(v_current_regressions)) THEN
-            -- Check minimum duration (anti-flapping protection)
-            IF v_active_regression.detected_at <= now() - v_min_duration THEN
-                UPDATE flight_recorder.query_regressions
-                SET resolved_at = now(),
-                    resolution_notes = 'Auto-resolved: performance returned to normal'
-                WHERE id = v_active_regression.id;
-
-                v_resolved_count := v_resolved_count + 1;
-
-                -- Send notification
-                PERFORM flight_recorder._notify_regression(
-                    'resolved',
-                    v_active_regression.id,
-                    v_active_regression.queryid,
-                    v_active_regression.severity,
-                    p_resolution_notes := 'Auto-resolved: performance returned to normal'
-                );
-
-                RAISE NOTICE 'pg-flight-recorder: Regression auto-resolved for queryid % (performance normalized)',
-                    v_active_regression.queryid;
-            ELSE
-                v_skipped_count := v_skipped_count + 1;
-            END IF;
-        END IF;
-    END LOOP;
-
-    -- Compute correlation data once for all new regressions
-    v_correlation := flight_recorder._compute_storm_correlation();
-
-    -- Detect and insert new regressions (avoid duplicates for same queryid in last hour)
-    FOR v_regression IN SELECT * FROM flight_recorder.detect_regressions() LOOP
-        -- Only insert if no unresolved regression exists for this queryid
-        IF NOT EXISTS (
-            SELECT 1 FROM flight_recorder.query_regressions
-            WHERE query_regressions.queryid = v_regression.queryid
-              AND resolved_at IS NULL
-              AND detected_at > now() - interval '1 hour'
-        ) THEN
-            INSERT INTO flight_recorder.query_regressions (
-                queryid, query_fingerprint, severity,
-                baseline_avg_ms, current_avg_ms, change_pct,
-                baseline_avg_buffers, current_avg_buffers, buffer_change_pct,
-                detection_metric, probable_causes, correlation
-            ) VALUES (
-                v_regression.queryid, v_regression.query_fingerprint, v_regression.severity,
-                v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct,
-                v_regression.baseline_avg_buffers, v_regression.current_avg_buffers, v_regression.buffer_change_pct,
-                v_regression.detection_metric, v_regression.probable_causes, v_correlation
-            )
-            RETURNING id INTO v_active_regression;
-
-            v_new_count := v_new_count + 1;
-
-            -- Send notification
-            PERFORM flight_recorder._notify_regression(
-                'detected',
-                v_active_regression.id,
-                v_regression.queryid,
-                v_regression.severity,
-                v_regression.baseline_avg_ms,
-                v_regression.current_avg_ms,
-                v_regression.change_pct
-            );
-
-            -- Log with the primary metric used for detection
-            IF v_regression.detection_metric = 'buffers' THEN
-                RAISE NOTICE 'pg-flight-recorder: Regression detected - % for queryid % (% -> % buffers, +%.1f%%)',
-                    v_regression.severity, v_regression.queryid,
-                    v_regression.baseline_avg_buffers, v_regression.current_avg_buffers, v_regression.buffer_change_pct;
-            ELSE
-                RAISE NOTICE 'pg-flight-recorder: Regression detected - % for queryid % (%.2f ms -> %.2f ms, +%.1f%%)',
-                    v_regression.severity, v_regression.queryid,
-                    v_regression.baseline_avg_ms, v_regression.current_avg_ms, v_regression.change_pct;
-            END IF;
-        END IF;
-    END LOOP;
-
-    IF v_new_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Detected % new performance regression(s)', v_new_count;
-    END IF;
-
-    IF v_resolved_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: Auto-resolved % regression(s)', v_resolved_count;
-    END IF;
-
-    IF v_skipped_count > 0 THEN
-        RAISE NOTICE 'pg-flight-recorder: % regression(s) not yet eligible for auto-resolution (min duration: %)',
-            v_skipped_count, v_min_duration;
-    END IF;
-
-    RETURN v_new_count;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.auto_detect_regressions() IS 'Auto-detect performance regressions and log to query_regressions table. Auto-resolves regressions when performance normalizes, with anti-flapping protection. Sends pg_notify alerts when enabled. Called by pg_cron.';
-
--- Returns current regression status for monitoring
--- Shows active (unresolved) regressions and recent resolved regressions with buffer metrics
-CREATE OR REPLACE FUNCTION flight_recorder.regression_status(
-    p_lookback INTERVAL DEFAULT '24 hours'
-)
-RETURNS TABLE(
-    regression_id BIGINT,
-    detected_at TIMESTAMPTZ,
-    queryid BIGINT,
-    query_fingerprint TEXT,
-    severity TEXT,
-    baseline_avg_ms NUMERIC,
-    current_avg_ms NUMERIC,
-    change_pct NUMERIC,
-    baseline_avg_buffers NUMERIC,
-    current_avg_buffers NUMERIC,
-    buffer_change_pct NUMERIC,
-    detection_metric TEXT,
-    correlation JSONB,
-    status TEXT,
-    duration INTERVAL
-)
-LANGUAGE plpgsql STABLE AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        qr.id AS regression_id,
-        qr.detected_at,
-        qr.queryid,
-        qr.query_fingerprint,
-        qr.severity,
-        qr.baseline_avg_ms,
-        qr.current_avg_ms,
-        qr.change_pct,
-        qr.baseline_avg_buffers,
-        qr.current_avg_buffers,
-        qr.buffer_change_pct,
-        qr.detection_metric,
-        qr.correlation,
-        CASE
-            WHEN qr.resolved_at IS NULL THEN 'ACTIVE'
-            ELSE 'RESOLVED'
-        END AS status,
-        COALESCE(qr.resolved_at, now()) - qr.detected_at AS duration
-    FROM flight_recorder.query_regressions qr
-    WHERE qr.detected_at >= now() - p_lookback
-       OR qr.resolved_at IS NULL
-    ORDER BY
-        CASE WHEN qr.resolved_at IS NULL THEN 0 ELSE 1 END,
-        CASE qr.severity
-            WHEN 'CRITICAL' THEN 1
-            WHEN 'HIGH' THEN 2
-            WHEN 'MEDIUM' THEN 3
-            WHEN 'LOW' THEN 4
-            ELSE 5
-        END,
-        qr.detected_at DESC;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.regression_status(INTERVAL) IS 'Show current regression status including active and recently resolved regressions with timing, buffer metrics, and correlation data.';
-
--- Enables regression detection and schedules periodic detection via pg_cron
-CREATE OR REPLACE FUNCTION flight_recorder.enable_regression_detection()
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_interval INTEGER;
-    v_cron_expression TEXT;
-BEGIN
-    -- Enable regression detection feature
-    INSERT INTO flight_recorder.config (key, value, updated_at)
-    VALUES ('regression_detection_enabled', 'true', now())
-    ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();
-
-    -- Get configured interval
-    v_interval := COALESCE(
-        flight_recorder._get_config('regression_detection_interval_minutes', '60')::integer,
-        60
-    );
-
-    -- Build cron expression
-    v_cron_expression := format('*/%s * * * *', v_interval);
-
-    -- Schedule the regression detection job
-    BEGIN
-        PERFORM cron.unschedule('flight_recorder_regression')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_regression');
-
-        PERFORM cron.schedule('flight_recorder_regression', v_cron_expression, 'SELECT flight_recorder.auto_detect_regressions()');
-
-        RETURN format('Regression detection enabled. Scheduled to run every %s minutes. Use regression_status() to check results.', v_interval);
-    EXCEPTION
-        WHEN undefined_table THEN
-            RETURN 'pg_cron extension not found. Regression detection enabled but not scheduled. Run detect_regressions() manually.';
-        WHEN undefined_function THEN
-            RETURN 'pg_cron extension not found. Regression detection enabled but not scheduled. Run detect_regressions() manually.';
-    END;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.enable_regression_detection() IS 'Enable regression detection and schedule periodic detection via pg_cron.';
-
--- Disables regression detection and unschedules the cron job
-CREATE OR REPLACE FUNCTION flight_recorder.disable_regression_detection()
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-BEGIN
-    -- Disable regression detection feature
-    INSERT INTO flight_recorder.config (key, value, updated_at)
-    VALUES ('regression_detection_enabled', 'false', now())
-    ON CONFLICT (key) DO UPDATE SET value = 'false', updated_at = now();
-
-    -- Unschedule the regression detection job
-    BEGIN
-        PERFORM cron.unschedule('flight_recorder_regression')
-        WHERE EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'flight_recorder_regression');
-
-        RETURN 'Regression detection disabled and unscheduled.';
-    EXCEPTION
-        WHEN undefined_table THEN
-            RETURN 'Regression detection disabled.';
-        WHEN undefined_function THEN
-            RETURN 'Regression detection disabled.';
-    END;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.disable_regression_detection() IS 'Disable regression detection and unschedule the cron job.';
-
--- Resolves a single regression by ID, marking it as resolved with optional notes
-CREATE OR REPLACE FUNCTION flight_recorder.resolve_regression(
-    p_regression_id BIGINT,
-    p_notes TEXT DEFAULT NULL
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_regression RECORD;
-BEGIN
-    -- Check if regression exists
-    SELECT id, severity, queryid, resolved_at
-    INTO v_regression
-    FROM flight_recorder.query_regressions
-    WHERE id = p_regression_id;
-
-    IF NOT FOUND THEN
-        RETURN format('Regression %s not found', p_regression_id);
-    END IF;
-
-    IF v_regression.resolved_at IS NOT NULL THEN
-        RETURN format('Regression %s already resolved at %s', p_regression_id, v_regression.resolved_at);
-    END IF;
-
-    -- Mark as resolved
-    UPDATE flight_recorder.query_regressions
-    SET resolved_at = now(),
-        resolution_notes = p_notes
-    WHERE id = p_regression_id;
-
-    -- Send notification
-    PERFORM flight_recorder._notify_regression(
-        'resolved',
-        p_regression_id,
-        v_regression.queryid,
-        v_regression.severity,
-        p_resolution_notes := p_notes
-    );
-
-    RETURN format('Regression %s (queryid %s) resolved', p_regression_id, v_regression.queryid);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.resolve_regression(BIGINT, TEXT) IS 'Mark a regression as resolved with optional notes explaining the resolution.';
-
--- Resolves all active regressions for a specific queryid
-CREATE OR REPLACE FUNCTION flight_recorder.resolve_regressions_by_queryid(
-    p_queryid BIGINT,
-    p_notes TEXT DEFAULT NULL
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_count INTEGER;
-BEGIN
-    UPDATE flight_recorder.query_regressions
-    SET resolved_at = now(),
-        resolution_notes = p_notes
-    WHERE queryid = p_queryid
-      AND resolved_at IS NULL;
-
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-
-    IF v_count = 0 THEN
-        RETURN format('No active regressions found for queryid %s', p_queryid);
-    END IF;
-
-    RETURN format('Resolved %s regression(s) for queryid %s', v_count, p_queryid);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.resolve_regressions_by_queryid(BIGINT, TEXT) IS 'Mark all active regressions for a queryid as resolved with optional notes.';
-
--- Resolves all active regressions at once (bulk resolution)
-CREATE OR REPLACE FUNCTION flight_recorder.resolve_all_regressions(
-    p_notes TEXT DEFAULT 'Bulk resolution'
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_count INTEGER;
-BEGIN
-    UPDATE flight_recorder.query_regressions
-    SET resolved_at = now(),
-        resolution_notes = p_notes
-    WHERE resolved_at IS NULL;
-
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-
-    IF v_count = 0 THEN
-        RETURN 'No active regressions to resolve';
-    END IF;
-
-    RETURN format('Resolved %s regression(s)', v_count);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.resolve_all_regressions(TEXT) IS 'Mark all active regressions as resolved. Use for bulk resolution after incident review.';
-
--- Reopens a previously resolved regression (in case of incorrect resolution)
-CREATE OR REPLACE FUNCTION flight_recorder.reopen_regression(
-    p_regression_id BIGINT
-)
-RETURNS TEXT
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_regression RECORD;
-BEGIN
-    -- Check if regression exists
-    SELECT id, severity, queryid, resolved_at
-    INTO v_regression
-    FROM flight_recorder.query_regressions
-    WHERE id = p_regression_id;
-
-    IF NOT FOUND THEN
-        RETURN format('Regression %s not found', p_regression_id);
-    END IF;
-
-    IF v_regression.resolved_at IS NULL THEN
-        RETURN format('Regression %s is already active (not resolved)', p_regression_id);
-    END IF;
-
-    -- Reopen the regression
-    UPDATE flight_recorder.query_regressions
-    SET resolved_at = NULL,
-        resolution_notes = NULL
-    WHERE id = p_regression_id;
-
-    RETURN format('Regression %s (queryid %s) reopened', p_regression_id, v_regression.queryid);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.reopen_regression(BIGINT) IS 'Reopen a previously resolved regression if it was resolved incorrectly.';
 
 -- Configure autovacuum on ring buffer tables
 -- Ring buffers use pre-allocated rows with UPDATE-only pattern, achieving high HOT update ratios.
@@ -9497,63 +7016,6 @@ BEGIN
         v_result := v_result || E'\n';
     END IF;
 
-    -- ==========================================================================
-    -- Canary Status Section
-    -- ==========================================================================
-    v_result := v_result || '## Canary Queries' || E'\n\n';
-
-    -- Check if canaries are enabled
-    IF COALESCE(flight_recorder._get_config('canary_enabled', 'false')::boolean, false) THEN
-        SELECT count(*) INTO v_count FROM flight_recorder.canary_status();
-        IF v_count = 0 THEN
-            v_result := v_result || '(no canary data available)' || E'\n\n';
-        ELSE
-            v_result := v_result || '| Canary | Baseline (ms) | Current (ms) | Change | Status | Last Run |' || E'\n';
-            v_result := v_result || '|--------|---------------|--------------|--------|--------|----------|' || E'\n';
-            FOR v_row IN SELECT * FROM flight_recorder.canary_status() LOOP
-                v_result := v_result || '| ' ||
-                    COALESCE(v_row.canary_name, '-') || ' | ' ||
-                    COALESCE(v_row.baseline_ms::TEXT, '-') || ' | ' ||
-                    COALESCE(v_row.current_ms::TEXT, '-') || ' | ' ||
-                    COALESCE(v_row.change_pct::TEXT || '%', '-') || ' | ' ||
-                    COALESCE(v_row.status, '-') || ' | ' ||
-                    COALESCE(to_char(v_row.last_executed, 'YYYY-MM-DD HH24:MI:SS'), '-') || ' |' || E'\n';
-            END LOOP;
-            v_result := v_result || E'\n';
-        END IF;
-    ELSE
-        v_result := v_result || '(canary monitoring not enabled - use enable_canaries() to enable)' || E'\n\n';
-    END IF;
-
-    -- ==========================================================================
-    -- Query Storms Section
-    -- ==========================================================================
-    v_result := v_result || '## Query Storms' || E'\n\n';
-
-    -- Check if storm detection is enabled
-    IF COALESCE(flight_recorder._get_config('storm_detection_enabled', 'false')::boolean, false) THEN
-        SELECT count(*) INTO v_count FROM flight_recorder.storm_status(p_end_time - p_start_time);
-        IF v_count = 0 THEN
-            v_result := v_result || '(no storms detected)' || E'\n\n';
-        ELSE
-            v_result := v_result || '| Detected | QueryID | Type | Recent | Baseline | Multiplier | Status |' || E'\n';
-            v_result := v_result || '|----------|---------|------|--------|----------|------------|--------|' || E'\n';
-            FOR v_row IN SELECT * FROM flight_recorder.storm_status(p_end_time - p_start_time) LOOP
-                v_result := v_result || '| ' ||
-                    COALESCE(to_char(v_row.detected_at, 'YYYY-MM-DD HH24:MI'), '-') || ' | ' ||
-                    COALESCE(v_row.queryid::TEXT, '-') || ' | ' ||
-                    COALESCE(v_row.storm_type, '-') || ' | ' ||
-                    COALESCE(v_row.recent_count::TEXT, '-') || ' | ' ||
-                    COALESCE(v_row.baseline_count::TEXT, '-') || ' | ' ||
-                    COALESCE(v_row.multiplier::TEXT || 'x', '-') || ' | ' ||
-                    COALESCE(v_row.status, '-') || ' |' || E'\n';
-            END LOOP;
-            v_result := v_result || E'\n';
-        END IF;
-    ELSE
-        v_result := v_result || '(storm detection not enabled - use enable_storm_detection() to enable)' || E'\n\n';
-    END IF;
-
     RETURN v_result;
 END;
 $$;
@@ -10620,252 +8082,9 @@ LEFT JOIN storage_metric s ON true;
 COMMENT ON VIEW flight_recorder.capacity_dashboard IS
 'At-a-glance capacity planning dashboard. Shows current status (healthy/warning/critical) across all resource dimensions: connections, memory, I/O, storage. Includes utilization percentages, composite memory pressure score, and array of critical issues requiring attention. Based on last 24 hours of data. Part of Phase 1 MVP capacity planning enhancements (FR-3.1).';
 
--- =============================================================================
--- QUERY STORM DASHBOARD VIEW
--- =============================================================================
+-- NOTE: Storm and Regression dashboard views removed in 2.21
+-- Use detect_query_storms() and detect_regressions() for on-demand analysis
 
-CREATE OR REPLACE VIEW flight_recorder.storm_dashboard AS
-WITH
-storm_config AS (
-    SELECT
-        COALESCE(
-            (SELECT value::boolean FROM flight_recorder.config WHERE key = 'storm_detection_enabled'),
-            false
-        ) AS detection_enabled
-),
-active_storms AS (
-    SELECT
-        count(*) AS active_count,
-        count(*) FILTER (WHERE storm_type = 'RETRY_STORM') AS retry_storms,
-        count(*) FILTER (WHERE storm_type = 'CACHE_MISS') AS cache_miss_storms,
-        count(*) FILTER (WHERE storm_type = 'SPIKE') AS spike_storms,
-        count(*) FILTER (WHERE severity = 'LOW') AS low_severity,
-        count(*) FILTER (WHERE severity = 'MEDIUM') AS medium_severity,
-        count(*) FILTER (WHERE severity = 'HIGH') AS high_severity,
-        count(*) FILTER (WHERE severity = 'CRITICAL') AS critical_severity
-    FROM flight_recorder.query_storms
-    WHERE resolved_at IS NULL
-),
-recent_storms AS (
-    SELECT
-        count(*) AS total_24h,
-        count(*) FILTER (WHERE resolved_at IS NOT NULL) AS resolved_24h
-    FROM flight_recorder.query_storms
-    WHERE detected_at >= now() - interval '24 hours'
-),
-resolution_stats AS (
-    SELECT
-        count(*) AS total_resolved,
-        EXTRACT(EPOCH FROM avg(resolved_at - detected_at)) / 60 AS avg_resolution_minutes,
-        EXTRACT(EPOCH FROM min(resolved_at - detected_at)) / 60 AS min_resolution_minutes,
-        EXTRACT(EPOCH FROM max(resolved_at - detected_at)) / 60 AS max_resolution_minutes
-    FROM flight_recorder.query_storms
-    WHERE resolved_at IS NOT NULL
-      AND detected_at >= now() - interval '7 days'
-),
-storm_prone_queries AS (
-    SELECT
-        array_agg(
-            json_build_object(
-                'queryid', queryid,
-                'fingerprint', left(query_fingerprint, 50),
-                'storm_count', storm_count
-            )
-            ORDER BY storm_count DESC
-        ) FILTER (WHERE rn <= 5) AS top_queries
-    FROM (
-        SELECT
-            queryid,
-            query_fingerprint,
-            count(*) AS storm_count,
-            row_number() OVER (ORDER BY count(*) DESC) AS rn
-        FROM flight_recorder.query_storms
-        WHERE detected_at >= now() - interval '7 days'
-        GROUP BY queryid, query_fingerprint
-    ) ranked
-),
-oldest_active AS (
-    SELECT
-        min(detected_at) AS oldest_storm_at,
-        EXTRACT(EPOCH FROM (now() - min(detected_at))) / 3600 AS oldest_storm_hours
-    FROM flight_recorder.query_storms
-    WHERE resolved_at IS NULL
-)
-SELECT
-    cfg.detection_enabled,
-    a.active_count,
-    a.retry_storms AS active_retry_storms,
-    a.cache_miss_storms AS active_cache_miss_storms,
-    a.spike_storms AS active_spike_storms,
-    a.low_severity AS active_low_severity,
-    a.medium_severity AS active_medium_severity,
-    a.high_severity AS active_high_severity,
-    a.critical_severity AS active_critical_severity,
-    r.total_24h AS storms_last_24h,
-    r.resolved_24h AS resolved_last_24h,
-    CASE
-        WHEN r.total_24h > 0
-        THEN round((r.resolved_24h::numeric / r.total_24h) * 100, 1)
-        ELSE NULL
-    END AS resolution_rate_pct,
-    round(rs.avg_resolution_minutes::numeric, 1) AS avg_resolution_minutes,
-    round(rs.min_resolution_minutes::numeric, 1) AS min_resolution_minutes,
-    round(rs.max_resolution_minutes::numeric, 1) AS max_resolution_minutes,
-    o.oldest_storm_at,
-    round(o.oldest_storm_hours::numeric, 1) AS oldest_storm_hours,
-    sq.top_queries AS storm_prone_queries,
-    CASE
-        WHEN NOT cfg.detection_enabled THEN 'disabled'
-        WHEN a.active_count = 0 THEN 'healthy'
-        WHEN a.critical_severity > 0 OR a.retry_storms > 0 THEN 'critical'
-        WHEN a.high_severity > 0 OR a.active_count >= 5 THEN 'warning'
-        WHEN a.medium_severity > 0 OR a.active_count >= 2 THEN 'attention'
-        ELSE 'healthy'
-    END AS overall_status,
-    CASE
-        WHEN NOT cfg.detection_enabled THEN
-            'Storm detection is disabled. Use enable_storm_detection() to enable.'
-        WHEN a.active_count = 0 THEN
-            'No active storms. System operating normally.'
-        WHEN a.critical_severity > 0 THEN
-            format('CRITICAL: %s critical severity storm(s). Immediate investigation required.', a.critical_severity)
-        WHEN a.retry_storms > 0 THEN
-            format('CRITICAL: %s active retry storm(s) detected. Check for transaction conflicts or lock contention.', a.retry_storms)
-        WHEN a.high_severity > 0 THEN
-            format('WARNING: %s high severity storm(s). Review with storm_status() for details.', a.high_severity)
-        WHEN a.cache_miss_storms > 0 THEN
-            format('WARNING: %s cache miss storm(s) detected. Check for cold cache or missing indexes.', a.cache_miss_storms)
-        ELSE
-            format('%s active storm(s). Review with storm_status() and resolve with resolve_storm().', a.active_count)
-    END AS recommendation
-FROM storm_config cfg
-CROSS JOIN active_storms a
-CROSS JOIN recent_storms r
-CROSS JOIN resolution_stats rs
-CROSS JOIN storm_prone_queries sq
-CROSS JOIN oldest_active o;
-COMMENT ON VIEW flight_recorder.storm_dashboard IS
-'At-a-glance query storm monitoring dashboard. Shows active storms by type and severity, resolution metrics, storm-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
-
--- Regression detection dashboard view
--- Provides at-a-glance summary of performance regression status
-CREATE OR REPLACE VIEW flight_recorder.regression_dashboard AS
-WITH
-regression_config AS (
-    SELECT
-        COALESCE(
-            (SELECT value::boolean FROM flight_recorder.config WHERE key = 'regression_detection_enabled'),
-            false
-        ) AS detection_enabled
-),
-active_regressions AS (
-    SELECT
-        count(*) AS active_count,
-        count(*) FILTER (WHERE severity = 'LOW') AS low_severity,
-        count(*) FILTER (WHERE severity = 'MEDIUM') AS medium_severity,
-        count(*) FILTER (WHERE severity = 'HIGH') AS high_severity,
-        count(*) FILTER (WHERE severity = 'CRITICAL') AS critical_severity
-    FROM flight_recorder.query_regressions
-    WHERE resolved_at IS NULL
-),
-recent_regressions AS (
-    SELECT
-        count(*) AS total_24h,
-        count(*) FILTER (WHERE resolved_at IS NOT NULL) AS resolved_24h
-    FROM flight_recorder.query_regressions
-    WHERE detected_at >= now() - interval '24 hours'
-),
-resolution_stats AS (
-    SELECT
-        count(*) AS total_resolved,
-        EXTRACT(EPOCH FROM avg(resolved_at - detected_at)) / 60 AS avg_resolution_minutes,
-        EXTRACT(EPOCH FROM min(resolved_at - detected_at)) / 60 AS min_resolution_minutes,
-        EXTRACT(EPOCH FROM max(resolved_at - detected_at)) / 60 AS max_resolution_minutes
-    FROM flight_recorder.query_regressions
-    WHERE resolved_at IS NOT NULL
-      AND detected_at >= now() - interval '7 days'
-),
-regression_prone_queries AS (
-    SELECT
-        array_agg(
-            json_build_object(
-                'queryid', queryid,
-                'fingerprint', left(query_fingerprint, 50),
-                'regression_count', regression_count,
-                'max_change_pct', max_change_pct
-            )
-            ORDER BY regression_count DESC, max_change_pct DESC
-        ) FILTER (WHERE rn <= 5) AS top_queries
-    FROM (
-        SELECT
-            queryid,
-            query_fingerprint,
-            count(*) AS regression_count,
-            max(change_pct) AS max_change_pct,
-            row_number() OVER (ORDER BY count(*) DESC, max(change_pct) DESC) AS rn
-        FROM flight_recorder.query_regressions
-        WHERE detected_at >= now() - interval '7 days'
-        GROUP BY queryid, query_fingerprint
-    ) ranked
-),
-oldest_active AS (
-    SELECT
-        min(detected_at) AS oldest_regression_at,
-        EXTRACT(EPOCH FROM (now() - min(detected_at))) / 3600 AS oldest_regression_hours
-    FROM flight_recorder.query_regressions
-    WHERE resolved_at IS NULL
-)
-SELECT
-    cfg.detection_enabled,
-    a.active_count,
-    a.low_severity AS active_low_severity,
-    a.medium_severity AS active_medium_severity,
-    a.high_severity AS active_high_severity,
-    a.critical_severity AS active_critical_severity,
-    r.total_24h AS regressions_last_24h,
-    r.resolved_24h AS resolved_last_24h,
-    CASE
-        WHEN r.total_24h > 0
-        THEN round((r.resolved_24h::numeric / r.total_24h) * 100, 1)
-        ELSE NULL
-    END AS resolution_rate_pct,
-    round(rs.avg_resolution_minutes::numeric, 1) AS avg_resolution_minutes,
-    round(rs.min_resolution_minutes::numeric, 1) AS min_resolution_minutes,
-    round(rs.max_resolution_minutes::numeric, 1) AS max_resolution_minutes,
-    o.oldest_regression_at,
-    round(o.oldest_regression_hours::numeric, 1) AS oldest_regression_hours,
-    rq.top_queries AS regression_prone_queries,
-    CASE
-        WHEN NOT cfg.detection_enabled THEN 'disabled'
-        WHEN a.active_count = 0 THEN 'healthy'
-        WHEN a.critical_severity > 0 THEN 'critical'
-        WHEN a.high_severity > 0 OR a.active_count >= 5 THEN 'warning'
-        WHEN a.medium_severity > 0 OR a.active_count >= 2 THEN 'attention'
-        ELSE 'healthy'
-    END AS overall_status,
-    CASE
-        WHEN NOT cfg.detection_enabled THEN
-            'Regression detection is disabled. Use enable_regression_detection() to enable.'
-        WHEN a.active_count = 0 THEN
-            'No active regressions. Query performance is stable.'
-        WHEN a.critical_severity > 0 THEN
-            format('CRITICAL: %s critical severity regression(s). Immediate investigation required.', a.critical_severity)
-        WHEN a.high_severity > 0 THEN
-            format('WARNING: %s high severity regression(s). Review with regression_status() for details.', a.high_severity)
-        ELSE
-            format('%s active regression(s). Review with regression_status() and resolve with resolve_regression().', a.active_count)
-    END AS recommendation
-FROM regression_config cfg
-CROSS JOIN active_regressions a
-CROSS JOIN recent_regressions r
-CROSS JOIN resolution_stats rs
-CROSS JOIN regression_prone_queries rq
-CROSS JOIN oldest_active o;
-COMMENT ON VIEW flight_recorder.regression_dashboard IS
-'At-a-glance performance regression monitoring dashboard. Shows active regressions by severity, resolution metrics, regression-prone queries, and overall status (healthy/attention/warning/critical/disabled). Based on last 24 hours for activity and 7 days for resolution stats.';
-
-
--- =============================================================================
 -- TABLE-LEVEL HOTSPOT TRACKING ANALYSIS FUNCTIONS
 -- =============================================================================
 
@@ -11477,447 +8696,6 @@ LANGUAGE sql STABLE AS $$
 $$;
 COMMENT ON FUNCTION flight_recorder.db_role_config_summary() IS
 'Overview of database/role configuration overrides grouped by scope. Shows which databases and roles have custom settings.';
-
-
--- =============================================================================
--- PERFORMANCE FORECASTING
--- =============================================================================
--- Predicts resource depletion using linear regression on historical data.
--- Enables proactive capacity planning by answering "When will I run out?"
-
--- Forecasts a single metric using linear regression
--- Supported metrics: db_size/storage, connections, wal/wal_bytes, transactions/xact_commit, temp/temp_bytes
-CREATE OR REPLACE FUNCTION flight_recorder.forecast(
-    p_metric TEXT,
-    p_lookback INTERVAL DEFAULT '7 days',
-    p_forecast_window INTERVAL DEFAULT '7 days'
-)
-RETURNS TABLE(
-    metric TEXT,
-    current_value NUMERIC,
-    current_display TEXT,
-    forecast_value NUMERIC,
-    forecast_display TEXT,
-    rate_per_day NUMERIC,
-    rate_display TEXT,
-    confidence NUMERIC,
-    depleted_at TIMESTAMPTZ,
-    time_to_depletion INTERVAL
-)
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_min_samples INTEGER;
-    v_metric_col TEXT;
-    v_capacity NUMERIC;
-    v_x NUMERIC[];
-    v_y NUMERIC[];
-    v_regression RECORD;
-    v_current NUMERIC;
-    v_forecast NUMERIC;
-    v_rate_per_second NUMERIC;
-    v_rate_per_day NUMERIC;
-    v_depleted_at TIMESTAMPTZ;
-    v_time_to_depletion INTERVAL;
-    v_sample_count INTEGER;
-    v_max_connections INTEGER;
-    v_disk_capacity_gb NUMERIC;
-BEGIN
-    -- Check if forecasting is enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('forecast_enabled', 'true')::boolean,
-        true
-    );
-    IF NOT v_enabled THEN
-        metric := p_metric;
-        current_display := 'Forecasting disabled';
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    v_min_samples := COALESCE(
-        flight_recorder._get_config('forecast_min_samples', '10')::integer,
-        10
-    );
-
-    -- Map metric aliases to column names
-    v_metric_col := CASE lower(p_metric)
-        WHEN 'db_size' THEN 'db_size_bytes'
-        WHEN 'storage' THEN 'db_size_bytes'
-        WHEN 'connections' THEN 'connections_total'
-        WHEN 'wal' THEN 'wal_bytes'
-        WHEN 'wal_bytes' THEN 'wal_bytes'
-        WHEN 'transactions' THEN 'xact_commit'
-        WHEN 'xact_commit' THEN 'xact_commit'
-        WHEN 'temp' THEN 'temp_bytes'
-        WHEN 'temp_bytes' THEN 'temp_bytes'
-        ELSE NULL
-    END;
-
-    IF v_metric_col IS NULL THEN
-        metric := p_metric;
-        current_display := format('Unknown metric: %s. Supported: db_size, connections, wal, transactions, temp', p_metric);
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    -- Get data points for regression
-    EXECUTE format(
-        'SELECT
-            array_agg(EXTRACT(EPOCH FROM captured_at) ORDER BY captured_at),
-            array_agg(%I::numeric ORDER BY captured_at),
-            count(*)
-         FROM flight_recorder.snapshots
-         WHERE captured_at > now() - $1
-           AND %I IS NOT NULL',
-        v_metric_col, v_metric_col
-    ) INTO v_x, v_y, v_sample_count
-    USING p_lookback;
-
-    -- Check for sufficient data
-    IF v_sample_count < v_min_samples THEN
-        metric := p_metric;
-        current_value := v_y[array_length(v_y, 1)];
-        current_display := CASE v_metric_col
-            WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
-            WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
-            WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
-            ELSE current_value::text
-        END;
-        rate_display := format('Insufficient data (%s samples, need %s)', v_sample_count, v_min_samples);
-        confidence := 0;
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    -- Perform linear regression
-    SELECT * INTO v_regression FROM flight_recorder._linear_regression(v_x, v_y);
-
-    IF v_regression.slope IS NULL THEN
-        metric := p_metric;
-        current_value := v_y[array_length(v_y, 1)];
-        current_display := CASE v_metric_col
-            WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
-            WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
-            WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(current_value::bigint)
-            ELSE current_value::text
-        END;
-        rate_display := 'Unable to calculate trend (constant values or invalid data)';
-        confidence := 0;
-        RETURN NEXT;
-        RETURN;
-    END IF;
-
-    -- Get current value (most recent)
-    v_current := v_y[array_length(v_y, 1)];
-
-    -- Calculate forecast value at end of forecast window
-    v_rate_per_second := v_regression.slope;
-    v_rate_per_day := v_rate_per_second * 86400;
-    v_forecast := v_current + (v_rate_per_second * EXTRACT(EPOCH FROM p_forecast_window));
-
-    -- Calculate depletion time based on metric type
-    CASE v_metric_col
-        WHEN 'db_size_bytes' THEN
-            -- Disk capacity from config
-            v_disk_capacity_gb := COALESCE(
-                flight_recorder._get_config('forecast_disk_capacity_gb', '100')::numeric,
-                100
-            );
-            v_capacity := v_disk_capacity_gb * 1024 * 1024 * 1024;
-
-            IF v_rate_per_second > 0 AND v_current < v_capacity THEN
-                v_time_to_depletion := make_interval(secs => (v_capacity - v_current) / v_rate_per_second);
-                v_depleted_at := now() + v_time_to_depletion;
-            END IF;
-
-        WHEN 'connections_total' THEN
-            -- Max connections from server settings
-            SELECT setting::integer INTO v_max_connections
-            FROM pg_settings WHERE name = 'max_connections';
-            v_capacity := v_max_connections;
-
-            IF v_rate_per_second > 0 AND v_current < v_capacity THEN
-                v_time_to_depletion := make_interval(secs => (v_capacity - v_current) / v_rate_per_second);
-                v_depleted_at := now() + v_time_to_depletion;
-            END IF;
-
-        ELSE
-            -- WAL, transactions, temp_bytes are informational (no depletion concept)
-            v_capacity := NULL;
-            v_depleted_at := NULL;
-            v_time_to_depletion := NULL;
-    END CASE;
-
-    -- Build result
-    metric := p_metric;
-    current_value := v_current;
-    current_display := CASE v_metric_col
-        WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(v_current::bigint)
-        WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(v_current::bigint)
-        WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(v_current::bigint)
-        WHEN 'connections_total' THEN format('%s / %s', v_current::integer, v_max_connections)
-        ELSE v_current::text
-    END;
-    forecast_value := v_forecast;
-    forecast_display := CASE v_metric_col
-        WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(GREATEST(0, v_forecast)::bigint)
-        WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(GREATEST(0, v_forecast)::bigint)
-        WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(GREATEST(0, v_forecast)::bigint)
-        WHEN 'connections_total' THEN format('%s / %s', GREATEST(0, v_forecast)::integer, v_max_connections)
-        ELSE GREATEST(0, v_forecast)::text
-    END;
-    rate_per_day := v_rate_per_day;
-    rate_display := CASE v_metric_col
-        WHEN 'db_size_bytes' THEN flight_recorder._pretty_bytes(v_rate_per_day::bigint) || '/day'
-        WHEN 'wal_bytes' THEN flight_recorder._pretty_bytes(v_rate_per_day::bigint) || '/day'
-        WHEN 'temp_bytes' THEN flight_recorder._pretty_bytes(v_rate_per_day::bigint) || '/day'
-        WHEN 'connections_total' THEN round(v_rate_per_day, 2)::text || '/day'
-        ELSE round(v_rate_per_day, 2)::text || '/day'
-    END;
-    confidence := v_regression.r_squared;
-    depleted_at := v_depleted_at;
-    time_to_depletion := v_time_to_depletion;
-
-    RETURN NEXT;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.forecast(TEXT, INTERVAL, INTERVAL) IS
-'Forecasts a single metric using linear regression. Predicts future values and time-to-depletion for capacity planning. Supported metrics: db_size/storage, connections, wal/wal_bytes, transactions/xact_commit, temp/temp_bytes. Returns current value, forecast value, growth rate, R² confidence (0-1), and estimated depletion time for applicable metrics.';
-
-
--- Multi-metric forecast summary dashboard
--- Returns all forecastable metrics with status classification and recommendations
-CREATE OR REPLACE FUNCTION flight_recorder.forecast_summary(
-    p_lookback INTERVAL DEFAULT '7 days',
-    p_forecast_window INTERVAL DEFAULT '7 days'
-)
-RETURNS TABLE(
-    metric TEXT,
-    current TEXT,
-    forecast TEXT,
-    rate TEXT,
-    confidence NUMERIC,
-    depleted_at TIMESTAMPTZ,
-    status TEXT,
-    recommendation TEXT
-)
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_metrics TEXT[] := ARRAY['db_size', 'connections', 'wal_bytes', 'xact_commit', 'temp_bytes'];
-    v_metric TEXT;
-    v_forecast RECORD;
-    v_status TEXT;
-    v_recommendation TEXT;
-    v_min_confidence NUMERIC;
-BEGIN
-    v_min_confidence := COALESCE(
-        flight_recorder._get_config('forecast_min_confidence', '0.5')::numeric,
-        0.5
-    );
-
-    FOREACH v_metric IN ARRAY v_metrics LOOP
-        SELECT * INTO v_forecast FROM flight_recorder.forecast(v_metric, p_lookback, p_forecast_window);
-
-        -- Determine status based on time_to_depletion and confidence
-        IF v_forecast.confidence IS NULL OR v_forecast.confidence < 0.1 THEN
-            v_status := 'insufficient_data';
-            v_recommendation := 'Need more data for reliable forecast';
-        ELSIF v_forecast.rate_per_day IS NOT NULL AND abs(v_forecast.rate_per_day) < 0.001 THEN
-            v_status := 'flat';
-            v_recommendation := CASE v_metric
-                WHEN 'db_size' THEN 'Database size is stable'
-                WHEN 'connections' THEN 'Connection usage is stable'
-                WHEN 'wal_bytes' THEN 'WAL generation is minimal'
-                WHEN 'xact_commit' THEN 'Transaction rate is stable'
-                WHEN 'temp_bytes' THEN 'No temp file usage detected'
-                ELSE 'Metric is stable'
-            END;
-        ELSIF v_forecast.depleted_at IS NOT NULL THEN
-            -- Calculate status based on time to depletion
-            IF v_forecast.time_to_depletion < interval '24 hours' THEN
-                v_status := 'critical';
-                v_recommendation := CASE v_metric
-                    WHEN 'db_size' THEN 'CRITICAL: Disk space will be exhausted within 24 hours. Immediate action required.'
-                    WHEN 'connections' THEN 'CRITICAL: Connection limit will be reached within 24 hours. Increase max_connections or implement pooling.'
-                    ELSE format('CRITICAL: %s will be exhausted within 24 hours', v_metric)
-                END;
-            ELSIF v_forecast.time_to_depletion < interval '7 days' THEN
-                v_status := 'warning';
-                v_recommendation := CASE v_metric
-                    WHEN 'db_size' THEN format('WARNING: Disk space will be exhausted in %s. Plan storage expansion.', v_forecast.time_to_depletion)
-                    WHEN 'connections' THEN format('WARNING: Connection limit will be reached in %s. Consider connection pooling.', v_forecast.time_to_depletion)
-                    ELSE format('WARNING: %s will be exhausted in %s', v_metric, v_forecast.time_to_depletion)
-                END;
-            ELSIF v_forecast.time_to_depletion < interval '30 days' THEN
-                v_status := 'attention';
-                v_recommendation := CASE v_metric
-                    WHEN 'db_size' THEN 'Monitor storage growth. Consider capacity increase within 30 days.'
-                    WHEN 'connections' THEN 'Monitor connection usage trend. May need adjustment soon.'
-                    ELSE format('%s trending toward capacity. Monitor closely.', v_metric)
-                END;
-            ELSE
-                v_status := 'healthy';
-                v_recommendation := CASE v_metric
-                    WHEN 'db_size' THEN 'Storage growth is sustainable'
-                    WHEN 'connections' THEN 'Connection usage is within healthy range'
-                    ELSE format('%s growth is sustainable', v_metric)
-                END;
-            END IF;
-        ELSE
-            -- No depletion concept (WAL, transactions, temp) - check trend direction
-            IF v_forecast.rate_per_day > 0 THEN
-                v_status := 'healthy';
-                v_recommendation := CASE v_metric
-                    WHEN 'wal_bytes' THEN 'WAL generation rate is normal'
-                    WHEN 'xact_commit' THEN 'Transaction rate trending up'
-                    WHEN 'temp_bytes' THEN 'Temp file usage is present. Consider increasing work_mem if excessive.'
-                    ELSE format('%s is increasing normally', v_metric)
-                END;
-            ELSIF v_forecast.rate_per_day < 0 THEN
-                v_status := 'healthy';
-                v_recommendation := CASE v_metric
-                    WHEN 'wal_bytes' THEN 'WAL generation decreasing (lower write activity)'
-                    WHEN 'xact_commit' THEN 'Transaction rate declining (reduced load or possible issue)'
-                    WHEN 'temp_bytes' THEN 'Temp file usage is declining'
-                    ELSE format('%s is decreasing', v_metric)
-                END;
-            ELSE
-                v_status := 'flat';
-                v_recommendation := 'No significant trend detected';
-            END IF;
-        END IF;
-
-        -- Low confidence warning
-        IF v_forecast.confidence IS NOT NULL
-           AND v_forecast.confidence < v_min_confidence
-           AND v_status NOT IN ('insufficient_data', 'flat') THEN
-            v_recommendation := v_recommendation || format(' (low confidence: %s%%)', round(v_forecast.confidence * 100)::integer);
-        END IF;
-
-        metric := v_metric;
-        current := v_forecast.current_display;
-        forecast := v_forecast.forecast_display;
-        rate := v_forecast.rate_display;
-        confidence := v_forecast.confidence;
-        depleted_at := v_forecast.depleted_at;
-        status := v_status;
-        recommendation := v_recommendation;
-        RETURN NEXT;
-    END LOOP;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.forecast_summary(INTERVAL, INTERVAL) IS
-'Multi-metric forecast dashboard. Returns all forecastable metrics with current values, predictions, growth rates, depletion estimates, and status classification (critical/warning/attention/healthy/flat/insufficient_data). Use for proactive capacity planning.';
-
-
--- Internal helper to send forecast alerts via pg_notify
-CREATE OR REPLACE FUNCTION flight_recorder._notify_forecast(
-    p_metric TEXT,
-    p_current_value TEXT,
-    p_depleted_at TIMESTAMPTZ,
-    p_confidence NUMERIC,
-    p_status TEXT
-)
-RETURNS VOID
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_channel TEXT;
-    v_payload JSONB;
-BEGIN
-    v_channel := COALESCE(
-        flight_recorder._get_config('forecast_notify_channel', 'flight_recorder_forecasts'),
-        'flight_recorder_forecasts'
-    );
-
-    v_payload := jsonb_build_object(
-        'type', 'forecast_alert',
-        'metric', p_metric,
-        'current_value', p_current_value,
-        'depleted_at', p_depleted_at,
-        'confidence', p_confidence,
-        'status', p_status,
-        'timestamp', now()
-    );
-
-    PERFORM pg_notify(v_channel, v_payload::text);
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder._notify_forecast IS
-'Internal helper to send forecast alerts via pg_notify. Payload includes metric, current value, predicted depletion time, confidence, and status.';
-
-
--- Scheduled alert checker for forecast-based capacity warnings
--- Designed to be called via pg_cron. Sends pg_notify for resources predicted to deplete soon.
-CREATE OR REPLACE FUNCTION flight_recorder.check_forecast_alerts()
-RETURNS INTEGER
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_enabled BOOLEAN;
-    v_alert_enabled BOOLEAN;
-    v_threshold INTERVAL;
-    v_min_confidence NUMERIC;
-    v_lookback INTERVAL;
-    v_forecast RECORD;
-    v_alert_count INTEGER := 0;
-BEGIN
-    -- Check if forecasting is enabled
-    v_enabled := COALESCE(
-        flight_recorder._get_config('forecast_enabled', 'true')::boolean,
-        true
-    );
-    IF NOT v_enabled THEN
-        RETURN 0;
-    END IF;
-
-    -- Check if alerts are enabled
-    v_alert_enabled := COALESCE(
-        flight_recorder._get_config('forecast_alert_enabled', 'false')::boolean,
-        false
-    );
-    IF NOT v_alert_enabled THEN
-        RETURN 0;
-    END IF;
-
-    -- Get configuration
-    v_threshold := COALESCE(
-        flight_recorder._get_config('forecast_alert_threshold', '3 days')::interval,
-        interval '3 days'
-    );
-    v_min_confidence := COALESCE(
-        flight_recorder._get_config('forecast_min_confidence', '0.5')::numeric,
-        0.5
-    );
-    v_lookback := COALESCE(
-        (flight_recorder._get_config('forecast_lookback_days', '7') || ' days')::interval,
-        interval '7 days'
-    );
-
-    -- Check each metric
-    FOR v_forecast IN
-        SELECT *
-        FROM flight_recorder.forecast_summary(v_lookback, v_threshold)
-        WHERE status IN ('critical', 'warning')
-          AND confidence >= v_min_confidence
-          AND depleted_at IS NOT NULL
-          AND depleted_at <= now() + v_threshold
-    LOOP
-        -- Send notification
-        PERFORM flight_recorder._notify_forecast(
-            v_forecast.metric,
-            v_forecast.current,
-            v_forecast.depleted_at,
-            v_forecast.confidence,
-            v_forecast.status
-        );
-        v_alert_count := v_alert_count + 1;
-    END LOOP;
-
-    RETURN v_alert_count;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.check_forecast_alerts() IS
-'Scheduled alert checker for forecast-based capacity warnings. Call via pg_cron to receive pg_notify alerts when resources are predicted to deplete within the configured threshold. Returns count of alerts sent.';
 
 
 -- =============================================================================
@@ -13279,375 +10057,6 @@ END;
 $$;
 COMMENT ON FUNCTION flight_recorder.blast_radius_report IS
 'Human-readable blast radius analysis report with ASCII-art formatting. Suitable for incident postmortems, Slack/email sharing, and documentation. Includes visual severity indicators, bar charts for lock types and affected apps, and actionable recommendations. Use: SELECT flight_recorder.blast_radius_report(''2024-01-15 10:23:00'', ''2024-01-15 10:35:00'');';
-
-
--- =============================================================================
--- SQLITE EXPORT FUNCTION
--- =============================================================================
-
--- Generates SQLite-compatible SQL dump of flight_recorder data
--- Usage: psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 out.db
-CREATE OR REPLACE FUNCTION flight_recorder.export_sql(
-    p_since INTERVAL DEFAULT NULL
-)
-RETURNS TEXT
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_result TEXT := '';
-    v_table_name TEXT;
-    v_col_names TEXT[];
-    v_col_types TEXT[];
-    v_col_def TEXT;
-    v_row RECORD;
-    v_values TEXT[];
-    v_val TEXT;
-    v_i INTEGER;
-    v_since TIMESTAMPTZ;
-    v_time_col TEXT;
-    v_where_clause TEXT;
-    v_tables TEXT[] := ARRAY[
-        'snapshots',
-        'statement_snapshots',
-        'table_snapshots',
-        'index_snapshots',
-        'replication_snapshots',
-        'config_snapshots',
-        'db_role_config_snapshots',
-        'vacuum_progress_snapshots',
-        'wait_samples_archive',
-        'activity_samples_archive',
-        'lock_samples_archive',
-        'wait_event_aggregates',
-        'activity_aggregates',
-        'lock_aggregates',
-        'canaries',
-        'canary_results',
-        'query_storms',
-        'query_regressions',
-        'config'
-    ];
-    v_time_columns TEXT[] := ARRAY[
-        'captured_at',   -- snapshots, statement_snapshots, etc.
-        'captured_at',   -- statement_snapshots
-        'captured_at',   -- table_snapshots (via snapshot)
-        'captured_at',   -- index_snapshots (via snapshot)
-        'captured_at',   -- replication_snapshots (via snapshot)
-        'captured_at',   -- config_snapshots (via snapshot)
-        'captured_at',   -- db_role_config_snapshots (via snapshot)
-        'captured_at',   -- vacuum_progress_snapshots (via snapshot)
-        'captured_at',   -- wait_samples_archive
-        'captured_at',   -- activity_samples_archive
-        'captured_at',   -- lock_samples_archive
-        'start_time',    -- wait_event_aggregates
-        'start_time',    -- activity_aggregates
-        'start_time',    -- lock_aggregates
-        NULL,            -- canaries (no time filter)
-        'executed_at',   -- canary_results
-        'detected_at',   -- query_storms
-        'detected_at',   -- query_regressions
-        NULL             -- config (no time filter)
-    ];
-BEGIN
-    -- Calculate since timestamp
-    IF p_since IS NOT NULL THEN
-        v_since := now() - p_since;
-    END IF;
-
-    -- Header
-    v_result := v_result || '-- flight_recorder SQLite export' || E'\n';
-    v_result := v_result || '-- Generated: ' || now()::text || E'\n';
-    v_result := v_result || '-- Schema version: ' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || E'\n';
-    v_result := v_result || '-- Source: ' || current_database() || E'\n';
-    IF p_since IS NOT NULL THEN
-        v_result := v_result || '-- Since: ' || v_since::text || E'\n';
-    END IF;
-    v_result := v_result || E'\n';
-    v_result := v_result || 'PRAGMA journal_mode=WAL;' || E'\n';
-    v_result := v_result || 'PRAGMA synchronous=NORMAL;' || E'\n';
-    v_result := v_result || E'\n';
-    v_result := v_result || 'BEGIN TRANSACTION;' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Process each table
-    FOR v_i IN 1..array_length(v_tables, 1) LOOP
-        v_table_name := v_tables[v_i];
-        v_time_col := v_time_columns[v_i];
-
-        -- Get column info
-        SELECT
-            array_agg(column_name ORDER BY ordinal_position),
-            array_agg(data_type ORDER BY ordinal_position)
-        INTO v_col_names, v_col_types
-        FROM information_schema.columns
-        WHERE table_schema = 'flight_recorder'
-          AND table_name = v_table_name;
-
-        IF v_col_names IS NULL THEN
-            CONTINUE;
-        END IF;
-
-        -- Generate CREATE TABLE
-        v_result := v_result || '-- Table: ' || v_table_name || E'\n';
-        v_result := v_result || 'CREATE TABLE IF NOT EXISTS "' || v_table_name || '" (' || E'\n';
-
-        FOR v_i IN 1..array_length(v_col_names, 1) LOOP
-            v_col_def := '  "' || v_col_names[v_i] || '" ';
-            v_col_def := v_col_def || CASE
-                WHEN v_col_types[v_i] IN ('integer', 'bigint', 'smallint', 'oid') THEN 'INTEGER'
-                WHEN v_col_types[v_i] = 'boolean' THEN 'INTEGER'
-                WHEN v_col_types[v_i] IN ('double precision', 'real', 'numeric') THEN 'REAL'
-                ELSE 'TEXT'
-            END;
-            IF v_i < array_length(v_col_names, 1) THEN
-                v_col_def := v_col_def || ',';
-            END IF;
-            v_result := v_result || v_col_def || E'\n';
-        END LOOP;
-
-        v_result := v_result || ');' || E'\n';
-
-        -- Build WHERE clause for time filtering
-        v_where_clause := '';
-        IF v_since IS NOT NULL AND v_time_col IS NOT NULL THEN
-            -- For tables with snapshot_id, join to snapshots
-            IF v_table_name IN ('statement_snapshots', 'table_snapshots', 'index_snapshots',
-                                'replication_snapshots', 'config_snapshots',
-                                'db_role_config_snapshots', 'vacuum_progress_snapshots') THEN
-                v_where_clause := ' WHERE snapshot_id IN (SELECT id FROM flight_recorder.snapshots WHERE captured_at > ''' || v_since::text || ''')';
-            ELSE
-                v_where_clause := ' WHERE ' || v_time_col || ' > ''' || v_since::text || '''';
-            END IF;
-        END IF;
-
-        -- Build SELECT that formats each column for SQLite
-        DECLARE
-            v_select_parts TEXT[] := ARRAY[]::TEXT[];
-            v_select_query TEXT;
-            v_formatted_row TEXT;
-        BEGIN
-            FOR v_i IN 1..array_length(v_col_names, 1) LOOP
-                IF v_col_types[v_i] = 'boolean' THEN
-                    v_select_parts := v_select_parts || format(
-                        'CASE WHEN %I IS NULL THEN ''NULL'' WHEN %I THEN ''1'' ELSE ''0'' END',
-                        v_col_names[v_i], v_col_names[v_i]);
-                ELSIF v_col_types[v_i] IN ('integer', 'bigint', 'smallint', 'oid', 'double precision', 'real', 'numeric') THEN
-                    v_select_parts := v_select_parts || format(
-                        'COALESCE(%I::text, ''NULL'')',
-                        v_col_names[v_i]);
-                ELSE
-                    -- Text types: escape single quotes, wrap in quotes
-                    v_select_parts := v_select_parts || format(
-                        'CASE WHEN %I IS NULL THEN ''NULL'' ELSE '''''''' || replace(%I::text, '''''''', '''''''''''') || '''''''' END',
-                        v_col_names[v_i], v_col_names[v_i]);
-                END IF;
-            END LOOP;
-
-            v_select_query := format(
-                'SELECT %s FROM flight_recorder.%I%s',
-                array_to_string(v_select_parts, ' || '', '' || '),
-                v_table_name,
-                v_where_clause
-            );
-
-            FOR v_formatted_row IN EXECUTE v_select_query LOOP
-                v_result := v_result || 'INSERT OR REPLACE INTO "' || v_table_name || '" VALUES (' || v_formatted_row || ');' || E'\n';
-            END LOOP;
-        END;
-
-        v_result := v_result || E'\n';
-    END LOOP;
-
-    v_result := v_result || 'COMMIT;' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Create indexes
-    v_result := v_result || '-- Indexes for common queries' || E'\n';
-    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_snapshots_captured_at ON snapshots(captured_at);' || E'\n';
-    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_wait_samples_captured_at ON wait_samples_archive(captured_at);' || E'\n';
-    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_activity_samples_captured_at ON activity_samples_archive(captured_at);' || E'\n';
-    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_lock_samples_captured_at ON lock_samples_archive(captured_at);' || E'\n';
-    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_statements_queryid ON statement_snapshots(queryid);' || E'\n';
-    v_result := v_result || 'CREATE INDEX IF NOT EXISTS idx_wait_events ON wait_samples_archive(wait_event_type, wait_event);' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Schema reference table (helps AI avoid column name errors)
-    v_result := v_result || '-- Schema reference - query this to see exact column names before writing queries' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _schema (table_name TEXT, column_name TEXT, column_type TEXT, column_position INTEGER, PRIMARY KEY (table_name, column_name));' || E'\n';
-    -- Dynamically populate _schema from the tables we exported
-    FOR v_i IN 1..array_length(v_tables, 1) LOOP
-        v_table_name := v_tables[v_i];
-        FOR v_row IN
-            SELECT column_name, data_type, ordinal_position
-            FROM information_schema.columns
-            WHERE table_schema = 'flight_recorder' AND table_name = v_table_name
-            ORDER BY ordinal_position
-        LOOP
-            v_result := v_result || format(
-                'INSERT OR REPLACE INTO _schema VALUES (%L, %L, %L, %s);',
-                v_table_name,
-                v_row.column_name,
-                v_row.data_type,
-                v_row.ordinal_position
-            ) || E'\n';
-        END LOOP;
-    END LOOP;
-    v_result := v_result || E'\n';
-
-    -- Metadata table
-    v_result := v_result || '-- Export metadata' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _export_metadata (key TEXT PRIMARY KEY, value TEXT);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''exported_at'', ''' || now()::text || ''');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''schema_version'', ''' || (SELECT value FROM flight_recorder.config WHERE key = 'schema_version') || ''');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''source_database'', ''' || current_database() || ''');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''pg_version'', ''' || version() || ''');' || E'\n';
-    IF p_since IS NOT NULL THEN
-        v_result := v_result || 'INSERT OR REPLACE INTO _export_metadata VALUES (''since_filter'', ''' || v_since::text || ''');' || E'\n';
-    END IF;
-    v_result := v_result || E'\n';
-
-    -- Analysis guide for AI
-    v_result := v_result || '-- Analysis guide for AI-driven exploration' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _guide (step INTEGER PRIMARY KEY, phase TEXT, instruction TEXT);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (0, ''BEFORE CUSTOM QUERIES'', ''Query _schema to see exact column names for any table before writing custom SQL. Example: SELECT column_name, column_type FROM _schema WHERE table_name = ''''wait_event_aggregates'''';'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (1, ''START HERE'', ''Check query_storms and query_regressions tables first - these contain pre-detected anomalies that indicate where problems occurred'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (2, ''LOW-ORDER APPROXIMATION'', ''Query snapshots for high-level system trends: connections_active, wal_bytes, temp_bytes, xact_commit, blks_read. Look for spikes or step changes.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (3, ''IDENTIFY TIME WINDOWS'', ''Find interesting time ranges from anomalies or snapshot trends. Note the timestamps for drilling down.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (4, ''WAIT EVENT ANALYSIS'', ''Query wait_event_aggregates for patterns in the time window. High counts of Lock, IO, or LWLock waits indicate bottlenecks.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (5, ''DRILL INTO DETAIL'', ''Use wait_samples_archive, activity_samples_archive, lock_samples_archive for raw samples in the time window.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (6, ''CORRELATE QUERIES'', ''Join statement_snapshots on time to see which queries were running. High temp_blks or blk_read_time indicate expensive queries.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (7, ''CHECK CONFIGURATION'', ''Query config_snapshots to see if settings changed near anomalies. Also check db_role_config_snapshots for role-level overrides.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _guide VALUES (8, ''TABLE HEALTH'', ''Query table_snapshots for n_dead_tup (bloat), seq_scan vs idx_scan ratios, and vacuum/analyze timestamps.'');' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Table descriptions for AI context
-    v_result := v_result || '-- Table descriptions' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _tables (name TEXT PRIMARY KEY, description TEXT, time_column TEXT);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''snapshots'', ''System-wide metrics every 5 min: WAL, checkpoints, connections, I/O, transactions'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''statement_snapshots'', ''Per-query stats from pg_stat_statements: timing, rows, blocks, temp usage'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''table_snapshots'', ''Per-table stats: seq/idx scans, tuple counts, dead tuples, vacuum times'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''index_snapshots'', ''Per-index stats: scan counts, tuple reads, index size'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''wait_event_aggregates'', ''5-minute summaries of wait events by type. Good for finding patterns.'', ''start_time'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''wait_samples_archive'', ''Raw wait event samples. Full detail for forensic analysis.'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''activity_samples_archive'', ''Raw session activity samples: who was connected, what they were doing'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''lock_samples_archive'', ''Raw lock contention samples: blocked/blocking PIDs, queries, durations'', ''captured_at'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''query_storms'', ''PRE-DETECTED: Sudden spikes in query execution counts. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''query_regressions'', ''PRE-DETECTED: Queries whose performance degraded vs baseline. Check resolved_at IS NULL for active.'', ''detected_at'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''config_snapshots'', ''PostgreSQL configuration parameter history'', ''via snapshot_id'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''config'', ''Flight recorder internal settings (not PostgreSQL config)'', NULL);' || E'\n';
-    -- Metadata tables (for AI self-reference)
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_schema'', ''SCHEMA REFERENCE: Lists all columns for each table. Query this before writing custom SQL to avoid column name errors.'', NULL);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_examples'', ''Ready-to-run query templates organized by tier. Use these instead of writing from scratch.'', NULL);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_columns'', ''Key column descriptions explaining what each metric means.'', NULL);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_guide'', ''Step-by-step analysis methodology (Top-Down approach).'', NULL);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _tables VALUES (''_glossary'', ''PostgreSQL terminology definitions.'', NULL);' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Example queries for common analysis patterns
-    v_result := v_result || '-- Example queries for common analysis patterns' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _examples (category TEXT, name TEXT, description TEXT, sql TEXT, PRIMARY KEY (category, name));' || E'\n';
-
-    -- Tier 0: Schema reference (use before writing custom queries)
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''list_tables'', ''List all available tables'', ''SELECT name, description FROM _tables ORDER BY name;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''table_columns'', ''List columns for a specific table (replace TABLE_NAME)'', ''SELECT column_name, column_type FROM _schema WHERE table_name = ''''TABLE_NAME'''' ORDER BY column_position;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''find_column'', ''Find which tables have a specific column (replace COLUMN_NAME)'', ''SELECT table_name, column_type FROM _schema WHERE column_name = ''''COLUMN_NAME'''';'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''0_schema'', ''column_meanings'', ''Get descriptions for key columns in a table (replace TABLE_NAME)'', ''SELECT column_name, meaning FROM _columns WHERE table_name = ''''TABLE_NAME'''';'');' || E'\n';
-
-    -- Tier 1: Quick status checks (ALWAYS run these first)
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''active_anomalies'', ''Count of unresolved anomalies - start here'', ''SELECT ''''storms'''' as type, COUNT(*) as count FROM query_storms WHERE resolved_at IS NULL UNION ALL SELECT ''''regressions'''', COUNT(*) FROM query_regressions WHERE resolved_at IS NULL;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''data_range'', ''Time range of available data'', ''SELECT MIN(captured_at) as earliest, MAX(captured_at) as latest, COUNT(*) as snapshots FROM snapshots;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''recent_activity'', ''Activity level in last hour'', ''SELECT COUNT(*) as samples, MAX(captured_at) as latest FROM snapshots WHERE captured_at > datetime(''''now'''', ''''-1 hour'''');'');' || E'\n';
-    -- data_inventory: Critical for knowing what data is available before querying
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''data_inventory'', ''Row counts per table - run this to see what data exists'', ''SELECT ''''snapshots'''' as tbl, COUNT(*) as rows FROM snapshots UNION ALL SELECT ''''wait_samples_archive'''', COUNT(*) FROM wait_samples_archive UNION ALL SELECT ''''wait_event_aggregates'''', COUNT(*) FROM wait_event_aggregates UNION ALL SELECT ''''activity_samples_archive'''', COUNT(*) FROM activity_samples_archive UNION ALL SELECT ''''lock_samples_archive'''', COUNT(*) FROM lock_samples_archive UNION ALL SELECT ''''statement_snapshots'''', COUNT(*) FROM statement_snapshots UNION ALL SELECT ''''table_snapshots'''', COUNT(*) FROM table_snapshots UNION ALL SELECT ''''query_storms'''', COUNT(*) FROM query_storms UNION ALL SELECT ''''query_regressions'''', COUNT(*) FROM query_regressions;'');' || E'\n';
-    -- system_health: Quick baseline metrics
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''1_quick_status'', ''system_health'', ''Key health metrics from latest snapshot'', ''SELECT captured_at, connections_active, connections_total, ROUND(100.0 * blks_hit / NULLIF(blks_hit + blks_read, 0), 2) as cache_hit_pct, temp_files, temp_bytes, xact_commit, xact_rollback FROM snapshots ORDER BY captured_at DESC LIMIT 1;'');' || E'\n';
-
-    -- Tier 2: Summary views (drill into specific areas)
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''connection_trend'', ''Connection count over time'', ''SELECT strftime(''''%Y-%m-%d %H:00'''', captured_at) as hour, ROUND(AVG(connections_active), 1) as avg_conn, MAX(connections_active) as max_conn FROM snapshots GROUP BY 1 ORDER BY 1;'');' || E'\n';
-    -- top_wait_events: Uses aggregates (populated by flush job every 5 min)
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''top_wait_events'', ''Most common wait events (from aggregates - may be empty if flush not run yet)'', ''SELECT wait_event_type, wait_event, SUM(total_waiters) as total, ROUND(AVG(avg_waiters), 2) as avg_concurrent FROM wait_event_aggregates GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 10;'');' || E'\n';
-    -- wait_events_from_samples: Fallback when aggregates are empty
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''wait_events_from_samples'', ''Wait events from raw samples (use when aggregates empty)'', ''SELECT backend_type, wait_event_type, wait_event, state, SUM(count) as total_waiters FROM wait_samples_archive GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC LIMIT 15;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''temp_file_usage'', ''Queries using temp files (memory pressure)'', ''SELECT s.captured_at, SUM(st.temp_blks_written) as temp_blks FROM snapshots s JOIN statement_snapshots st ON st.snapshot_id = s.id GROUP BY 1 HAVING SUM(st.temp_blks_written) > 0 ORDER BY 1;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''checkpoint_frequency'', ''Checkpoint timing and buffer writes'', ''SELECT captured_at, ckpt_timed, ckpt_requested, ckpt_buffers FROM snapshots WHERE ckpt_buffers > 0 ORDER BY captured_at;'');' || E'\n';
-    -- cache_hit_ratio: Critical performance indicator
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''cache_hit_ratio'', ''Buffer cache hit ratio over time (should be >95%)'', ''SELECT captured_at, blks_read, blks_hit, ROUND(100.0 * blks_hit / NULLIF(blks_hit + blks_read, 0), 2) as hit_ratio_pct FROM snapshots ORDER BY captured_at;'');' || E'\n';
-    -- wal_activity: Write workload indicator
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''wal_activity'', ''WAL generation over time (write workload)'', ''SELECT captured_at, wal_bytes, wal_bytes - LAG(wal_bytes) OVER (ORDER BY captured_at) as wal_delta FROM snapshots ORDER BY captured_at;'');' || E'\n';
-    -- transaction_rate: Throughput indicator
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''transaction_rate'', ''Transactions per snapshot interval'', ''SELECT captured_at, xact_commit, xact_rollback, xact_commit - LAG(xact_commit) OVER (ORDER BY captured_at) as commits_delta, xact_rollback - LAG(xact_rollback) OVER (ORDER BY captured_at) as rollbacks_delta FROM snapshots ORDER BY captured_at;'');' || E'\n';
-    -- snapshot_deltas: Compute deltas manually (the PostgreSQL deltas VIEW is not exported to SQLite)
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''2_summaries'', ''snapshot_deltas'', ''Compute snapshot deltas with pretty formatting (replaces deltas view)'', ''SELECT captured_at, temp_files, printf(''''%.2f MB'''', temp_bytes / 1048576.0) as temp_pretty, printf(''''%.2f MB'''', (wal_bytes - LAG(wal_bytes) OVER (ORDER BY captured_at)) / 1048576.0) as wal_delta, CASE WHEN ckpt_timed > LAG(ckpt_timed) OVER (ORDER BY captured_at) THEN ''''YES'''' ELSE ''''no'''' END as checkpoint_occurred, connections_active, connections_total FROM snapshots ORDER BY captured_at;'');' || E'\n';
-
-    -- Tier 3: Drill-down queries
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''lock_chains'', ''Who is blocking whom (replace timestamps)'', ''SELECT captured_at, blocked_user, blocked_query_preview, blocking_user, blocking_query_preview, blocked_duration FROM lock_samples_archive WHERE captured_at BETWEEN ''''2024-01-15 14:00'''' AND ''''2024-01-15 15:00'''' ORDER BY blocked_duration DESC LIMIT 20;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''slow_queries'', ''Slowest queries by total time'', ''SELECT queryid, query_preview, SUM(total_exec_time) as total_ms, SUM(calls) as calls, ROUND(SUM(total_exec_time)/SUM(calls), 2) as avg_ms FROM statement_snapshots GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 10;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''table_bloat'', ''Tables with high dead tuple counts'', ''SELECT s.captured_at, t.schemaname, t.relname, t.n_live_tup, t.n_dead_tup, ROUND(100.0 * t.n_dead_tup / NULLIF(t.n_live_tup + t.n_dead_tup, 0), 1) as dead_pct FROM snapshots s JOIN table_snapshots t ON t.snapshot_id = s.id WHERE t.n_dead_tup > 1000 ORDER BY t.n_dead_tup DESC LIMIT 20;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''3_drill_down'', ''index_usage'', ''Unused or underused indexes'', ''SELECT i.schemaname, i.relname, i.indexrelname, SUM(i.idx_scan) as total_scans, MAX(i.index_size_bytes) as size_bytes FROM index_snapshots i GROUP BY 1, 2, 3 HAVING SUM(i.idx_scan) < 10 ORDER BY 5 DESC;'');' || E'\n';
-
-    -- Correlation queries
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''4_correlation'', ''waits_during_storm'', ''Wait events during a query storm (get storm time from query_storms)'', ''SELECT w.captured_at, w.wait_event_type, w.wait_event, w.count FROM wait_samples_archive w WHERE w.captured_at BETWEEN (SELECT detected_at - interval ''''5 minutes'''' FROM query_storms LIMIT 1) AND (SELECT detected_at + interval ''''10 minutes'''' FROM query_storms LIMIT 1) ORDER BY w.captured_at;'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _examples VALUES (''4_correlation'', ''config_changes'', ''Configuration changes over time'', ''SELECT s.captured_at, c.name, c.setting, c.source FROM snapshots s JOIN config_snapshots c ON c.snapshot_id = s.id WHERE c.name IN (''''work_mem'''', ''''shared_buffers'''', ''''max_connections'''', ''''effective_cache_size'''') ORDER BY s.captured_at, c.name;'');' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Glossary of key concepts
-    v_result := v_result || '-- Glossary of key concepts' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _glossary (term TEXT PRIMARY KEY, definition TEXT);' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''wait_event'', ''What a PostgreSQL process is waiting for. Common types: Lock (row/table locks), IO (disk reads/writes), LWLock (internal locks), Client (waiting for client input). High wait counts indicate bottlenecks.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''query_storm'', ''A sudden spike in query execution counts, often caused by retry loops, cache invalidation, or application bugs. Storms can overwhelm the database.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''query_regression'', ''A query whose execution time has increased significantly compared to its historical baseline. Often caused by plan changes, data growth, or missing indexes.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''dead_tuples'', ''Old row versions that are no longer visible to any transaction. High counts indicate bloat - VACUUM removes them. Check n_dead_tup in table_snapshots.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''temp_files'', ''When queries need more memory than work_mem allows, PostgreSQL spills to disk. High temp_bytes in snapshots or temp_blks in statement_snapshots indicates memory pressure.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''checkpoint'', ''Periodic flush of dirty buffers to disk. ckpt_requested (forced) checkpoints indicate WAL pressure. High ckpt_buffers means lots of data being written.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''WAL'', ''Write-Ahead Log - PostgreSQL''''s durability mechanism. High wal_bytes indicates heavy write activity. WAL problems cause replication lag.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''seq_scan'', ''Sequential table scan - reads every row. Fine for small tables, but seq_scan on large tables (check seq_tup_read in table_snapshots) often indicates missing indexes.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''snapshot_id'', ''Links detail tables (statement_snapshots, table_snapshots, etc.) to the parent snapshots table. JOIN on snapshot_id to correlate metrics with timestamps.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _glossary VALUES (''queryid'', ''Hash of the query structure (from pg_stat_statements). Same queryid = same query pattern with different parameters. Use to track query performance over time.'');' || E'\n';
-    v_result := v_result || E'\n';
-
-    -- Key columns reference
-    v_result := v_result || '-- Key columns to understand' || E'\n';
-    v_result := v_result || 'CREATE TABLE IF NOT EXISTS _columns (table_name TEXT, column_name TEXT, meaning TEXT, PRIMARY KEY (table_name, column_name));' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''connections_active'', ''Currently active connections (running queries)'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''connections_total'', ''Total connections including idle'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''wal_bytes'', ''WAL generated (cumulative). Diff between snapshots = write activity.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''temp_bytes'', ''Temp file usage (cumulative). High values = queries spilling to disk.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''xact_commit'', ''Committed transactions (cumulative). Diff = transaction rate.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''blks_hit'', ''Buffer cache hits (cumulative). Compare to blks_read for cache hit ratio.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''snapshots'', ''blks_read'', ''Disk reads (cumulative). High values = cache misses or large scans.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''total_exec_time'', ''Total execution time for this query (ms). Divide by calls for average.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''calls'', ''Number of times this query was executed.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''rows'', ''Total rows returned by this query.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''shared_blks_read'', ''Disk blocks read by this query. High = cache misses.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''statement_snapshots'', ''temp_blks_written'', ''Temp blocks written. Any value > 0 means query exceeded work_mem.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''table_snapshots'', ''n_dead_tup'', ''Dead tuples awaiting vacuum. High values = bloat.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''table_snapshots'', ''seq_scan'', ''Sequential scans on this table. Compare to idx_scan.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''table_snapshots'', ''idx_scan'', ''Index scans on this table. Low ratio to seq_scan may indicate missing indexes.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''sample_count'', ''Number of samples in this time window where this wait event appeared.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''total_waiters'', ''Sum of processes waiting for this event type in the time window.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''avg_waiters'', ''Average concurrent waiters. High values = sustained contention.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''max_waiters'', ''Maximum concurrent waiters seen in any single sample.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_event_aggregates'', ''pct_of_samples'', ''Percentage of samples where this wait event was observed.'');' || E'\n';
-    -- wait_samples_archive columns (raw samples, use when aggregates empty)
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''captured_at'', ''Timestamp when this sample was captured.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''backend_type'', ''Type of backend process (client backend, autovacuum, etc).'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''wait_event_type'', ''Category of wait (Activity, Client, Lock, LWLock, IO, etc).'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''wait_event'', ''Specific wait event name within the type.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''state'', ''Backend state (active, idle, idle in transaction, etc).'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''wait_samples_archive'', ''count'', ''Number of backends in this state at sample time.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''lock_samples_archive'', ''blocked_duration'', ''How long the blocked process has been waiting for the lock.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''query_storms'', ''multiplier'', ''How many times higher than baseline. 10x = storm is 10x normal rate.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''query_storms'', ''resolved_at'', ''NULL = still active. Set when storm subsides or manually resolved.'');' || E'\n';
-    v_result := v_result || 'INSERT OR REPLACE INTO _columns VALUES (''query_regressions'', ''change_pct'', ''Percentage increase in execution time vs baseline. 200 = 3x slower.'');' || E'\n';
-
-    RETURN v_result;
-END;
-$$;
-COMMENT ON FUNCTION flight_recorder.export_sql IS
-'Generates SQLite-compatible SQL dump of all flight_recorder data.
-Usage: psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 out.db
-       psql -At -c "SELECT flight_recorder.export_sql(''7 days'')" mydb | sqlite3 out.db
-The optional interval parameter filters to recent data only.
-The export includes _guide and _tables metadata to help AI apply progressive refinement methodology.';
 
 
 SELECT flight_recorder.snapshot();

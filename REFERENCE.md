@@ -29,19 +29,15 @@ Technical reference for pg-flight-recorder, a PostgreSQL monitoring extension.
 **Part V: Capacity Planning**
 
 - [Capacity Planning](#capacity-planning)
-- [Performance Forecasting](#performance-forecasting)
 
 **Part VI: Reference Material**
 
 - [Troubleshooting Guide](#troubleshooting-guide)
 - [Anomaly Detection Reference](#anomaly-detection-reference)
-- [Canary Queries](#canary-queries)
 - [Query Storm Detection](#query-storm-detection)
 - [Performance Regression Detection](#performance-regression-detection)
-- [Visual Timeline](#visual-timeline)
 - [Testing and Benchmarking](#testing-and-benchmarking)
 - [Code Browser](#code-browser)
-- [SQLite Export](#sqlite-export)
 
 ---
 
@@ -458,11 +454,20 @@ This is safe — it preserves all data and updates functions/views to the latest
 
 | Version | Changes |
 |---------|---------|
-| 2.13 | Visual Timeline: `_sparkline()`, `_bar()`, `timeline()`, `sparkline_metrics()` functions for ASCII-based metric visualization |
+| 2.22 | **Removed** visual timeline functions, forecasting system, and high_ddl profile |
+| 2.21 | **Removed** auto-detect wrappers (storm/regression automated logging) |
+| 2.20 | **Removed** canary queries feature (use `statement_compare()` for query performance monitoring) |
+| 2.19 | **Removed** SQLite export function (use `report()` for database analysis) |
+| 2.18 | Version bump (SQLite export enhancements, now removed) |
+| 2.17 | Buffer-based performance metrics: ranking by buffers instead of timing |
+| 2.16 | Blast radius analysis: `blast_radius()`, `blast_radius_report()` functions |
+| 2.15 | ~~Capacity forecasting~~ (removed in 2.22) |
+| 2.14 | Performance profiles: `apply_profile()`, `list_profiles()`, `explain_profile()` functions |
+| 2.13 | ~~Visual Timeline~~ (removed in 2.22) |
 | 2.12 | Performance regression detection: `query_regressions` table, `detect_regressions()`, `regression_status()`, `regression_dashboard` view |
 | 2.11 | Query storm severity levels and correlation data, anti-flapping protection for auto-resolution |
 | 2.10 | Query storm detection: `query_storms` table, `detect_query_storms()`, `storm_status()`, `storm_dashboard` view |
-| 2.9 | Canary queries: `canaries` and `canary_results` tables, `run_canaries()`, `canary_status()` functions |
+| 2.9 | ~~Canary queries~~ (removed in 2.20) |
 | 2.8 | OID exhaustion detection: `max_catalog_oid` and `large_object_count` columns, `OID_EXHAUSTION_RISK` anomaly type, rate calculation functions (`oid_consumption_rate`, `time_to_oid_exhaustion`) |
 | 2.7 | Autovacuum observer enhancements: `n_mod_since_analyze` column, configurable sampling modes (`top_n`/`all`/`threshold`), rate calculation functions (`dead_tuple_growth_rate`, `modification_rate`, `hot_update_ratio`, `time_to_budget_exhaustion`) |
 | 2.6 | New anomaly detections (idle-in-transaction, dead tuple accumulation, vacuum starvation, connection leak, replication lag velocity), database conflict columns (`pg_stat_database_conflicts`), `recent_idle_in_transaction` view |
@@ -488,7 +493,6 @@ Profiles provide pre-configured settings for common use cases. Each profile sets
 | `development` | 180s | 0.013% | All | Balanced | 7d/3d | 15min/3d |
 | `troubleshooting` | 60s | 0.04% | All + top 100 | Lenient | 7d/7d | 5min/7d |
 | `minimal_overhead` | 300s | 0.008% | Wait/activity | Very aggressive | 7d/3d | Disabled |
-| `high_ddl` | 180s | 0.013% | All | DDL-optimized | 30d/7d | 15min/7d |
 
 ### Key Profile Settings
 
@@ -501,7 +505,6 @@ Profiles provide pre-configured settings for common use cases. Each profile sets
 | `development` | 250ms | 1000ms | 2MB |
 | `troubleshooting` | 500ms | 2000ms | 4MB |
 | `minimal_overhead` | 100ms | 500ms | 1MB |
-| `high_ddl` | 200ms | 800ms | 2MB |
 
 #### Load Thresholds
 
@@ -512,7 +515,6 @@ Profiles provide pre-configured settings for common use cases. Each profile sets
 | `development` | 50 | 100 | 1000/s | 10000/s |
 | `troubleshooting` | 100 | 200 | 2000/s | 20000/s |
 | `minimal_overhead` | 20 | 30 | 300/s | 3000/s |
-| `high_ddl` | 30 | 100 | 1000/s | 10000/s |
 
 #### Statement Collection
 
@@ -523,18 +525,16 @@ Profiles provide pre-configured settings for common use cases. Each profile sets
 | `development` | 15min | 1 | 20 |
 | `troubleshooting` | 5min | 1 | 50 |
 | `minimal_overhead` | 30min | 10 | 20 |
-| `high_ddl` | 15min | 1 | 20 |
 
 #### Advanced Features
 
-| Profile | Canary | Storm | Regression | Forecast | Jitter | Auto-mode |
-|---------|--------|-------|------------|----------|--------|-----------|
-| `default` | off | off | off | on | on | 60% |
-| `production_safe` | off | off | off | on | on | 50% |
-| `development` | **on** | **on** | **on** | on+alerts | on | 60% |
-| `troubleshooting` | **on** | **on** | **on** | on+alerts | off | disabled |
-| `minimal_overhead` | off | off | off | off | off | 40% |
-| `high_ddl` | off | off | off | on | on | 60% |
+| Profile | Storm | Regression | Jitter | Auto-mode |
+|---------|-------|------------|--------|-----------|
+| `default` | off | off | on | 60% |
+| `production_safe` | off | off | on | 50% |
+| `development` | **on** | **on** | on | 60% |
+| `troubleshooting` | **on** | **on** | off | disabled |
+| `minimal_overhead` | off | off | off | 40% |
 
 #### Troubleshooting-Specific Tuning
 
@@ -550,8 +550,6 @@ The `troubleshooting` profile includes more sensitive detection settings:
 | `regression_baseline_days` | 7 | 3 |
 | `regression_lookback_interval` | 1 hour | 30 minutes |
 | `regression_min_duration_minutes` | 30 | 10 |
-| `forecast_lookback_days` | 7 | 3 |
-| `forecast_window_days` | 7 | 3 |
 
 ### Profile Commands
 
@@ -576,13 +574,11 @@ SELECT * FROM flight_recorder.get_current_profile();
 
 **`production_safe`** — Production with strict SLAs. 40% less overhead through aggressive skipping, faster timeouts, lower memory usage. Locks and progress tracking disabled. Emergency mode triggers earlier (50% connections).
 
-**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention. **Enables canary queries, storm detection, regression detection, and forecast alerts** for full feature testing.
+**`development`** — Staging/dev environments. Always collects (no adaptive sampling skip), shorter retention. **Enables storm detection and regression detection** for full feature testing.
 
 **`troubleshooting`** — Active incidents. High-frequency collection (60s), lenient safety thresholds, more memory for complex queries. Disables jitter for consistent timing and auto-mode to prevent emergency throttling. **More sensitive detection thresholds** for storms and regressions. **Temporary use only**—switch back after incident.
 
-**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint with very aggressive skipping, fastest timeouts, archives disabled, forecasting disabled. Emergency mode triggers very early (40% connections).
-
-**`high_ddl`** — Multi-tenant SaaS, frequent schema changes. Pre-checks for DDL locks, fast lock timeout, aggressive lock skipping to avoid blocking on DDL operations.
+**`minimal_overhead`** — Resource-constrained systems, replicas. Minimum footprint with very aggressive skipping, fastest timeouts, archives disabled. Emergency mode triggers very early (40% connections).
 
 ### Combining Profiles with Overrides
 
@@ -719,7 +715,6 @@ Single authoritative reference for all retention periods:
 | `retention_snapshots_days` | 30 | Snapshots | System stat snapshots |
 | `retention_statements_days` | 30 | Snapshots | Query snapshots |
 | `retention_collection_stats_days` | 30 | Internal | Collection performance stats |
-| `retention_canary_days` | 7 | Canary | Canary query results |
 | `retention_storms_days` | 30 | Storms | Query storm history |
 | `retention_regressions_days` | 30 | Regressions | Performance regression history |
 | `snapshot_retention_days_extended` | 90 | Extended | Extended snapshot retention for capacity planning |
@@ -756,7 +751,6 @@ Both `ring_buffer_slots` and `sample_interval_seconds` are configurable. Use opt
 | `capacity_planning_enabled` | true | Enable capacity metrics collection |
 | `capacity_thresholds_warning_pct` | 60 | Warning threshold |
 | `capacity_thresholds_critical_pct` | 80 | Critical threshold |
-| `capacity_forecast_window_days` | 90 | Forecast window for projections |
 | `collect_database_size` | true | Collect db_size_bytes |
 | `collect_connection_metrics` | true | Collect connection metrics |
 
@@ -1364,9 +1358,6 @@ UPDATE flight_recorder.config SET value = '50' WHERE key = 'lock_timeout_ms';
 
 -- Use emergency mode during high-DDL periods
 SELECT flight_recorder.set_mode('emergency');
-
--- Or apply high_ddl profile
-SELECT flight_recorder.apply_profile('high_ddl');
 ```
 
 ---
@@ -1533,212 +1524,6 @@ FROM flight_recorder.capacity_summary(interval '30 days')
 WHERE utilization_pct < 30
 ORDER BY utilization_pct;
 ```
-
----
-
-## Performance Forecasting
-
-Flight Recorder predicts resource depletion using linear regression on historical data. This enables proactive capacity planning by answering: "When will I run out?"
-
-### Overview
-
-Forecasting extends existing capacity planning:
-
-| Feature | Question Answered | Focus |
-|---------|-------------------|-------|
-| `capacity_summary()` | "What's my current utilization?" | Present state, headroom % |
-| `capacity_dashboard` | "What's my overall status?" | At-a-glance with growth rate |
-| `forecast()` | "When will I run out?" | Future depletion time |
-| `forecast_summary()` | "What resources need attention soon?" | Prioritized by urgency |
-
-**Key benefits:**
-
-- Uses existing snapshot data (no new collection overhead)
-- Predicts when resources will be exhausted
-- Provides confidence scores (R²) for predictions
-- Supports pg_notify alerts for critical forecasts
-
-### Using forecast()
-
-Forecast a single metric:
-
-```sql
--- Forecast database size growth
-SELECT * FROM flight_recorder.forecast('db_size');
-
--- Custom lookback and forecast windows
-SELECT * FROM flight_recorder.forecast('db_size', '14 days', '30 days');
-
--- Forecast connections
-SELECT * FROM flight_recorder.forecast('connections', '7 days', '7 days');
-```
-
-**Supported metrics:**
-
-| Metric | Aliases | Depletion Tracked |
-|--------|---------|-------------------|
-| `db_size` | `storage` | Yes (configurable disk capacity) |
-| `connections` | - | Yes (max_connections) |
-| `wal_bytes` | `wal` | No (informational) |
-| `xact_commit` | `transactions` | No (informational) |
-| `temp_bytes` | `temp` | No (informational) |
-
-**Output columns:**
-
-| Column | Purpose |
-|--------|---------|
-| `metric` | Metric name |
-| `current_value` | Current raw value |
-| `current_display` | Human-readable current value |
-| `forecast_value` | Predicted value at end of forecast window |
-| `forecast_display` | Human-readable forecast value |
-| `rate_per_day` | Growth rate (units per day) |
-| `rate_display` | Human-readable growth rate |
-| `confidence` | R² coefficient (0-1, higher is better) |
-| `depleted_at` | Predicted depletion timestamp (if applicable) |
-| `time_to_depletion` | Time until depletion (if applicable) |
-
-### Using forecast_summary()
-
-Multi-metric forecast dashboard:
-
-```sql
--- All metrics with default windows (7 days lookback, 7 days forecast)
-SELECT * FROM flight_recorder.forecast_summary();
-
--- Custom windows
-SELECT * FROM flight_recorder.forecast_summary('14 days', '30 days');
-```
-
-**Output columns:**
-
-| Column | Purpose |
-|--------|---------|
-| `metric` | Metric name |
-| `current` | Current value (display format) |
-| `forecast` | Forecast value (display format) |
-| `rate` | Growth rate per day |
-| `confidence` | R² coefficient (0-1) |
-| `depleted_at` | Predicted depletion timestamp |
-| `status` | Status classification |
-| `recommendation` | Actionable advice |
-
-**Status values:**
-
-| Status | Condition |
-|--------|-----------|
-| `critical` | Depletion within 24 hours |
-| `warning` | Depletion within 7 days |
-| `attention` | Depletion within 30 days |
-| `healthy` | No depletion predicted or >30 days |
-| `insufficient_data` | Not enough snapshots for forecast |
-| `flat` | No significant trend detected |
-
-### Config Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `forecast_enabled` | `true` | Enable/disable forecasting |
-| `forecast_lookback_days` | `7` | Default lookback window |
-| `forecast_window_days` | `7` | Default forecast window |
-| `forecast_alert_enabled` | `false` | Enable pg_notify alerts |
-| `forecast_alert_threshold` | `3 days` | Alert when depletion is within this window |
-| `forecast_notify_channel` | `flight_recorder_forecasts` | pg_notify channel name |
-| `forecast_disk_capacity_gb` | `100` | Assumed disk capacity for db_size forecasts |
-| `forecast_min_samples` | `10` | Minimum snapshots required for forecast |
-| `forecast_min_confidence` | `0.5` | Minimum R² for alerts |
-
-### Setting Up Alerts
-
-Enable forecast alerts to receive pg_notify messages when resources are predicted to deplete soon:
-
-```sql
--- Enable alerts
-UPDATE flight_recorder.config
-SET value = 'true'
-WHERE key = 'forecast_alert_enabled';
-
--- Configure disk capacity (if different from default)
-UPDATE flight_recorder.config
-SET value = '500'  -- 500 GB
-WHERE key = 'forecast_disk_capacity_gb';
-
--- Schedule alert checks via pg_cron (every 4 hours)
-SELECT cron.schedule(
-    'forecast-alerts',
-    '0 */4 * * *',
-    'SELECT flight_recorder.check_forecast_alerts()'
-);
-```
-
-**Listen for alerts:**
-
-```sql
--- In a separate session
-LISTEN flight_recorder_forecasts;
-
--- Alerts are JSON payloads:
--- {"type":"forecast_alert","metric":"db_size","current_value":"45 GB","depleted_at":"2026-02-15 10:30:00","confidence":0.92,"status":"warning","timestamp":"2026-01-30 14:00:00"}
-```
-
-### Interpreting Results
-
-**High confidence (R² > 0.8):**
-
-The trend is clear and predictions are reliable. Take action based on status.
-
-**Medium confidence (R² 0.5-0.8):**
-
-Some variability in data. Predictions are directionally correct but timing may vary.
-
-**Low confidence (R² < 0.5):**
-
-Data is noisy or non-linear. Consider using longer lookback windows or investigating anomalies.
-
-### Practical Examples
-
-**Weekly capacity review:**
-
-```sql
-SELECT metric, current, forecast, rate, status, recommendation
-FROM flight_recorder.forecast_summary('14 days', '30 days')
-ORDER BY
-    CASE status
-        WHEN 'critical' THEN 1
-        WHEN 'warning' THEN 2
-        WHEN 'attention' THEN 3
-        ELSE 4
-    END;
-```
-
-**Storage planning:**
-
-```sql
--- Check when disk will be full
-SELECT
-    current_display AS "Current Size",
-    rate_display AS "Growth Rate",
-    depleted_at AS "Full At",
-    time_to_depletion AS "Time Left",
-    confidence AS "Confidence"
-FROM flight_recorder.forecast('db_size', '30 days', '90 days');
-```
-
-**Connection pool sizing:**
-
-```sql
-SELECT
-    current_display AS "Connections",
-    rate_display AS "Trend",
-    CASE
-        WHEN depleted_at IS NOT NULL THEN
-            format('Will hit limit at %s', depleted_at)
-        ELSE 'No limit reached in forecast window'
-    END AS "Prediction"
-FROM flight_recorder.forecast('connections', '7 days', '30 days');
-```
-
----
 
 ## Part VI: Reference Material
 
@@ -2056,184 +1841,6 @@ Detects when replica lag is trending upward (lag is growing over time).
 | `medium` | 30-60 seconds |
 | `high` | 60-300 seconds |
 | `critical` | >300 seconds |
-
-## Canary Queries
-
-Canary queries are synthetic workloads that run periodically to detect silent performance degradation. Unlike passive monitoring that waits for problems to appear in real queries, canary queries proactively test database responsiveness with known, lightweight operations.
-
-### Overview
-
-A "canary query" is a simple, well-understood query that establishes a performance baseline. When canary performance degrades, it indicates systemic issues (I/O problems, CPU contention, memory pressure) before user-facing queries are impacted.
-
-**Use cases:**
-
-- Detect silent degradation before users report slowness
-- Establish performance baselines for capacity planning
-- Validate database health after maintenance or changes
-- Identify infrastructure issues (storage latency, network problems)
-
-### Built-in Canary Queries
-
-Flight Recorder includes four pre-defined canary queries targeting common database operations:
-
-| Name | Description | Query |
-|------|-------------|-------|
-| `index_lookup` | B-tree index lookup on pg_class | `SELECT oid FROM pg_class WHERE relname = 'pg_class' LIMIT 1` |
-| `small_agg` | Count aggregation on pg_stat_activity | `SELECT count(*) FROM pg_stat_activity` |
-| `seq_scan_baseline` | Sequential scan count on pg_namespace | `SELECT count(*) FROM pg_namespace` |
-| `simple_join` | Join pg_namespace to pg_class | `SELECT count(*) FROM pg_namespace n JOIN pg_class c ON c.relnamespace = n.oid WHERE n.nspname = 'pg_catalog'` |
-
-These queries use only system catalogs and are safe to run frequently.
-
-### Status Levels
-
-Canary status compares current performance (p50 over last hour) to baseline (p50 over last 7 days, excluding last day):
-
-| Status | Condition | Description |
-|--------|-----------|-------------|
-| `OK` | Current < baseline × warning threshold | Performance within normal range |
-| `DEGRADED` | Current >= baseline × warning threshold | Performance degraded, warrants monitoring |
-| `CRITICAL` | Current >= baseline × critical threshold | Severe degradation, immediate attention needed |
-| `INSUFFICIENT_DATA` | Not enough samples | Need more data to establish baseline |
-
-Default thresholds: warning = 1.5x (50% slower), critical = 2.0x (100% slower). Thresholds are configurable per canary.
-
-### Enabling Canary Monitoring
-
-Canary monitoring is opt-in. Enable it with:
-
-```sql
-SELECT flight_recorder.enable_canaries();
-```
-
-This schedules automatic execution every 15 minutes via pg_cron. To disable:
-
-```sql
-SELECT flight_recorder.disable_canaries();
-```
-
-### Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `canary_enabled` | `false` | Master enable/disable |
-| `canary_interval_minutes` | `15` | How often to run canary queries |
-| `canary_capture_plans` | `false` | Store EXPLAIN output with results |
-| `retention_canary_days` | `7` | How long to keep canary results |
-
-Adjust configuration:
-
-```sql
--- Run canaries more frequently
-UPDATE flight_recorder.config
-SET value = '5'
-WHERE key = 'canary_interval_minutes';
-
--- Enable plan capture for debugging
-UPDATE flight_recorder.config
-SET value = 'true'
-WHERE key = 'canary_capture_plans';
-
--- Keep results longer
-UPDATE flight_recorder.config
-SET value = '30'
-WHERE key = 'retention_canary_days';
-```
-
-### Manual Execution
-
-Run canaries without enabling automatic scheduling:
-
-```sql
-SELECT * FROM flight_recorder.run_canaries();
-```
-
-Output:
-
-| canary_name | duration_ms | success | error_message |
-|-------------|-------------|---------|---------------|
-| index_lookup | 0.42 | true | |
-| small_agg | 1.23 | true | |
-| seq_scan_baseline | 0.31 | true | |
-| simple_join | 2.15 | true | |
-
-### Monitoring Canary Health
-
-**Status function** (detailed list):
-
-```sql
-SELECT * FROM flight_recorder.canary_status();
-```
-
-Output:
-
-| canary_name | description | baseline_ms | current_ms | change_pct | status | last_executed | last_error |
-|-------------|-------------|-------------|------------|------------|--------|---------------|------------|
-| index_lookup | B-tree index lookup on pg_class | 0.45 | 0.42 | -6.7 | OK | 2024-01-15 10:30:00 | |
-| small_agg | Count aggregation on pg_stat_activity | 1.20 | 2.40 | 100.0 | CRITICAL | 2024-01-15 10:30:00 | |
-
-### Adding Custom Canaries
-
-Add your own canary queries for application-specific monitoring:
-
-```sql
--- Add a canary for your most critical table
-INSERT INTO flight_recorder.canaries (name, description, query_text, threshold_warning, threshold_critical)
-VALUES (
-    'orders_lookup',
-    'Primary key lookup on orders table',
-    'SELECT id FROM orders WHERE id = 1 LIMIT 1',
-    1.5,  -- Alert at 50% slower
-    2.0   -- Critical at 100% slower
-);
-
--- Add a canary with expected baseline timing
-INSERT INTO flight_recorder.canaries (name, description, query_text, expected_time_ms)
-VALUES (
-    'inventory_count',
-    'Count active inventory items',
-    'SELECT count(*) FROM inventory WHERE status = ''active''',
-    5.0  -- Expected to run in ~5ms
-);
-```
-
-Disable a canary without deleting it:
-
-```sql
-UPDATE flight_recorder.canaries
-SET enabled = false
-WHERE name = 'orders_lookup';
-```
-
-### Function Reference
-
-| Function | Description |
-|----------|-------------|
-| `enable_canaries()` | Enable and schedule automatic canary execution |
-| `disable_canaries()` | Disable and unschedule canary execution |
-| `run_canaries()` | Execute all enabled canaries immediately |
-| `canary_status()` | Get current status comparing performance to baseline |
-
-### Table Reference
-
-| Object | Type | Description |
-|--------|------|-------------|
-| `canaries` | Table | Canary query definitions |
-| `canary_results` | Table | Execution history with timing and optional plans |
-
-### Quick Start
-
-```sql
--- 1. Enable canary monitoring
-SELECT flight_recorder.enable_canaries();
-
--- 2. Wait for some executions, then check status
-SELECT * FROM flight_recorder.canary_status();
-
--- 3. Add a custom canary for your application
-INSERT INTO flight_recorder.canaries (name, description, query_text)
-VALUES ('my_canary', 'Check critical table', 'SELECT 1 FROM my_table LIMIT 1');
-```
 
 ## Query Storm Detection
 
@@ -3127,166 +2734,6 @@ RECOMMENDATIONS
 3. **Capacity Planning**: Identify connection pool and throughput limits
 4. **Application Mapping**: Discover which apps were affected by lock contention
 
-## Visual Timeline
-
-Visual timeline functions provide ASCII-based visualization of metrics, enabling quick pattern recognition in terminal-based reports.
-
-### Overview
-
-Visual timeline includes four functions:
-
-| Function | Purpose |
-|----------|---------|
-| `_sparkline(numeric[])` | Compact Unicode sparkline from numeric array |
-| `_bar(value, max)` | Horizontal progress bar |
-| `timeline(metric, duration)` | Full ASCII chart with Y-axis and time labels |
-| `sparkline_metrics(duration)` | Summary table with sparkline trends |
-
-### Sparklines
-
-Sparklines are compact inline charts using Unicode block characters (▁▂▃▄▅▆▇█):
-
-```sql
--- Basic sparkline from array
-SELECT flight_recorder._sparkline(ARRAY[1,2,4,8,4,2,1,2,4,8]);
--- Returns: ▁▂▃█▃▂▁▂▃█
-
--- With custom width (samples if array is larger)
-SELECT flight_recorder._sparkline(ARRAY[1,2,3,4,5,6,7,8,9,10], 5);
--- Returns: ▁▃▄▆█
-```
-
-**Edge cases handled:**
-
-- NULL array → empty string
-- Empty array → empty string
-- All-NULL values → empty string
-- Constant values → middle-height bars (▄▄▄▄)
-- Mixed NULL values → space character for NULLs
-
-### Progress Bars
-
-Horizontal progress bars show filled/empty portions:
-
-```sql
--- 75% progress bar
-SELECT flight_recorder._bar(75, 100, 20);
--- Returns: ███████████████░░░░░
-
--- 0% and 100%
-SELECT flight_recorder._bar(0, 100, 10);   -- ░░░░░░░░░░
-SELECT flight_recorder._bar(100, 100, 10); -- ██████████
-```
-
-### Timeline Charts
-
-Full ASCII charts with Y-axis labels and time markers:
-
-```sql
-SELECT flight_recorder.timeline('connections', '2 hours');
-```
-
-**Example output:**
-
-```
-connections (last 2 hours)
-    87 ┤          ╭────╮
-    72 ┤    ╭─────╯    ╰──╮
-    58 ┤╭───╯             ╰──
-    43 ┼╯
-       └───────┬───────┬───────
-            14:00   15:00   16:00
-```
-
-**Supported metrics:**
-
-| Alias | Column | Description |
-|-------|--------|-------------|
-| `connections` | `connections_active` | Active database connections |
-| `connections_total` | `connections_total` | Total connections |
-| `wal` | `wal_bytes` | WAL bytes generated |
-| `temp` | `temp_bytes` | Temp file bytes |
-| `commits` | `xact_commit` | Committed transactions |
-| `rollbacks` | `xact_rollback` | Rolled back transactions |
-| `blks_read` | `blks_read` | Blocks read from disk |
-| `blks_hit` | `blks_hit` | Blocks found in cache |
-| `db_size` | `db_size_bytes` | Database size |
-
-**Parameters:**
-
-```sql
-flight_recorder.timeline(
-    p_metric TEXT,             -- Metric name or alias
-    p_duration INTERVAL DEFAULT '4 hours',
-    p_width INTEGER DEFAULT 60,
-    p_height INTEGER DEFAULT 10
-)
-```
-
-### Sparkline Metrics Summary
-
-Get an at-a-glance summary with sparkline trends for key metrics:
-
-```sql
-SELECT * FROM flight_recorder.sparkline_metrics('1 hour');
-```
-
-**Example output:**
-
-```
-     metric      │ current_value │     trend      │ min_value │ max_value
-─────────────────┼───────────────┼────────────────┼───────────┼───────────
- connections_active │ 87          │ ▁▂▃▅▇█▆▄▃▂    │ 43        │ 87
- cache_hit_ratio │ 98.2%        │ █████████▇    │ 97.1%     │ 99.0%
- wal_bytes       │ 1.2 GB       │ ▃▃▃▄▅▇█▅▄▃    │ 0.8 GB    │ 1.5 GB
- temp_bytes      │ 0 B          │ ▁▁▁▁▁▁▁▁▁▁    │ 0 B       │ 0 B
- xact_commit     │ 15234        │ ▂▃▄▅▆▇█▇▆▅    │ 12000     │ 18000
- db_size_bytes   │ 2.5 GB       │ ▁▁▁▁▁▁▁▂▂▂    │ 2.4 GB    │ 2.5 GB
-```
-
-**Metrics included:**
-
-- `connections_active` - Active connections
-- `cache_hit_ratio` - Computed from blks_hit/(blks_hit+blks_read)
-- `wal_bytes` - WAL generated
-- `temp_bytes` - Temp file usage
-- `xact_commit` - Committed transactions
-- `db_size_bytes` - Database size
-
-### Use Cases
-
-**Quick health check:**
-
-```sql
-SELECT * FROM flight_recorder.sparkline_metrics('1 hour');
-```
-
-**Incident investigation:**
-
-```sql
--- What did connections look like during the incident?
-SELECT flight_recorder.timeline('connections', '4 hours');
-```
-
-**Capacity monitoring:**
-
-```sql
--- Database growth trend
-SELECT flight_recorder.timeline('db_size', '24 hours');
-```
-
-**Progress bars in reports:**
-
-```sql
-SELECT
-    'Connections' AS resource,
-    connections_active || '/' || connections_max AS usage,
-    flight_recorder._bar(connections_active, connections_max) AS utilization
-FROM flight_recorder.snapshots
-ORDER BY captured_at DESC
-LIMIT 1;
-```
-
 ## Testing and Benchmarking
 
 ### Running Tests
@@ -3413,169 +2860,3 @@ For local development, use the `./tools/gg` wrapper:
 ./tools/gg grep take_snapshot    # search file contents
 ./tools/gg ctx install.sql:100   # show context around line
 ```
-
-## SQLite Export
-
-Export flight_recorder data to SQLite for offline analysis, archival, or AI-driven exploration.
-
-### Why SQLite
-
-- **Ubiquitous** - every system has it, AI tools can query it directly
-- **Single file** - easy to share, archive, analyze offline
-- **No setup** - `sqlite3 flight_recorder.db "SELECT ..."`
-- **Good enough** - handles ~500K-1M rows typical of 7-30 day retention
-
-### Usage
-
-The database can export itself to SQLite-compatible SQL. Just pipe to `sqlite3`:
-
-```bash
-# Basic export - one-liner, no dependencies beyond psql and sqlite3
-psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db
-
-# Export only recent data (last 7 days)
-psql -At -c "SELECT flight_recorder.export_sql('7 days')" mydb | sqlite3 flight_recorder.db
-
-# With compression
-psql -At -c "SELECT flight_recorder.export_sql()" mydb | sqlite3 flight_recorder.db && gzip flight_recorder.db
-```
-
-The `export_sql()` function generates SQLite-compatible SQL that includes:
-
-- `CREATE TABLE` statements with proper type mappings
-- `INSERT` statements for all data (wrapped in a transaction for performance)
-- Indexes on common query patterns
-- Export metadata
-- AI methodology guide (`_guide` and `_tables` tables)
-
-### Output Structure
-
-The exported SQLite database contains all flight_recorder tables:
-
-| Table | Description |
-|-------|-------------|
-| `snapshots` | System state snapshots (WAL, checkpoints, connections) |
-| `statement_snapshots` | Query performance from pg_stat_statements |
-| `table_snapshots` | Table statistics and bloat indicators |
-| `index_snapshots` | Index usage statistics |
-| `replication_snapshots` | Replication lag and status |
-| `config_snapshots` | PostgreSQL configuration history |
-| `db_role_config_snapshots` | Role-specific settings |
-| `vacuum_progress_snapshots` | Vacuum operations in progress |
-| `wait_samples_archive` | Wait events (detailed, 7-day retention) |
-| `activity_samples_archive` | Session activity (detailed, 7-day retention) |
-| `lock_samples_archive` | Lock contention (detailed, 7-day retention) |
-| `wait_event_aggregates` | Wait events (5-min summaries) |
-| `activity_aggregates` | Activity (5-min summaries) |
-| `lock_aggregates` | Locks (5-min summaries) |
-| `canaries` | Synthetic query definitions |
-| `canary_results` | Synthetic query results |
-| `query_storms` | Detected query spikes |
-| `query_regressions` | Performance regressions |
-| `config` | Flight recorder settings |
-| `_export_metadata` | Export timestamp, version info |
-| `_guide` | **AI docs** - 8-step analysis methodology |
-| `_tables` | **AI docs** - table descriptions and time columns |
-| `_examples` | **AI docs** - ready-to-run SQL queries by category |
-| `_glossary` | **AI docs** - definitions of key terms |
-| `_columns` | **AI docs** - explanations of important columns |
-
-### AI Analysis Guide
-
-The export includes self-documenting tables that teach AI how to analyze the data:
-
-```sql
--- Read the methodology first (8-step progressive refinement)
-SELECT * FROM _guide ORDER BY step;
-
--- Understand each table's purpose
-SELECT * FROM _tables;
-
--- Get example queries for common analysis patterns
-SELECT * FROM _examples ORDER BY category, name;
-
--- Look up unfamiliar terms
-SELECT * FROM _glossary WHERE term = 'wait_event';
-
--- Understand what key columns mean
-SELECT * FROM _columns WHERE table_name = 'snapshots';
-```
-
-| Table | Purpose |
-|-------|---------|
-| `_guide` | 8-step methodology from "START HERE" through correlation analysis |
-| `_tables` | Description and time column for each data table |
-| `_examples` | Ready-to-run SQL queries organized by tier (quick_status → drill_down) |
-| `_glossary` | Definitions of PostgreSQL/monitoring terms (wait_event, query_storm, etc.) |
-| `_columns` | Explanations of important columns in key tables |
-
-The documentation travels with the data - no external references needed.
-
-### Type Mapping
-
-| PostgreSQL | SQLite |
-|------------|--------|
-| INTEGER, BIGINT, SERIAL | INTEGER |
-| TEXT, VARCHAR | TEXT |
-| BOOLEAN | INTEGER (0/1) |
-| TIMESTAMPTZ | TEXT (ISO 8601) |
-| INTERVAL | TEXT |
-| NUMERIC, REAL | REAL |
-| JSONB | TEXT (JSON string) |
-| ARRAY | TEXT (JSON array) |
-
-### Progressive Refinement Workflow
-
-The exported SQLite enables tiered analysis for AI assistants:
-
-**Tier 1: Quick Status**
-
-```sql
--- How many anomalies?
-SELECT COUNT(*) FROM query_storms WHERE resolved_at IS NULL;
-SELECT COUNT(*) FROM query_regressions WHERE resolved_at IS NULL;
-
--- Recent activity level?
-SELECT COUNT(*), MAX(captured_at) FROM snapshots
-WHERE captured_at > datetime('now', '-1 hour');
-```
-
-**Tier 2: Summary View**
-
-```sql
--- Top wait events in last hour
-SELECT wait_event_type, wait_event, SUM(count) as total
-FROM wait_samples_archive
-WHERE captured_at > datetime('now', '-1 hour')
-GROUP BY wait_event_type, wait_event
-ORDER BY total DESC LIMIT 10;
-
--- Connection trend
-SELECT strftime('%H:%M', captured_at) as time,
-       AVG(connections_active) as avg_conn
-FROM snapshots
-WHERE captured_at > datetime('now', '-4 hours')
-GROUP BY strftime('%H:%M', captured_at);
-```
-
-**Tier 3: Drill Down**
-
-```sql
--- What queries were running during lock contention?
-SELECT captured_at, blocked_query_preview, blocking_query_preview,
-       blocked_duration, lock_type
-FROM lock_samples_archive
-WHERE captured_at BETWEEN '2024-01-15 14:00' AND '2024-01-15 14:30'
-ORDER BY blocked_duration DESC;
-
--- Correlate with wait events
-SELECT captured_at, wait_event_type, wait_event, count
-FROM wait_samples_archive
-WHERE captured_at BETWEEN '2024-01-15 14:00' AND '2024-01-15 14:30'
-  AND wait_event_type = 'Lock'
-ORDER BY captured_at;
-```
-
-### Requirements
-
-Just `psql` and `sqlite3` - both are ubiquitous. No Python, no drivers, no dependencies.

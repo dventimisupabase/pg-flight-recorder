@@ -851,7 +851,7 @@ SELECT ok(
 
 -- Test get_current_profile()
 SELECT ok(
-    (SELECT closest_profile FROM flight_recorder.get_current_profile()) IN ('default', 'production_safe', 'development', 'troubleshooting', 'minimal_overhead', 'high_ddl', 'custom'),
+    (SELECT closest_profile FROM flight_recorder.get_current_profile()) IN ('default', 'production_safe', 'development', 'troubleshooting', 'minimal_overhead', 'custom'),
     'Alerts: get_current_profile() should return valid profile name'
 );
 
